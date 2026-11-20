@@ -1,6 +1,6 @@
 # Serving track: lossless SGLang optimization
 
-This track applies a source patch to SGLang v0.5.23 to serve Muse Spark Open on **eight H200 GPUs**, with tensor/expert parallelism and DFlash speculative decoding. Our best completed scored run achieved **1.2363x stock throughput** at the judge's interactivity targets. The final submission uses the same source plus a cache-capacity flag that passed a separate 32-user check.
+This track applies a source patch to SGLang v0.5.23 to serve Muse Spark Open on **eight H200 GPUs**, with tensor/expert parallelism and DFlash speculative decoding. Our final scored run achieved **1.2647x stock throughput** at the judge's interactivity targets, improving on our previous best of 1.2363x by **2.30%**. It completed on **20 November 2026 at 4:42 PM IST**, with correctness and later-turn checks passed. The final submission combines the earlier source release with `--swa-full-tokens-ratio 0.35`.
 
 ## Result and ranking status
 
@@ -11,11 +11,22 @@ Snapshot fetched on **20 November 2026 (UTC)** for `aditya3799`:
 | `317c88a5fd474cd2` | Full scored ladder, Humming flag | **1.2363x**, correctness/later-turn checks passed |
 | `2b583e18aad84d09` | Later joint projection candidate, full ladder | **1.2239x**, passed; lower score than the earlier release |
 | `f464d5f09f534363` | Exact final source + cache ratio 0.35, unscored 32-user check | **1.398x indicative ratio**, passed; **-1.4 GB/GPU** versus stock |
-| `9577d0fdbe714fa6` | Final scored submission, submitted 20 November at 12:23:30 IST | **Queued; final score pending** at fetch time |
+| `9577d0fdbe714fa6` | Final scored submission, full 1/4/16/32-user ladder; completed 20 November at 4:42 PM IST | **1.2647x**, correctness/later-turn checks passed; **best completed score** |
 
-**Serving rank: unavailable.** The [official serving board](https://openkernelchallenge.dev/api/v1/serving/leaderboard) still returned `hidden: true` and no rows. A score is not a rank, and the 1.398x one-load check is not the final four-load score. The earlier full-score change from 1.2363x to 1.2239x is about -1.00%; one comparison does not establish its statistical significance or cause.
+**Serving rank: unavailable.** The [official serving board](https://openkernelchallenge.dev/api/v1/serving/leaderboard) still returned `hidden: true` and no rows. The final four-load score is **1.2647x**; the 1.398x value above is an earlier unscored, one-load check. The final score is **26.47% above stock** and **2.30% above our previous best**. These are observed score differences; the comparison alone does not establish statistical significance or isolate the cache flag's causal effect.
 
-[Saved receipts](results/) support these statements. The final receipt and reviewer notes are in [submission](submission/). The best full run's normalized ratios were 1.1706x, 1.1867x, 1.2963x, and 1.2974x at 1, 4, 16, and 32 concurrent users respectively.
+The [completed final result](results/9577d0fdbe714fa6.json) records `status: done`, result status `ok`, and `passed: true`. Correctness and later-turn checks passed, with **zero short outputs** and **no reported flags**. GPU memory was **0.1 GB/GPU above stock**, within the 2.0 GB allowance. The submission receipt and reviewer notes remain in [submission](submission/).
+
+Final normalized throughput ratios at the judge's interactivity targets:
+
+| Concurrent users | Final ratio vs stock |
+|---:|---:|
+| 1 | **1.1500x** |
+| 4 | **1.1836x** |
+| 16 | **1.3398x** |
+| 32 | **1.4031x** |
+
+The aggregate official score is **1.2647x**. [Saved receipts](results/) also retain the earlier scored runs and the unscored check for comparison.
 
 ## Submitted artifact
 
@@ -88,7 +99,7 @@ The launch script binds to localhost and carries the pinned judge launch configu
 
 For a meaningful mock comparison, use separate stock and patched checkouts, the same checkpoints and requests, matched repetitions, and the same concurrency ladder. Record time-to-first-token, throughput, memory, output validity, and generated-token counts. Public or synthetic conversations are a mock workload; they cannot reproduce the private judge corpus or certify the official score.
 
-## Refresh the pending result
+## Official result and leaderboard
 
 These are read-only status queries:
 
@@ -97,5 +108,5 @@ okc serve status 9577d0fdbe714fa6 --json
 okc serve leaderboard
 ```
 
-Update the saved result and the README together after the official run finishes. There is no new submission required to reproduce the publication record. See [reviewer notes](submission/reviewer_notes.txt), [validation](submission/validation.json), and [attribution](../NOTICE.md).
+The final run is complete. The saved result and this README reflect its 1.2647x score; the serving rank remains unavailable while the board is hidden. These commands can check for later leaderboard publication without submitting another run. See [reviewer notes](submission/reviewer_notes.txt), [validation](submission/validation.json), and [attribution](../NOTICE.md).
 "# muse-spark-serving" 

@@ -3,9 +3,335 @@
     "mode":  "run",
     "team":  "aditya3799",
     "board":  "serving",
-    "result":  null,
-    "status":  "queued",
+    "result":  {
+                   "status":  "ok",
+                   "passed":  true,
+                   "node":  "n-ylawlh2urn5puf2qv62d6ccela",
+                   "image":  "lmsysorg/sglang@sha256:f832b5c39559c9caa900b22ad37c76fcce66470676855c42052102c537812f1f",
+                   "weights":  "pvc:Muse-Spark-Open-816B-A42B-NVFP4",
+                   "gpus":  8,
+                   "concurrency":  [
+                                       1,
+                                       4,
+                                       16,
+                                       32
+                                   ],
+                   "reps":  3,
+                   "shape":  {
+                                 "turns":  13,
+                                 "output":  null,
+                                 "lengths":  "varied",
+                                 "first_turn":  74160,
+                                 "output_mean":  220.0,
+                                 "new_per_turn":  753
+                             },
+                   "expected_cache_hit":  0.92,
+                   "startup_s":  411.4,
+                   "pod_s":  2678.0,
+                   "flags":  [
+
+                             ],
+                   "frontier":  {
+                                    "score":  1.2647,
+                                    "points":  [
+                                                   {
+                                                       "ratio":  1.15,
+                                                       "concurrency":  1,
+                                                       "tok_s_per_gpu":  7472.5,
+                                                       "tok_s_per_user":  141.5,
+                                                       "stock_tok_s_per_gpu":  6498.0
+                                                   },
+                                                   {
+                                                       "ratio":  1.1836,
+                                                       "concurrency":  4,
+                                                       "tok_s_per_gpu":  11712.5,
+                                                       "tok_s_per_user":  56.2,
+                                                       "stock_tok_s_per_gpu":  9896.0
+                                                   },
+                                                   {
+                                                       "ratio":  1.3398,
+                                                       "concurrency":  16,
+                                                       "tok_s_per_gpu":  16492.3,
+                                                       "tok_s_per_user":  17.4,
+                                                       "stock_tok_s_per_gpu":  12309.3
+                                                   },
+                                                   {
+                                                       "ratio":  1.4031,
+                                                       "concurrency":  32,
+                                                       "tok_s_per_gpu":  17779.0,
+                                                       "tok_s_per_user":  9.0,
+                                                       "stock_tok_s_per_gpu":  12671.5
+                                                   }
+                                               ],
+                                    "excluded":  [
+
+                                                 ],
+                                    "paired_reps":  3,
+                                    "ttft_ratio_limit":  2.0
+                                },
+                   "short_outputs":  0,
+                   "launch_settings":  {
+                                           "unavailable":  null,
+                                           "env_not_logged":  false,
+                                           "denied":  [
+
+                                                      ],
+                                           "launch_flags":  [
+                                                                {
+                                                                    "setting":  "moe_runner_backend",
+                                                                    "stock":  "marlin",
+                                                                    "build":  "humming"
+                                                                },
+                                                                {
+                                                                    "setting":  "swa_full_tokens_ratio",
+                                                                    "stock":  0.8,
+                                                                    "build":  0.35
+                                                                }
+                                                            ],
+                                           "new_defaults":  [
+                                                                {
+                                                                    "setting":  "_swa_full_tokens_ratio_explicitly_set",
+                                                                    "stock":  false,
+                                                                    "build":  true
+                                                                },
+                                                                {
+                                                                    "setting":  "speculative_moe_runner_backend",
+                                                                    "stock":  "marlin",
+                                                                    "build":  "humming"
+                                                                }
+                                                            ],
+                                           "derived":  [
+                                                           {
+                                                               "setting":  "internal_states[0].decode_cuda_graph_memory_gb",
+                                                               "stock":  0.334,
+                                                               "build":  0.367
+                                                           },
+                                                           {
+                                                               "setting":  "internal_states[0].memory_usage.graph.prefill",
+                                                               "stock":  15.791,
+                                                               "build":  15.559
+                                                           },
+                                                           {
+                                                               "setting":  "internal_states[0].memory_usage.graph.target_verify",
+                                                               "stock":  0.254,
+                                                               "build":  0.287
+                                                           },
+                                                           {
+                                                               "setting":  "internal_states[0].memory_usage.kvcache",
+                                                               "stock":  37.636,
+                                                               "build":  34.033
+                                                           },
+                                                           {
+                                                               "setting":  "internal_states[0].memory_usage.startup_available",
+                                                               "stock":  20.678,
+                                                               "build":  20.639
+                                                           },
+                                                           {
+                                                               "setting":  "internal_states[0].memory_usage.token_capacity",
+                                                               "stock":  1889034,
+                                                               "build":  2819026
+                                                           },
+                                                           {
+                                                               "setting":  "internal_states[0].memory_usage.token_capacity_swa",
+                                                               "stock":  1511227,
+                                                               "build":  986659
+                                                           },
+                                                           {
+                                                               "setting":  "internal_states[0].memory_usage.weight",
+                                                               "stock":  69.85,
+                                                               "build":  70.129
+                                                           },
+                                                           {
+                                                               "setting":  "max_total_num_tokens",
+                                                               "stock":  1889034,
+                                                               "build":  2819026
+                                                           }
+                                                       ]
+                                       },
+                   "serving_flags":  {
+                                         "--moe-runner-backend":  "humming",
+                                         "--swa-full-tokens-ratio":  "0.35"
+                                     },
+                   "rungs":  [
+                                 {
+                                     "concurrency":  1,
+                                     "tok_s_per_gpu":  7133.6,
+                                     "tok_s_per_user_p50":  224.8,
+                                     "tok_s_per_user_e2e_p50":  194.9,
+                                     "tok_s_per_user_e2e":  154.1,
+                                     "ttft_p90_s":  0.214,
+                                     "ttft_first_p90_s":  6.536,
+                                     "ttft_later_p90_s":  0.194,
+                                     "cache_hit":  0.92,
+                                     "acceptance":  4.0,
+                                     "reps":  3,
+                                     "truncated":  false,
+                                     "spread":  0.0074
+                                 },
+                                 {
+                                     "concurrency":  4,
+                                     "tok_s_per_gpu":  11340.2,
+                                     "tok_s_per_user_p50":  115.5,
+                                     "tok_s_per_user_e2e_p50":  105.2,
+                                     "tok_s_per_user_e2e":  63.5,
+                                     "ttft_p90_s":  0.257,
+                                     "ttft_first_p90_s":  15.6,
+                                     "ttft_later_p90_s":  0.221,
+                                     "cache_hit":  0.92,
+                                     "acceptance":  4.0,
+                                     "reps":  3,
+                                     "truncated":  false,
+                                     "spread":  0.0358
+                                 },
+                                 {
+                                     "concurrency":  16,
+                                     "tok_s_per_gpu":  15514.0,
+                                     "tok_s_per_user_p50":  49.5,
+                                     "tok_s_per_user_e2e_p50":  45.7,
+                                     "tok_s_per_user_e2e":  22.1,
+                                     "ttft_p90_s":  0.74,
+                                     "ttft_first_p90_s":  61.344,
+                                     "ttft_later_p90_s":  0.303,
+                                     "cache_hit":  0.92,
+                                     "acceptance":  4.0,
+                                     "reps":  3,
+                                     "truncated":  false,
+                                     "spread":  0.0137
+                                 },
+                                 {
+                                     "concurrency":  32,
+                                     "tok_s_per_gpu":  17779.0,
+                                     "tok_s_per_user_p50":  40.3,
+                                     "tok_s_per_user_e2e_p50":  37.1,
+                                     "tok_s_per_user_e2e":  12.7,
+                                     "ttft_p90_s":  0.974,
+                                     "ttft_first_p90_s":  133.54,
+                                     "ttft_later_p90_s":  0.755,
+                                     "cache_hit":  0.92,
+                                     "acceptance":  4.1,
+                                     "reps":  1,
+                                     "truncated":  false,
+                                     "spread":  0.0
+                                 }
+                             ],
+                   "correctness":  {
+                                       "short":  0,
+                                       "bounds":  {
+                                                      "agreement_min":  0.05,
+                                                      "decode_kl_mean":  0.035,
+                                                      "min_references":  24,
+                                                      "prefill_kl_mean":  0.11,
+                                                      "prefill_top1_min":  0.62
+                                                  },
+                                       "passed":  true,
+                                       "invalid":  0,
+                                       "reasons":  [
+
+                                                   ],
+                                       "agreement":  0.14,
+                                       "references":  176,
+                                       "prefill_top1":  0.82,
+                                       "decode_kl_mean":  0.013,
+                                       "prefill_kl_mean":  0.052
+                                   },
+                   "later_turns":  {
+                                       "ran":  true,
+                                       "bounds":  {
+                                                      "nll_rise_max":  0.07,
+                                                      "agreement_min":  0.92,
+                                                      "min_positions":  20000,
+                                                      "agreement_drop_max":  0.03,
+                                                      "lead_agreement_min":  0.8,
+                                                      "min_lead_positions":  100,
+                                                      "first_agreement_min":  0.85,
+                                                      "min_rung_first_positions":  400,
+                                                      "min_rung_later_positions":  5000
+                                                  },
+                                       "passed":  true,
+                                       "reasons":  [
+
+                                                   ],
+                                       "seconds":  287.9,
+                                       "per_rung":  [
+                                                        {
+                                                            "passed":  true,
+                                                            "checked":  true,
+                                                            "concurrency":  1,
+                                                            "conversations":  4,
+                                                            "first_agreement":  0.96,
+                                                            "later_agreement":  0.98,
+                                                            "later_positions":  10499
+                                                        },
+                                                        {
+                                                            "passed":  true,
+                                                            "checked":  true,
+                                                            "concurrency":  4,
+                                                            "conversations":  4,
+                                                            "first_agreement":  0.96,
+                                                            "later_agreement":  0.96,
+                                                            "later_positions":  10551
+                                                        },
+                                                        {
+                                                            "passed":  true,
+                                                            "checked":  true,
+                                                            "concurrency":  16,
+                                                            "conversations":  4,
+                                                            "first_agreement":  0.96,
+                                                            "later_agreement":  0.98,
+                                                            "later_positions":  9913
+                                                        },
+                                                        {
+                                                            "passed":  true,
+                                                            "checked":  true,
+                                                            "concurrency":  32,
+                                                            "conversations":  4,
+                                                            "first_agreement":  0.94,
+                                                            "later_agreement":  0.98,
+                                                            "later_positions":  10582
+                                                        }
+                                                    ],
+                                       "first_nll":  0.27,
+                                       "later_nll":  0.18,
+                                       "startup_s":  141.1,
+                                       "incomplete":  false,
+                                       "insufficient":  false,
+                                       "conversations":  16,
+                                       "lead_agreement":  1.0,
+                                       "lead_positions":  192,
+                                       "first_agreement":  0.95,
+                                       "first_positions":  3879,
+                                       "later_agreement":  0.97,
+                                       "later_positions":  41545,
+                                       "served_positions":  45424,
+                                       "unmatched_positions":  0
+                                   },
+                   "patch":  {
+                                 "files":  [
+                                               "python/sglang/kernels/ops/moe/adaptive_marlin_tiles.py",
+                                               "python/sglang/kernels/ops/moe/moe_align_small_numel.py",
+                                               "python/sglang/kernels/ops/moe/muse_spark_humming_scale.py",
+                                               "python/sglang/kernels/ops/moe/muse_spark_humming_split.py",
+                                               "python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py",
+                                               "python/sglang/srt/layers/attention/flashattention_backend.py",
+                                               "python/sglang/srt/layers/communication/muse_spark_gemm_ag.py",
+                                               "python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py",
+                                               "python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py",
+                                               "python/sglang/srt/models/muse_spark.py"
+                                           ],
+                                 "sha256":  "8c7547213fb993a318321a26f84e2872db8c87b358ee3d3ea638695702b0dc2b"
+                             },
+                   "gpu_memory":  {
+                                      "over_stock_gb":  0.1,
+                                      "limit_gb":  2.0
+                                  }
+               },
+    "status":  "done",
+    "call_id":  "nyc3b:kcs-9577d0fdbe714fa6",
+    "cluster":  "nyc3b",
+    "dedicated":  true,
     "created_at":  1795157610.857914,
+    "started_at":  1795170432.116104,
+    "finished_at":  1795173125.4248784,
     "payload_ref":  "serving/44bf747f07b2cb951433f8b6ce077dc1ce29f951b2673fc74396edba5efcfe7e.diff",
     "content_hash":  "44bf747f07b2cb951433f8b6ce077dc1ce29f951b2673fc74396edba5efcfe7e",
     "duplicate_of":  null,
