@@ -1,0 +1,46 @@
+NOTEBOOK 07: VERIFIED SINGLE-OWNER REVIEW
+Run: 20261114T173941Z_88f16c
+
+VALIDATION
+All 10 member checksums and source provenance matched. Recomputed 180 timing rows from 1,980 raw samples; verified 120 comparisons. All 576 output checks across 192 configurations, 30 benchmark cases and 360 schedule checks passed.
+Aliasing, CPU/GPU moves, direct mutation, graph visibility, rejected attribute replacement and checkpoint exclusion checks passed. Map offset remains four bytes; real fused-kernel compatibility is NOT established.
+Trace: 324 kernels and 16 copies; no unattributed device operations. Annotation spans excluded.
+
+LATENCY REDUCTION AGAINST ORIGINAL BASELINE (%)
+Candidate | Schedule | Replays per update cycle | Wins | Median | Range
+two_buffer | static | 1 | 6/6 | 15.70% | 13.71% to 18.73%
+two_buffer | static | 2 | 6/6 | 17.16% | 15.00% to 20.61%
+two_buffer | static | 4 | 6/6 | 16.71% | 15.28% to 20.10%
+two_buffer | static | 8 | 6/6 | 17.05% | 13.68% to 20.41%
+two_buffer | static | 64 | 6/6 | 17.53% | 16.44% to 20.69%
+two_buffer | external | 1 | 0/6 | -163.74% | -194.87% to -73.56%
+two_buffer | external | 2 | 0/6 | -85.17% | -199.34% to -67.39%
+two_buffer | external | 4 | 0/6 | -28.88% | -58.55% to -21.44%
+two_buffer | external | 8 | 6/6 | 1.75% | 0.34% to 5.40%
+two_buffer | external | 64 | 6/6 | 14.86% | 13.37% to 17.21%
+single_owner | static | 1 | 6/6 | 16.12% | 14.59% to 19.20%
+single_owner | static | 2 | 6/6 | 17.03% | 15.18% to 19.38%
+single_owner | static | 4 | 6/6 | 17.25% | 14.81% to 20.24%
+single_owner | static | 8 | 6/6 | 16.93% | 13.80% to 20.42%
+single_owner | static | 64 | 6/6 | 17.59% | 16.01% to 19.94%
+single_owner | external | 1 | 0/6 | -46.12% | -62.22% to -11.21%
+single_owner | external | 2 | 0/6 | -15.00% | -82.93% to -4.43%
+single_owner | external | 4 | 5/6 | 4.77% | -3.02% to 7.53%
+single_owner | external | 8 | 6/6 | 11.01% | 8.16% to 12.36%
+single_owner | external | 64 | 6/6 | 16.63% | 14.62% to 18.60%
+Negative reduction means higher/slower latency. Static schedules have no updates. Values are medians of matched configuration/trial ratios, not confidence intervals or universal crossover points.
+
+INTERPRETATION
+Single-owner static: 30/30 wins, median latency reduction 16.64%.
+Single-owner external: K=1 remains 46.12% slower; K=2 remains 15.00% slower. K=4 wins 5/6 (median 4.77% lower latency); K=8 and K=64 win 6/6 (11.01% and 16.63% lower latency).
+Versus the prior two-buffer candidate, the single-owner external schedule wins 30/30 comparisons, median reduction 26.86%.
+At K=4, per trace cycle: baseline 32 kernels + 1 copy, two-buffer 25 kernels + 2 copies, single-owner 24 kernels + 1 copy. This supports removal of the extra fill/copy. It does not assign exact host/GPU percentages to benchmark latency.
+Residual overhead could include checked update method dispatch, the no_grad wrapper, validation and creating the map view. This is a hypothesis for Notebook 08, not a measured decomposition.
+Baseline external update uses a direct copy whereas the candidate uses a checked method. Notebook 08 adds the same checked method to the baseline as an experimental control and measures direct-property and retained-view writes separately.
+Schedule checks in Notebook 07 preload each module with the expected map before calling the update variant. They verify output consistency but do not independently prove each update wrapper changed old state. Notebook 08 explicitly poisons the old map before each update check; separate Notebook 07 direct-write tests already demonstrate shared-storage visibility.
+
+NEXT EXPERIMENT: 08_kaggle_update_overhead.ipynb
+Keep the Notebook 07 source slices unchanged. Compare baseline direct/checked updates and single-owner checked/property-copy/retained-view-copy updates, plus two static graph controls. Test K=1/2/4/8 at 32/128 tokens in three shuffled trials.
+Report CUDA-event cycle time, synchronized wall time and host enqueue time separately. Host enqueue overlaps device execution and is not an additive component to subtract from event timing.
+Retained-view writes are diagnostic: bind only after device placement, validate the input contract before use and rebind/recapture after storage changes. Do not bypass validation in production based on this result.
+All variants remain unapplied. T4 source-prefix results do not establish full-serving/H200 speedup, actual alignment/GEMM behavior, scheduler/tokenizer startup or framework-wide buffer compatibility.

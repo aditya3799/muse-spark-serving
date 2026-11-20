@@ -1,0 +1,87 @@
+def _choose_large_prefill_configs(layer, actual_routes, global_experts):
+    # The public wrapper dispatches these routes through the original function.
+    # Retain the original selector semantics too if called directly.
+    if type(actual_routes) is not int:
+        return None
+    if actual_routes <= 4096:
+        return original_choose_partition_configs(layer, actual_routes, global_experts)
+    if (type(actual_routes) is not int or actual_routes > 131072
+            or type(global_experts) is not int or global_experts <= 0):
+        return None
+    try:
+        admitted = getattr(layer, "_humming_large_prefill_configs", None)
+        if type(admitted) is not frozenset or not admitted:
+            return None
+        intervals = layer.fp32_configs
+        if type(intervals) is not dict or set(intervals) != {"w13", "w2"}:
+            return None
+        experts = layer.w13_post_scale.numel()
+        if (type(experts) is not int or not 0 < experts <= 256
+                or layer.w2_post_scale.numel() != experts
+                or global_experts < experts or global_experts % experts):
+            return None
+        tune_m = (actual_routes * experts + global_experts - 1) // global_experts
+        # Reject incomplete/ambiguous interval tables before the scored chooser.
+        for stage in ("w13", "w2"):
+            table = intervals[stage]
+            if not isinstance(table, (list, tuple)) or not table:
+                return None
+            previous_hi = None
+            for entry in table:
+                if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+                    return None
+                lo, hi, config = entry
+                if (type(lo) is not int or type(hi) is not int or lo < 0 or hi <= lo
+                        or type(config) is not dict
+                        or (previous_hi is not None and lo < previous_hi)):
+                    return None
+                previous_hi = hi
+            if any(sum(lo < value <= hi for lo, hi, _ in table) != 1
+                   for value in (actual_routes, tune_m)):
+                return None
+        plan = original_choose_partition_configs(layer, actual_routes, global_experts)
+        if plan is None:
+            return None
+        plan = deepcopy(plan)
+        for stage in ("w13", "w2"):
+            light, heavy = plan["light"][stage], plan["heavy"][stage]
+            for config in (light, heavy):
+                if (config.get("use_f16_accum") is not False
+                        or config.get("use_stream_k") is not False):
+                    return None
+                for key in ("block_shape", "warp_shape"):
+                    shape = config.get(key)
+                    if (not isinstance(shape, (list, tuple)) or len(shape) != 3
+                            or any(type(v) is not int or v <= 0 for v in shape)):
+                        return None
+                if any(b % w for b, w in zip(config["block_shape"], config["warp_shape"])):
+                    return None
+            light["block_shape"] = list(light["block_shape"])
+            light["warp_shape"] = list(light["warp_shape"])
+            light["block_shape"][2] = heavy["block_shape"][2]
+            light["warp_shape"][2] = heavy["warp_shape"][2]
+            if light["block_shape"][0] > heavy["block_shape"][0]:
+                return None
+            for config in (light, heavy):
+                block, warp = config["block_shape"], config["warp_shape"]
+                if any(b % w for b, w in zip(block, warp)):
+                    return None
+                warps = 1
+                for b, w in zip(block, warp):
+                    warps *= b // w
+                ws = config.get("use_warp_spec", False)
+                if ws is not None and type(ws) is not bool:
+                    return None
+                if warps * 32 + (128 if ws is True else 0) > 1024:
+                    return None
+                signature = _large_prefill_config_signature(config)
+                if (stage, signature) not in admitted:
+                    return None
+        # Original distinctness was checked before K repair. Recheck afterward.
+        if all(plan["light"][stage] == plan["heavy"][stage] for stage in ("w13", "w2")):
+            return None
+        plan["cutoff"] = min(plan["light"][stage]["block_shape"][0] for stage in ("w13", "w2"))
+        return plan
+    except (AttributeError, KeyError, TypeError, ValueError, IndexError, StopIteration, OverflowError):
+        # Metadata-only rejection; no GPU work has begun and no launch is retried.
+        return None

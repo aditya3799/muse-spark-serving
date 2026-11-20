@@ -1,0 +1,114 @@
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -33,7 +33,7 @@
+ from sglang.kernels.ops.activation.softcap import (
+     softcap_to_float32_logits,
+ )
+-from sglang.kernels.ops.sampling.softcap_row_argmax import softcap_row_argmax
++from sglang.kernels.ops.sampling.parallel_softcap_row_argmax import parallel_softcap_max
+ from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
+ from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+ from sglang.srt.environ import envs
+@@ -1005,16 +1005,24 @@
+             torch.cuda.synchronize()
+             _trace_e2e_logits("post_lm_head_sync_returned")
+ 
++        can_fuse_gather = self._can_gather_softcap_fused(
++            logits, local_hidden_states, lm_head, logits_metadata
++        )
++        deferred_verify = (
++            can_fuse_gather
++            and self.defer_verify_gather
++            and logits_metadata.forward_mode.is_target_verify()
++        )
++        # The DFlash worker finishes a true TP shard after it knows whether
++        # greedy selection or the complete distribution is required.
++        if deferred_verify and logits.shape[-1] < self.vocab_size:
++            return logits
++
+         if self.logit_scale is not None:
+             logits.mul_(self.logit_scale)
+ 
+-        if self._can_gather_softcap_fused(
+-            logits, local_hidden_states, lm_head, logits_metadata
+-        ):
+-            if (
+-                self.defer_verify_gather
+-                and logits_metadata.forward_mode.is_target_verify()
+-            ):
++        if can_fuse_gather:
++            if deferred_verify:
+                 return logits
+             return self._gather_softcap_fused(
+                 logits, logits_metadata, use_logits_buffer
+@@ -1098,6 +1106,8 @@
+ 
+     def finish_deferred_gather(self, logits: torch.Tensor) -> torch.Tensor:
+         """Full softcapped logits from a target-verify vocab shard."""
++        if self.logit_scale is not None:
++            logits = logits * self.logit_scale
+         return self._gather_softcap_fused(logits, None, use_buffer=False)
+ 
+     def deferred_argmax(self, logits: torch.Tensor) -> torch.Tensor:
+@@ -1108,8 +1118,9 @@
+         num_tokens, shard_width = logits.shape
+         col_offset = group.rank_in_group * shard_width
+         valid_width = max(0, min(shard_width, self.vocab_size - col_offset))
+-        local = softcap_row_argmax(
+-            logits, self.final_logit_softcapping, valid_width, col_offset
++        scale = 1.0 if self.logit_scale is None else self.logit_scale
++        local = parallel_softcap_max(
++            logits, self.final_logit_softcapping, valid_width, col_offset, scale=scale
+         )
+         gathered = torch.empty(
+             (group.world_size, num_tokens, 2), dtype=local.dtype, device=local.device
+--- /dev/null
++++ b/python/sglang/kernels/ops/sampling/parallel_softcap_row_argmax.py
+@@ -0,0 +1,47 @@
++"""Compute the original softcapped vocabulary winner with independent CTAs for wide rows."""
++import torch
++import triton
++import triton.language as tl
++from triton.language.extra import libdevice
++
++
++@triton.jit
++def _tile(logits, parts, stride, ncols, cap, scale, tiles:tl.constexpr, WIDTH:tl.constexpr):
++    tile=tl.program_id(0)
++    row=tl.program_id(1).to(tl.int64)
++    cols=tile*WIDTH+tl.arange(0,WIDTH)
++    keep=cols<ncols
++    x=tl.load(logits+row*stride+cols,mask=keep,other=0.)
++    x=tl.inline_asm_elementwise("mul.rn.f32 $0, $1, $2;", constraints="=f,f,f", args=[x,scale], dtype=tl.float32,is_pure=True,pack=1)
++    x=libdevice.tanh(x/cap)*cap
++    x=tl.where(keep,x,-float("inf"))
++    val,which=tl.max(x,axis=0,return_indices=True,return_indices_tie_break_left=True)
++    offset=(row*tiles+tile)*2
++    tl.store(parts+offset,val)
++    tl.store(parts+offset+1,(which+tile*WIDTH).to(tl.float32))
++
++
++@triton.jit
++def _first_winner(parts, out, token_offset, tiles:tl.constexpr, BLOCK:tl.constexpr):
++    row=tl.program_id(0).to(tl.int64)
++    t=tl.arange(0,BLOCK)
++    v=tl.load(parts+(row*tiles+t)*2,mask=t<tiles,other=-float("inf"))
++    # The parent updates only on '>'. NaN and -inf tile winners never replace its initial value.
++    v=tl.where(v==v,v,-float("inf"))
++    best,first=tl.max(v,axis=0,return_indices=True,return_indices_tie_break_left=True)
++    idx=tl.load(parts+(row*tiles+first)*2+1)
++    idx=tl.where(best>-float("inf"),idx,0.)
++    tl.store(out+row*2,best)
++    tl.store(out+row*2+1,idx+token_offset)
++
++
++def parallel_softcap_max(logits,cap,ncols,token_offset,tile=4096,scale=1.):
++    assert logits.dtype==torch.float32 and logits.stride(1)==1 and token_offset+logits.shape[1]<2**24
++    rows=logits.shape[0]
++    tiles=max(1,triton.cdiv(ncols,tile))
++    parts=torch.empty(rows,tiles,2,dtype=logits.dtype,device=logits.device)
++    out=torch.empty(rows,2,dtype=logits.dtype,device=logits.device)
++    if rows:
++        _tile[(tiles,rows)](logits,parts,logits.stride(0),ncols,cap,scale,tiles,tile,num_warps=8)
++        _first_winner[(rows,)](parts,out,token_offset,tiles,triton.next_power_of_2(tiles),num_warps=1)
++    return out

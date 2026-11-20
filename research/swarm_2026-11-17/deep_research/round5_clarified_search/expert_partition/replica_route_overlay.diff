@@ -1,0 +1,19 @@
+--- a/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
++++ b/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
+@@ -428,9 +428,13 @@
+                 _humming_expert_outputs,
+             )
+ 
+-            local_ids = topk_ids.to(torch.int32)
+-            if self._expert_map is not None:
+-                local_ids = self._expert_lookup[local_ids.clamp_min(-1) + 1]
++            replica_routes = getattr(self, "_research_replica_routes", None)
++            if replica_routes is None:
++                local_ids = topk_ids.to(torch.int32)
++                if self._expert_map is not None:
++                    local_ids = self._expert_lookup[local_ids.clamp_min(-1) + 1]
++            else:
++                local_ids = replica_routes(self._humming_layer, topk_ids.to(torch.int32))
+             return _humming_expert_outputs(
+                 self._humming_layer, hidden_states.contiguous(),
+                 local_ids.contiguous(), torch,

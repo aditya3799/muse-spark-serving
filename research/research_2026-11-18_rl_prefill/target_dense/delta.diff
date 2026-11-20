@@ -1,0 +1,722 @@
+diff --git a/python/sglang/kernels/jit/csrc/elementwise/route_activation.cuh b/python/sglang/kernels/jit/csrc/elementwise/route_activation.cuh
+new file mode 100644
+index 0000000..69ddce5
+--- /dev/null
++++ b/python/sglang/kernels/jit/csrc/elementwise/route_activation.cuh
+@@ -0,0 +1,83 @@
++#include "elementwise/activation.cuh"
++
++namespace sglang {
++struct RouteActivationParams {
++  const void* input;
++  void* output;
++  const void* scales;
++  const int32_t* ids;
++  uint32_t rows;
++  uint32_t experts;
++};
++
++// Match the scored Triton BF16 scaling boundary even with fast-math activation.
++SGL_DEVICE float route_scale_product(float value, float scale) {
++  float result;
++  asm("mul.rn.f32 %0, %1, %2;" : "=f"(result) : "f"(value), "f"(scale));
++  return result;
++}
++
++template <typename T, bool kUsePDL, uint32_t kGroup>
++__global__ void route_scaled_activation(const __grid_constant__ RouteActivationParams p) {
++  using namespace device;
++  constexpr uint32_t kValues = kMaxVecBytes / sizeof(T);
++  constexpr uint32_t kVectors = 4096 / kValues;
++  constexpr uint32_t kThreads = 256;
++  using vec_t = AlignedVector<T, kValues>;
++  const uint32_t base_row = blockIdx.x * kGroup;
++  const uint32_t lane = threadIdx.x % 32;
++  PDLWaitPrimary<kUsePDL>();
++  const int expert = lane < kGroup && base_row + lane < p.rows ? p.ids[base_row + lane] : -1;
++  uint32_t active = __ballot_sync(0xffffffffu, expert >= 0 && uint32_t(expert) < p.experts);
++  // Each warp visits the same live rows. No CTA synchronization or CPU count read.
++  while (active) {
++    const int slot = __ffs(active) - 1;
++    const int selected = __shfl_sync(0xffffffffu, expert, slot);
++    const float scale = device::cast<fp32_t>(static_cast<const T*>(p.scales)[selected]);
++    const uint32_t row = base_row + slot;
++#pragma unroll
++    for (uint32_t vector = threadIdx.x; vector < kVectors; vector += kThreads) {
++      const uint32_t offset = row * (2 * kVectors) + vector;
++      const vec_t gate = device::load_as<vec_t>(p.input, offset);
++      const vec_t up = device::load_as<vec_t>(p.input, offset + kVectors);
++      vec_t result;
++#pragma unroll
++      for (uint32_t i=0; i<kValues; ++i) {
++        const T rounded_gate = device::cast<T>(route_scale_product(device::cast<fp32_t>(gate[i]), scale));
++        const T rounded_up = device::cast<T>(route_scale_product(device::cast<fp32_t>(up[i]), scale));
++        const float activation = apply_activation_f32<ActivationKind::kSiLU>(device::cast<fp32_t>(rounded_gate));
++        result[i] = device::cast<T>(activation * device::cast<fp32_t>(rounded_up));
++      }
++      device::store_as<vec_t>(p.output, result, row * kVectors + vector);
++    }
++    active &= active - 1;
++  }
++  PDLTriggerSecondary<kUsePDL>();
++}
++
++template <typename T, bool kUsePDL, uint32_t kGroup>
++struct RouteActivationKernel {
++  static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output,
++                  tvm::ffi::TensorView ids, tvm::ffi::TensorView scales) {
++    using namespace host;
++    static_assert(kGroup > 0 && kGroup <= 32);
++    auto rows = SymbolicSize{"rows"};
++    auto experts = SymbolicSize{"experts"};
++    auto device_ = SymbolicDevice{};
++    device_.set_options<kDLCUDA>();
++    TensorMatcher({rows, 8192}).with_dtype<T>().with_device(device_).verify(input);
++    TensorMatcher({rows, 4096}).with_dtype<T>().with_device(device_).verify(output);
++    TensorMatcher({rows}).with_dtype<int32_t>().with_device(device_).verify(ids);
++    TensorMatcher({experts}).with_dtype<T>().with_device(device_).verify(scales);
++    constexpr uint32_t kVectors = 4096 / (device::kMaxVecBytes / sizeof(T));
++    RuntimeCheck(rows.unwrap() <= std::numeric_limits<uint32_t>::max() / (2 * kVectors), "row offsets overflow");
++    RuntimeCheck(experts.unwrap() > 0, "invalid expert count");
++    if (rows.unwrap() == 0) return;
++    const RouteActivationParams params{input.data_ptr(), output.data_ptr(), scales.data_ptr(),
++      static_cast<const int32_t*>(ids.data_ptr()), static_cast<uint32_t>(rows.unwrap()),
++      static_cast<uint32_t>(experts.unwrap())};
++    LaunchKernel(div_ceil(params.rows, kGroup), 256u, device_.unwrap())
++      .enable_pdl(kUsePDL)(route_scaled_activation<T, kUsePDL, kGroup>, params);
++  }
++};
++}  // namespace sglang
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_humming_split.py b/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
+index 4d0c560..813919b 100644
+--- a/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
++++ b/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
+@@ -79,7 +79,7 @@ def split_expert_outputs(original_helper, layer, x, local_ids, torch, global_exp
+                          *, retain=False, defer_downscale=False):
+     from humming.layer import HummingMethod
+     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+-    from sglang.kernels.ops.activation.activation import silu_and_mul
++    from sglang.kernels.ops.moe.route_activation import scaled_prefill_activation
+     from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
+     def fallback():
+         return original_helper(layer,x,local_ids,torch,retain=retain,
+@@ -120,9 +120,8 @@ def split_expert_outputs(original_helper, layer, x, local_ids, torch, global_exp
+             tuning_config=config,sorted_ids=sorted_ids,expert_ids=expert_ids,num_tokens_padded=padded,
+             valid_shape_m=valid,compute_config={'gemm_type':'indexed','use_f16_accum':False})
+     # Both up partitions are complete before scaling/activation or down-buffer reuse.
+-    scale_active_rows(cache1,local_ids,layer.w13_post_scale)
+     cache2 = torch.empty((m*topk,intermediate),device=x.device,dtype=x.dtype)
+-    silu_and_mul(cache1,cache2,expert_ids=local_ids.flatten(),expert_step=1)
++    scaled_prefill_activation(cache1, cache2, local_ids, layer.w13_post_scale)
+     cache3 = cache13[:m*topk*k].view(m*topk,k)
+     for name,ids in partitions:
+         config = plan[name]['w2']
+@@ -197,7 +196,7 @@ def _split_large_prefill_expert_outputs(original_helper, layer, x, local_ids, to
+                          *, retain=False, defer_downscale=False):
+     from humming.layer import HummingMethod
+     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+-    from sglang.kernels.ops.activation.activation import silu_and_mul
++    from sglang.kernels.ops.moe.route_activation import scaled_prefill_activation
+     from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
+     def fallback():
+         return original_helper(layer,x,local_ids,torch,retain=retain,
+@@ -238,9 +237,8 @@ def _split_large_prefill_expert_outputs(original_helper, layer, x, local_ids, to
+             tuning_config=config,sorted_ids=sorted_ids,expert_ids=expert_ids,num_tokens_padded=padded,
+             valid_shape_m=valid,compute_config={'gemm_type':'indexed','use_f16_accum':False})
+     # Both up partitions are complete before scaling/activation or down-buffer reuse.
+-    scale_active_rows(cache1,local_ids,layer.w13_post_scale)
+     cache2 = torch.empty((m*topk,intermediate),device=x.device,dtype=x.dtype)
+-    silu_and_mul(cache1,cache2,expert_ids=local_ids.flatten(),expert_step=1)
++    scaled_prefill_activation(cache1, cache2, local_ids, layer.w13_post_scale)
+     cache3 = cache13[:m*topk*k].view(m*topk,k)
+     for name,ids in partitions:
+         config = plan[name]['w2']
+diff --git a/python/sglang/kernels/ops/moe/route_activation.py b/python/sglang/kernels/ops/moe/route_activation.py
+new file mode 100644
+index 0000000..1c4ade7
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/route_activation.py
+@@ -0,0 +1,36 @@
++from pathlib import Path
++
++import torch
++
++from sglang.kernels.jit.utils import cache_once, get_activation_cuda_cflags, is_arch_support_pdl, load_jit, make_cpp_args
++from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
++
++
++@cache_once
++def route_activation_module():
++    args = make_cpp_args(torch.bfloat16, is_arch_support_pdl())
++    return load_jit(
++        "muse_route_scaled_activation", *args,
++        cuda_files=["elementwise/route_activation.cuh"],
++        extra_cuda_cflags=get_activation_cuda_cflags(),
++        extra_include_paths=[str(KERNEL_PATH / "csrc")],
++        cuda_wrappers=[("run", f"RouteActivationKernel<{args}, 8>::run")],
++    )
++
++
++def scaled_prefill_activation(x, out, ids, scales):
++    if (
++        ids.ndim == 2 and ids.shape[0] >= 512 and ids.shape[1] == 8
++        and x.ndim == 2 and out.ndim == 2 and x.shape == (ids.numel(), 8192)
++        and out.shape == (ids.numel(), 4096) and scales.ndim == 1 and scales.numel() > 0
++        and x.is_cuda and x.device == out.device == ids.device == scales.device
++        and x.dtype == out.dtype == scales.dtype == torch.bfloat16 and ids.dtype == torch.int32
++        and x.is_contiguous() and out.is_contiguous() and ids.is_contiguous() and scales.is_contiguous()
++        and ids.numel() <= 2**32 // 1024 - 1
++    ):
++        route_activation_module().run(x, out, ids.view(-1), scales)
++    else:
++        from sglang.kernels.ops.activation.activation import silu_and_mul
++        from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
++        scale_active_rows(x, ids, scales)
++        silu_and_mul(x, out, expert_ids=ids.flatten(), expert_step=1)
+diff --git a/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py b/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
+index fd09430..bc14041 100644
+--- a/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
++++ b/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
+@@ -94,7 +94,7 @@ def prefill_row_projection_supported(group, x, weight) -> bool:
+     )
+ 
+ 
+-def prefill_row_projection(group, x, weight):
++def prefill_row_projection(group, x, weight, *, qualify_vendor=False):
+     """Compute full output rows once, then gather in original token order.
+ 
+     Input and weights must be replicated on the TP group. The complete K
+@@ -103,9 +103,13 @@ def prefill_row_projection(group, x, weight):
+     """
+     m_local = x.shape[0] // group.world_size
+     start = group.rank_in_group * m_local
+-    local_fp32 = torch.mm(
+-        x[start : start + m_local], weight.t(), out_dtype=torch.float32
+-    )
++    rows = x[start : start + m_local]
++    if qualify_vendor:
++        from sglang.srt.layers.communication.muse_target_projection import qualified_target_row_mm
++
++        local_fp32 = qualified_target_row_mm(rows, weight)
++    else:
++        local_fp32 = torch.mm(rows, weight.t(), out_dtype=torch.float32)
+     local = local_fp32.to(x.dtype)
+     del local_fp32
+     return group.all_gather(local, dim=0)
+diff --git a/python/sglang/srt/layers/communication/muse_target_projection.cc b/python/sglang/srt/layers/communication/muse_target_projection.cc
+new file mode 100644
+index 0000000..68ce838
+--- /dev/null
++++ b/python/sglang/srt/layers/communication/muse_target_projection.cc
+@@ -0,0 +1,183 @@
++// Diagnostic library. Each configuration is proposed on this host by cuBLASLt.
++// Search native BF16 matmul choices at fixed full K. The caller checks every output.
++#include <cublasLt.h>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++struct Probe {
++    cublasLtHandle_t handle{};
++    cublasLtMatmulDesc_t op{};
++    cublasLtMatrixLayout_t weight{}, input{}, output{}, parent_weight{}, parent_output{};
++    cublasLtMatmulPreference_t pref{};
++    std::vector<cublasLtMatmulAlgo_t> algorithms;
++    ~Probe() {
++        if (pref) cublasLtMatmulPreferenceDestroy(pref);
++        for (auto layout : {weight, input, output, parent_weight, parent_output})
++            if (layout) cublasLtMatrixLayoutDestroy(layout);
++        if (op) cublasLtMatmulDescDestroy(op);
++        if (handle) cublasLtDestroy(handle);
++    }
++};
++
++extern "C" void destroy_probe(void* opaque) { delete static_cast<Probe*>(opaque); }
++#define CHECK(expr) do { auto code = (expr); if (code != CUBLAS_STATUS_SUCCESS) { \
++    std::fprintf(stderr, "cuBLASLt status %d at line %d\n", int(code), __LINE__); delete p; return nullptr; } } while (0)
++
++extern "C" void* prepare_probe(int m, int n, int full_n, int k, uint64_t workspace_bytes) {
++    auto* p = new Probe;
++    CHECK(cublasLtCreate(&p->handle));
++    CHECK(cublasLtMatmulDescCreate(&p->op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
++    cublasOperation_t trans = CUBLAS_OP_T;
++    CHECK(cublasLtMatmulDescSetAttribute(p->op, CUBLASLT_MATMUL_DESC_TRANSA, &trans, sizeof(trans)));
++    CHECK(cublasLtMatrixLayoutCreate(&p->weight, CUDA_R_16BF, k, n, k));
++    CHECK(cublasLtMatrixLayoutCreate(&p->input, CUDA_R_16BF, k, m, k));
++    CHECK(cublasLtMatrixLayoutCreate(&p->output, CUDA_R_32F, n, m, n));
++    CHECK(cublasLtMatrixLayoutCreate(&p->parent_weight, CUDA_R_16BF, k, full_n, k));
++    CHECK(cublasLtMatrixLayoutCreate(&p->parent_output, CUDA_R_32F, full_n, m, full_n));
++    CHECK(cublasLtMatmulPreferenceCreate(&p->pref));
++    CHECK(cublasLtMatmulPreferenceSetAttribute(p->pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
++                                               &workspace_bytes, sizeof(workspace_bytes)));
++    for (bool full : {true,false}) {
++        auto w = full ? p->parent_weight : p->weight;
++        auto y = full ? p->parent_output : p->output;
++        cublasLtMatmulHeuristicResult_t results[32]{};
++        int count = 0;
++        CHECK(cublasLtMatmulAlgoGetHeuristic(p->handle,p->op,w,p->input,y,y,p->pref,32,results,&count));
++        for (int i=0; i<count; ++i) {
++            if (results[i].state != CUBLAS_STATUS_SUCCESS) continue;
++            bool duplicate = false;
++            for (const auto& previous : p->algorithms)
++                if (std::memcmp(&previous,&results[i].algo,sizeof(previous)) == 0) duplicate = true;
++            if (!duplicate) p->algorithms.push_back(results[i].algo);
++        }
++    }
++    return p;
++}
++
++extern "C" int probe_count(void* opaque) {
++    return int(static_cast<Probe*>(opaque)->algorithms.size());
++}
++extern "C" int probe_call(void* opaque, int index, const void* w, const void* x, void* y,
++                          void* workspace, uint64_t bytes, cudaStream_t stream) {
++    auto p = static_cast<Probe*>(opaque);
++    if (index < 0 || size_t(index) >= p->algorithms.size()) return -1;
++    float alpha = 1, beta = 0;
++    return int(cublasLtMatmul(p->handle,p->op,&alpha,w,p->weight,x,p->input,&beta,
++        y,p->output,y,p->output,&p->algorithms[index],workspace,bytes,stream));
++}
++extern "C" int probe_attr(void* opaque, int index, int field) {
++    auto p = static_cast<Probe*>(opaque);
++    const cublasLtMatmulAlgoConfigAttributes_t attrs[] = {
++        CUBLASLT_ALGO_CONFIG_ID,CUBLASLT_ALGO_CONFIG_TILE_ID,CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
++        CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,CUBLASLT_ALGO_CONFIG_STAGES_ID};
++    int value=-1;
++    if(index<0 || size_t(index)>=p->algorithms.size() || field<0 || field>=5) return -1;
++    auto status=cublasLtMatmulAlgoConfigGetAttribute(&p->algorithms[index],attrs[field],&value,sizeof(value),nullptr);
++    return status == CUBLAS_STATUS_SUCCESS ? value : -1;
++}
++
++#include <algorithm>
++#include <array>
++#include <set>
++#include <tuple>
++#include <memory>
++
++static const cublasLtMatmulAlgoConfigAttributes_t fields[] = {
++    CUBLASLT_ALGO_CONFIG_ID, CUBLASLT_ALGO_CONFIG_TILE_ID,
++    CUBLASLT_ALGO_CONFIG_SPLITK_NUM, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
++    CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION,
++    CUBLASLT_ALGO_CONFIG_STAGES_ID, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID,
++    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID};
++
++struct Entry {
++    cublasLtMatmulAlgo_t algo;
++    int source;
++    uint64_t discovery_workspace;
++    uint64_t parent_workspace;
++    uint64_t local_workspace;
++};
++using Fields=std::array<int,9>;
++static Fields describe(const cublasLtMatmulAlgo_t &algo) {
++    Fields f{};
++    for (int i=0;i<9;++i) {
++        int value=-1;
++        auto s=cublasLtMatmulAlgoConfigGetAttribute(&algo,fields[i],&value,sizeof(value),nullptr);
++        f[i]=s==CUBLAS_STATUS_SUCCESS?value:-1;
++    }
++    return f;
++}
++
++struct Sweep {
++    std::unique_ptr<Probe> p;
++    std::vector<Entry> entries;
++    std::set<Fields> seen;
++    uint64_t cap;
++    Sweep(Probe* state,uint64_t bytes):p(state),cap(bytes) {}
++    void add(const cublasLtMatmulAlgo_t &algo,int from,uint64_t ws) {
++        if (!seen.insert(describe(algo)).second) return;
++        cublasLtMatmulHeuristicResult_t full{},local{};
++        auto chk=[&](bool parent,cublasLtMatmulHeuristicResult_t *out) {
++            auto w=parent?p->parent_weight:p->weight, y=parent?p->parent_output:p->output;
++            return cublasLtMatmulAlgoCheck(p->handle,p->op,w,p->input,y,y,&algo,out);
++        };
++        auto sf=chk(true,&full),ss=chk(false,&local);
++        if (sf||ss||full.state||local.state||full.workspaceSize>cap||local.workspaceSize>cap) return;
++        entries.push_back({algo,from,ws,full.workspaceSize,local.workspaceSize});
++    }
++};
++
++extern "C" void *make_sweep(int m,int n,int full_n,int k,int ldout,uint64_t native_ws,uint64_t cap,int max_split) {
++    auto probe=static_cast<Probe*>(prepare_probe(m,n,full_n,k,cap));
++    if (!probe) return nullptr;
++    auto wrapper=std::make_unique<Sweep>(probe,cap);
++    auto* p=wrapper->p.get();
++    cublasLtMatrixLayoutDestroy(p->output);
++    p->output=nullptr;
++    if (cublasLtMatrixLayoutCreate(&p->output,CUDA_R_32F,n,m,ldout)) return nullptr;
++    std::vector<uint64_t> workspaces{native_ws,cap,0,128*1024,512*1024,1024*1024,
++                                    2*1024*1024,4*1024*1024,8*1024*1024,16*1024*1024,32*1024*1024};
++    for(auto bytes:workspaces) {
++        if(bytes>cap) continue;
++        cublasLtMatmulPreferenceSetAttribute(p->pref,CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&bytes,sizeof(bytes));
++        for(bool full:{true,false}) {
++            auto w=full?p->parent_weight:p->weight, y=full?p->parent_output:p->output;
++            cublasLtMatmulHeuristicResult_t results[64]{};
++            int count=0;
++            auto status=cublasLtMatmulAlgoGetHeuristic(p->handle,p->op,w,p->input,y,y,p->pref,64,results,&count);
++            if(status) continue;
++            for(int i=0;i<count;++i) if(!results[i].state) wrapper->add(results[i].algo,full?0:1,bytes);
++        }
++    }
++    // Keep exact valid seed tiling, stages, swizzle and custom settings.
++    // Sweep only permitted split-K counts and reduction modes, checking both
++    // layouts with the installed CUDA version. Parameters are runtime input.
++    auto seeds=wrapper->entries;
++    for(int split=1;split<=max_split;++split) {
++        for(auto &seed:seeds) {
++            auto a=seed.algo;
++            if(cublasLtMatmulAlgoConfigSetAttribute(&a,CUBLASLT_ALGO_CONFIG_SPLITK_NUM,&split,sizeof(split))) continue;
++            for(int red:{0,1,2,4}) {
++                if(cublasLtMatmulAlgoConfigSetAttribute(&a,CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,&red,sizeof(red))) continue;
++                wrapper->add(a,2,seed.discovery_workspace);
++            }
++        }
++    }
++    return wrapper.release();
++}
++extern "C" int sweep_count(void* q){return static_cast<Sweep*>(q)->entries.size();}
++extern "C" void sweep_attr(void* q,int i,int* sink,uint64_t* work){
++    const auto &e=static_cast<Sweep*>(q)->entries.at(i);
++    auto f=describe(e.algo); std::copy(f.begin(),f.end(),sink); sink[9]=e.source;
++    work[0]=e.discovery_workspace; work[1]=e.parent_workspace; work[2]=e.local_workspace;
++}
++extern "C" int sweep_call(void* q,int i,int full,const void* w,const void* x,void* y,
++    void* scratch,uint64_t bytes,cudaStream_t stream) {
++    auto* s=static_cast<Sweep*>(q);auto* p=s->p.get();const auto& a=s->entries.at(i).algo;
++    auto weight=full?p->parent_weight:p->weight, output=full?p->parent_output:p->output;
++    float alpha=1,beta=0;
++    return cublasLtMatmul(p->handle,p->op,&alpha,w,weight,x,p->input,&beta,y,output,y,output,
++                        &a,scratch,bytes,stream);
++}
++extern "C" void drop_sweep(void* q){delete static_cast<Sweep*>(q);}
+diff --git a/python/sglang/srt/layers/communication/muse_target_projection.py b/python/sglang/srt/layers/communication/muse_target_projection.py
+new file mode 100644
+index 0000000..b997a94
+--- /dev/null
++++ b/python/sglang/srt/layers/communication/muse_target_projection.py
+@@ -0,0 +1,226 @@
++"""Full-K BF16 × BF16 → FP32 projection for pre-qualified prefill row shards."""
++from __future__ import annotations
++
++import ctypes
++import functools
++import hashlib
++import logging
++import os
++import statistics
++import sysconfig
++import threading
++from pathlib import Path
++
++import torch
++from sglang.srt.utils.custom_op import register_custom_op
++
++log = logging.getLogger(__name__)
++_plans = {}
++_seen = set()
++_lock = threading.RLock()
++
++
++@functools.lru_cache(maxsize=1)
++def _library():
++    if os.name != "posix":
++        return None
++    try:
++        from torch.utils.cpp_extension import CUDA_HOME, load
++
++        wheel = Path(sysconfig.get_paths()["purelib"]) / "nvidia"
++        roots = [wheel / "cu13", wheel / "cublas", wheel / "cuda_runtime"]
++        if CUDA_HOME:
++            roots.append(Path(CUDA_HOME))
++        includes = [p / "include" for p in roots if (p / "include").is_dir()]
++        includes.extend([p / "cccl" for p in list(includes) if (p / "cccl").is_dir()])
++        if not any((p / "cublasLt.h").exists() for p in includes):
++            return None
++        library = next((so for p in roots for d in ("lib", "lib64") for so in
++                        sorted((p / d).glob("libcublasLt.so*")) if so.is_file()), None)
++        if library is None:
++            return None
++        src = Path(__file__).with_name("muse_target_projection.cc")
++        name = "sgl_target_lt_" + hashlib.sha256(src.read_bytes()).hexdigest()[:12]
++        path = load(name, [str(src)], extra_include_paths=[str(p) for p in includes],
++                    extra_cflags=["-O2"], extra_ldflags=[str(library),"-Wl,-rpath,"+str(library.parent)],
++                    is_python_module=False, with_cuda=False, verbose=False)
++        dll = ctypes.CDLL(path)
++        ptr, integer, size = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64
++        for symbol, signature, result in (
++            ("make_sweep",[integer]*5+[size,size,integer],ptr), ("sweep_count",[ptr],integer),
++            ("sweep_attr",[ptr,integer,ctypes.POINTER(integer),ctypes.POINTER(size)],None),
++            ("sweep_call",[ptr,integer,integer,ptr,ptr,ptr,ptr,size,ptr],integer),("drop_sweep",[ptr],None),
++        ):
++            fn = getattr(dll,symbol)
++            fn.argtypes,fn.restype=signature,result
++        return dll
++    except (OSError,RuntimeError,ImportError,AttributeError) as exc:
++        log.info("Target projection uses native GEMM: %s", exc)
++        return None
++
++
++def _native(x, weight):
++    return torch.mm(x, weight.t(), out_dtype=torch.float32)
++
++
++def _layout(x, weight):
++    return (x.device.index, x.shape[0], weight.shape[0], weight.shape[1],
++            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
++            torch.are_deterministic_algorithms_enabled())
++
++
++def _compatible(x, weight):
++    return (x.is_cuda and x.device == weight.device and x.ndim == weight.ndim == 2
++            and torch.cuda.current_device() == x.device.index
++            and x.dtype == weight.dtype == torch.bfloat16 and x.is_contiguous() and weight.is_contiguous()
++            and x.shape[1] == weight.shape[1] and x.data_ptr() % 256 == weight.data_ptr() % 256 == 0
++            and not torch.are_deterministic_algorithms_enabled())
++
++
++class Plan:
++    def __init__(self, dll, handle):
++        self.dll, self.handle, self.index = dll, handle, None
++
++    def run(self, index, x, weight):
++        y = torch.empty((x.shape[0], weight.shape[0]), device=x.device, dtype=torch.float32)
++        code = self.dll.sweep_call(self.handle, index, 1, weight.data_ptr(), x.data_ptr(), y.data_ptr(),
++                                   0, 0, torch.cuda.current_stream(x.device).cuda_stream)
++        if code:
++            return None
++        return y
++
++    def close(self):
++        if self.handle:
++            self.dll.drop_sweep(self.handle)
++            self.handle = None
++
++
++def _elapsed(fn):
++    start,end = torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
++    start.record()
++    result=fn()
++    end.record()
++    end.synchronize()
++    return start.elapsed_time(end) if result is not None else float("inf")
++
++
++def _calibrate(x, actual_weight):
++    dll = _library()
++    if dll is None:
++        return None
++    m, k = x.shape
++    n = actual_weight.shape[0]
++    # Only zero-workspace plans can execute. Discovery also queries larger
++    # workspace budgets to expose valid vendor tiles before their split checks.
++    cap = 32 * 1024**2
++    h = dll.make_sweep(m,n,n,k,n,0,cap,4)
++    if not h:
++        return None
++    plan=Plan(dll,h)
++    try:
++        candidates=[]
++        for i in range(dll.sweep_count(h)):
++            attr,workspace=(ctypes.c_int*10)(),(ctypes.c_uint64*3)()
++            dll.sweep_attr(h,i,attr,workspace)
++            if workspace[1]==0:
++                candidates.append(i)
++        if not candidates:
++            return None
++        gen=torch.Generator(device=x.device).manual_seed(919343)
++        for mode in ("actual","cancellation","finite"):
++            x.normal_(std=.1,generator=gen)
++            if mode=="actual":
++                w=actual_weight
++            else:
++                w=torch.empty_like(actual_weight).normal_(std=.025,generator=gen)
++            if mode=="cancellation":
++                # Power-of-two signed cancellation with one representable perturbation.
++                xx=x.view(m,-1,2,64)
++                ww=w.view(n,-1,2,64)
++                xx[:,:,1].copy_(xx[:,:,0]);ww[:,:,1].copy_(ww[:,:,0]).neg_()
++                ww[::3,:,1,0].mul_(1.0078125)
++            if mode=="finite":
++                x[:,::4]*=128
++                w[:,::4]/=128
++                x[::11,1::7]=-0.0
++            ref=_native(x,w)
++            next_candidates=[]
++            for i in candidates:
++                y=plan.run(i,x,w)
++                if y is not None and torch.equal(y.view(torch.int32),ref.view(torch.int32)):
++                    next_candidates.append(i)
++            candidates=next_candidates
++            if not candidates:
++                return None
++        # Compare the trial on the live model weight. Confirm the best choice
++        # in balanced order with a duplicate native control before accepting.
++        x.normal_(std=.1,generator=gen)
++        ref=_native(x,actual_weight)
++        passing=[]
++        for i in candidates:
++            y=plan.run(i,x,actual_weight)
++            if y is not None and torch.equal(y.view(torch.int32),ref.view(torch.int32)):
++                passing.append((statistics.median(_elapsed(lambda:plan.run(i,x,actual_weight)) for _ in range(3)),i))
++        if not passing:
++            return None
++        best=min(passing)[1]
++        native=lambda:_native(x,actual_weight)
++        trial=lambda:plan.run(best,x,actual_weight)
++        pairs,controls=[],[]
++        for step in range(6):
++            if step%2:
++                c,b,a=_elapsed(native),_elapsed(trial),_elapsed(native)
++            else:
++                a,b,c=_elapsed(native),_elapsed(trial),_elapsed(native)
++            pairs.append(a/max(b,1e-9))
++            controls.append(a/max(c,1e-9))
++        if min(pairs)<=1 or statistics.median(pairs)<=1.02:
++            return None
++        if abs(statistics.median(controls)-1)>.02:
++            return None
++        plan.index=best
++        return plan
++    finally:
++        if plan.index is None:
++            plan.close()
++
++
++@torch.inference_mode()
++def prepare(rows, weight):
++    if (not weight.is_cuda or weight.dtype != torch.bfloat16 or weight.ndim!=2 or not weight.is_contiguous()
++            or rows<=0 or weight.shape[1]%128 or weight.shape[0]%128 or weight.data_ptr()%256!=0
++            or torch.cuda.is_current_stream_capturing() or torch.are_deterministic_algorithms_enabled()):
++        return
++    with _lock, torch.cuda.device(weight.device):
++        # Check the layout cache before allocating or compiling.
++        key=(weight.device.index,rows,weight.shape[0],weight.shape[1],
++             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
++             torch.are_deterministic_algorithms_enabled())
++        if key in _seen:
++            return
++        _seen.add(key)
++        try:
++            x=torch.empty((rows,weight.shape[1]),device=weight.device,dtype=torch.bfloat16)
++            if not _compatible(x,weight):
++                return
++            with torch.cuda.stream(torch.cuda.current_stream(weight.device)):
++                plan=_calibrate(x,weight)
++            if plan is not None:
++                _plans[key]=plan
++        except (RuntimeError,OSError,MemoryError) as exc:
++            log.info("Target projection warmup uses native GEMM: %s",exc)
++
++
++def _fake(x, weight):
++    return x.new_empty((x.shape[0],weight.shape[0]),dtype=torch.float32)
++
++
++@register_custom_op(fake_impl=_fake)
++def qualified_target_row_mm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
++    if _compatible(x,weight):
++        plan=_plans.get(_layout(x,weight))
++        if plan is not None:
++            y=plan.run(plan.index,x,weight)
++            if y is not None:
++                return y
++    return _native(x,weight)
+diff --git a/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py b/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
+index 03e43f2..e22f308 100644
+--- a/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
++++ b/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
+@@ -282,7 +282,7 @@ First and final outputs alias one buffer as in the stock Marlin path.
+ The caller applies the original per-expert norm and weighted finalization."""
+     from humming.layer import HummingMethod
+     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+-    from sglang.kernels.ops.activation.activation import silu_and_mul
++    from sglang.kernels.ops.moe.route_activation import scaled_prefill_activation
+     from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
+     configs = layer.fp32_configs
+     valid = local_ids.numel()
+@@ -299,9 +299,8 @@ The caller applies the original per-expert norm and weighted finalization."""
+     HummingMethod.forward_layer(layer, inputs=x, outputs=cache1, top_k=topk, sublayer_name='w13', tuning_config=selected['w13'], **common)
+     # GEMM output has already rounded to BF16. Apply the BF16 global scale
+     # in a separate BF16 operation, preserving Marlin's second rounding.
+-    scale_active_rows(cache1, local_ids, layer.w13_post_scale)
+     cache2 = torch.empty((m * topk, i), device=x.device, dtype=x.dtype)
+-    silu_and_mul(cache1, cache2, expert_ids=local_ids.flatten(), expert_step=1)
++    scaled_prefill_activation(cache1, cache2, local_ids, layer.w13_post_scale)
+     cache3 = cache13[:m * topk * k].view(m * topk, k)
+     if selected['w2']['block_shape'][0] != block:
+         second = moe_align_block_size(local_ids, selected['w2']['block_shape'][0], layer.w2_post_scale.numel(), ignore_invalid_expert=True)
+diff --git a/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py b/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+index 5587d0d..5fcef0a 100644
+--- a/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+@@ -1747,6 +1747,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
+         """
+         num_tokens = size
+         forward_batch, attn_backend = self.capture_prepare(num_tokens)
++        prepare_projections = getattr(self.model_runner.model, "prepare_target_projection_plans", None)
++        if prepare_projections is not None:
++            prepare_projections(num_tokens)
+         # Recapture can follow decode replay, which may change model-owned storage.
+         prepare = getattr(self.model_runner.model, "prepare_for_forward", None)
+         if prepare is not None:
+diff --git a/python/sglang/srt/models/muse_spark.py b/python/sglang/srt/models/muse_spark.py
+index 2e6a757..1dcb575 100644
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -759,7 +759,8 @@ class MuseSpark1xMoE(nn.Module):
+                 return gemm_ag(comm, output, self.post_expert_proj.weight)
+             if self._can_shard_prefill_row_projection(output, self.post_expert_proj.weight):
+                 return prefill_row_projection(
+-                    get_parallel().tp_group, output, self.post_expert_proj.weight
++                    get_parallel().tp_group, output, self.post_expert_proj.weight,
++                    qualify_vendor=getattr(self.experts, "use_humming", False),
+                 )
+             if self._can_shard_small_projection(output, self.post_expert_proj.weight):
+                 return small_projection(
+@@ -871,7 +872,8 @@ class MuseSpark1xMoE(nn.Module):
+                 hidden_states, self.pre_expert_proj.weight
+             ):
+                 expert_input = prefill_row_projection(
+-                    get_parallel().tp_group, hidden_states, self.pre_expert_proj.weight
++                    get_parallel().tp_group, hidden_states, self.pre_expert_proj.weight,
++                    qualify_vendor=getattr(self.experts, "use_humming", False),
+                 )
+             elif self._can_shard_small_projection(
+                 hidden_states, self.pre_expert_proj.weight
+@@ -1423,6 +1425,33 @@ class MuseSparkTextForCausalLM(nn.Module):
+     def get_layers(self):
+         return self.model.language_model.layers
+ 
++
++    @torch.inference_mode()
++    def prepare_target_projection_plans(self, num_tokens: int) -> None:
++        parallel = get_parallel()
++        if (
++            parallel.tp_size not in (2, 4, 8)
++            or num_tokens < 512
++            or num_tokens % parallel.tp_size
++            or parallel.attn_dp_size != 1
++            or parallel.attn_cp_size != 1
++            or envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
++            or not torch.cuda.is_available()
++            or torch.cuda.get_device_capability() != (9, 0)
++        ):
++            return
++        from sglang.srt.layers.communication.muse_target_projection import prepare
++
++        layouts = set()
++        for layer in self.get_layers():
++            if not layer.is_moe_layer or not getattr(layer.mlp.experts, "use_humming", False):
++                continue
++            for proj in (layer.mlp.pre_expert_proj, layer.mlp.post_expert_proj):
++                if proj is None or tuple(proj.weight.shape) in layouts:
++                    continue
++                layouts.add(tuple(proj.weight.shape))
++                prepare(num_tokens // parallel.tp_size, proj.weight)
++
+     def get_attention_sliding_window_size(self) -> Optional[int]:
+         if "sliding_attention" in self.config.layer_types:
+             return self.config.sliding_window - 1

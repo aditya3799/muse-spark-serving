@@ -1,0 +1,14 @@
+Three-hour continuation:10:32:37--13:32:37UTC, November19.
+
+Prioritize larger affected runtime fractions; component wins remain qualified
+only within their measured scope. Read round1/coordination/RESEARCH_DECISION.txt
+and frozen evidence before reusing any old positive result. Keep failed hypotheses.
+
+Root investigates existing gather+norm fusion on Hopper with native single-CTA
+arithmetic, then actual communication/resource scheduling bottlenecks. Agents own
+separate directories and source targets. Every new shipping experiment is an
+unapplied patch; round1 frozen submissions stay byte-identical.
+
+New H200 logs take priority when available. Read statuses periodically, not in
+a busy loop. No scored or paid work. Research continues to the requested end
+time even if unscored queue is stalled; do not fabricate a2x conclusion.

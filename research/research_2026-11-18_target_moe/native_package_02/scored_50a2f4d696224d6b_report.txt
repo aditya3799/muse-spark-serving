@@ -1,0 +1,22 @@
+﻿Hopper scored serving run 50a2f4d696224d6b
+Job done. Evaluation ok. Overall pass True. Eligible loads 0. Official score null.
+GPU count 8. Backend humming. Startup 361.3 s. Pod time 4734.1 s.
+
+Judge exclusion reasons
+1 users | ttft_first_p90_s 18.74s > 2x stock's 8.97s
+4 users | ttft_first_p90_s 45.47s > 2x stock's 21.35s
+16 users | ttft_first_p90_s 174.26s > 2x stock's 84.11s
+32 users | truncated
+
+Raw load measurements
+Users | reps | tokens/s/GPU | median generation tokens/s/user | end-to-end tokens/s/user | first-turn p90 TTFT (s) | later-turn p90 TTFT (s) | cache hit | acceptance | truncated
+1 | 3 | 3728.2 | 151.1 | 81.5 | 18.741 | 0.419 | 0.92 | 4.1 | False
+4 | 3 | 5308.8 | 71.2 | 29.2 | 45.471 | 0.444 | 0.92 | 3.8 | False
+16 | 3 | 6450.1 | 32.3 | 9.1 | 174.256 | 2.703 | 0.92 | 4 | False
+32 | 1 | 3212.8 | 29.3 | 2.4 | 386.442 | 53.256 | 0.81 | 3.7 | True
+
+Correctness passed on 176 references. Invalid 0. Short outputs 0.
+Prefill top-1 0.82. Prefill mean KL 0.053. Decode mean KL 0.013. Judge agreement metric 0.14 (minimum 0.05).
+Multi-turn check passed across 16 conversations. First agreement 0.96. Later agreement 0.97 over 36826 later positions. The 32-user per-load check is marked checked=false.
+GPU memory over stock -0.1 GB. Permitted increase 2 GB.
+Supplied startup log ends at the first request. The receipt gives only 'truncated' as the 32-user exclusion reason.

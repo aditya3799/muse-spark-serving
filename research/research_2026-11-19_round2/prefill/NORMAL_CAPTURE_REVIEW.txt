@@ -1,0 +1,43 @@
+Positive capture-path audit of frozen normal80db (read-only).
+
+try_grouped's is_current_stream_capturing check is INSIDE `if index not in_STATE`.
+It prevents first qualification during capture; it does not disable an already
+qualified arena during capture. _stream_allowed returns True for the registered
+resources.streams['cuda_graph_capture'] before its generic capture veto.
+
+The stream identities agree:
+- runner_utils/pool.py _CAPTURE_STREAM_NAME='cuda_graph_capture';
+  get_or_create_global_graph_capture_stream calls runtime get_stream with that key.
+- PrefillCudaGraphRunner._capture enters graph_capture(stream=that stream), then
+  backend.capture_session(self.stream).
+- GroupCoordinator.graph_capture waits on prior initialization stream, then enters
+  device_module.stream(stream). Thus BCG's two warmup forwards and capture body
+  use the same registered capture stream.
+- A successful normal qualification during the first largest-bucket eager warmup
+  retains Arena in_STATE. Later try_grouped calls reach Arena.forward in capture.
+  Arena.forward updates self.stream to current before native launches, so launch
+  arguments are issued on the active capture stream.
+
+The Humming Muse path is not replaced by an eager MoE graph break:
+MuseSparkMoE._forward_experts -> experts.forward(use_marlin=True for Humming)
+->_forward_marlin -> _marlin_expert_outputs -> patched_humming_expert_outputs
+->try_grouped ->Arena.forward. These methods have no eager_on_graph decorator.
+set_tc_piecewise_forward_context stores context metadata; it does not monkeypatch
+these functions. RadixAttention._eager_attention is the separate attention break.
+Therefore successful grouped launches are captured in the following FFN segment.
+
+Serialization scope: normal rejects TBO, SBO and PP>1. Router-side-stream work
+joins the main stream before experts. Target execution and graph replay follow
+the scheduler's one forward stream. BCG's shared graph-pool scope prevents
+nested host ownership; it is not by itself a device synchronization guarantee.
+Safety still depends on that existing serialized-forward-stream contract.
+_stream_allowed permits initialization/capture and later binds one forward stream
+after a device synchronize. Other eager streams are rejected. Graph replay bypasses
+Python dispatch, so future concurrent replay/stream designs would require revisiting
+the shared arena; current ordinary scheduler contract is the relevant constraint.
+
+Conclusion: no unconditional capture activation veto found. If first warmup
+qualification succeeds, the grouped path can be captured and its arena persists
+into later row-FC startup qualification. If qualification fails, native Humming
+remains active and no grouped speedup may be claimed. Native H200 launch logs and
+profile still determine actual activation; source audit does not prove launch gain.

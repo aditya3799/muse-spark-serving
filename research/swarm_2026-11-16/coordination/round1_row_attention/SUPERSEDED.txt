@@ -1,0 +1,1 @@
+﻿Unsubmitted encoding-damaged comments. Use ../round1_row_attention_utf8. Runtime AST is identical, documented by attention_speculation/encoding_validation.json.

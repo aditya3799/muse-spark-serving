@@ -1,0 +1,64 @@
+ATTENTION/SPECULATION ROUND 1 - 2026-11-16
+
+Mechanism: reuse FA3 scheduling metadata across full-attention target-verify
+layers. Existing SGLang reuses it only for normal decode. Separate verify
+buffer, refreshed per replay, guards for exact Q/K/V geometry and causal
+full attention; SWA/local/cross/DP/CP/custom masks retain stock behavior.
+
+Status: corrected local candidate passed; H200 FP8/serving validation pending.
+Frozen UTF8/LF source SHA256:
+2a720c8f5ed86437e6ec181cace03ae97fba0460672b1d001549f8df4b71e03c
+Exact runtime AST is identical to GPU-validated source66ffaeaf (encoding
+repair restores comments/docstrings only, zero other literal changes).
+See encoding_validation.json for that proof and original raw source hashes
+in candidate_manifest.json. GPU suite passed60 cases, CPU suite7 scheduler
+refreshes/6 forward-boundary cases; tests are scoped as described below.
+
+Bare FA3 API probe passed 12 BF16 geometry/window cases,
+with bitwise equality after changed-Q and length replays. Exact exported
+method GPU tests then found a metadata-size mismatch at short capture
+lengths. Failure is preserved in candidate_gpu_tests_failed_live_maxk.json.
+Diagnosis: get_scheduler_metadata(maxK=25) emits16 entries, whereas the
+attention kernel derives maxK from page-table capacity8192 and requires17.
+Both cu_seqlens_k_new settings reproduced it, so that field is not the cause.
+The corrected candidate uses page_table.shape[1]*page_size and computes eager
+metadata only after final page conversion. Corrected GPU rerun passed60 cases.
+An intermediate ragged fixture failed because it padded a ghost row to10
+queries while declaring maxQ8. It is preserved separately. Corrected test
+asserts every padded row fits maxQ and still compares all covered rows,
+including valid padding; no output tolerance was relaxed.
+
+Synthetic 32-layer BF16 chain A/B showed small gains, but laptop clock drift
+was visible and no A/A control was included. Do not interpret these as a
+precise gain, a Hopper FP8 result, or an end-to-end serving result.
+
+CPU exact exported-method tests cover capture binding, refreshed lengths,
+stable pointers, actual RaggedVerifyLayout padding, and forward eligibility.
+GPU second-phase harness passed page1/256, alternating batch1/4/8 captured
+views sharing verify-buffer storage, changed Q/lengths, and real ragged
+layout/padding kernels. Live exact GPU result file is authoritative and its
+hash maps to the final export through encoding_validation.json.
+
+Full-semantic FP8 kernel-track adapter prepared in fp8_validation/submission.py
+(9595bytes; SHA47d842e59d2cd390007d42d05852ac57bfbe4579bbdd4bbc7057525a07b1b019).
+It retains all task baseline operations and runs the exact exported verify
+scheduler inside each kernel_fn. It does not cache input-derived metadata
+or import reference/harness code. One layer cannot show the across-layer
+reuse benefit; use this only as extra FP8 correctness/geometry evidence.
+The task baseline is old commita55; serving is pinned297e. Root owns submission.
+
+Draft tuning: --speculative-num-draft-tokens is configurable. Block6 is a
+less aggressive candidate than4 versus stock8, with measured acceptance~4.
+Average acceptance cannot predict a win: DFlash bidirectional draft attention
+changes prefix proposals when block length changes. Require same-load H200
+throughput/acceptance/TTFT measurements and unchanged target verification.
+
+Projection cross-review found no immediate blocker: equal token-row shards
+and dim0 gathering reconstruct row order; SP/DP/CP guards establish input
+replication and post-expert reduction happens before unpool. Remote NCCL
+graph safety and full-model peak memory remain unvalidated.
+
+Round2 experimental draft_glue is separate from scheduler candidate. Only
+nontranslated FA4 DFlash draft metadata appears device-only; global DFlash
+glue guard must remain. Host-fed/translated plan capture can silently freeze
+draft state and acceptance. No glue candidate promotion without tests.

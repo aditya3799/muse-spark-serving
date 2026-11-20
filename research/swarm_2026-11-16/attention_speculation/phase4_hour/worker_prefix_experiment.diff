@@ -1,0 +1,128 @@
+--- a/sglang/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/sglang/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -1,4 +1,5 @@
+ import logging
++from sglang.srt.speculative.dflash_prefix_research import resolve_verify_prefix
+ import math
+ import os
+ from typing import TYPE_CHECKING, List, Optional, Tuple
+@@ -2225,7 +2226,7 @@
+         else:
+             if target_predict is None:
+                 target_predict = torch.argmax(next_token_logits, dim=-1)
+-            target_predict = target_predict.view(bs, int(self.block_size))
++            target_predict = target_predict.view(bs, candidates.shape[1])
+             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
+             if self._use_triton_accept_bonus:
+                 try:
+@@ -2282,6 +2283,12 @@
+             # accept_len; recompute it from the forced commit_lens.
+             new_seq_lens = None
+ 
++        # Preserve scheduler output stride8 even when the stock eager fallback
++        # produces a compact [B,K] output instead of the persistent [B,8] buffer.
++        if out_tokens.shape[1] != int(self.block_size):
++            padded = out_tokens.new_zeros((bs, int(self.block_size)))
++            padded[:, :out_tokens.shape[1]].copy_(out_tokens)
++            out_tokens = padded
+         return accept_len, commit_lens, bonus, out_tokens, new_seq_lens
+ 
+     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
+@@ -2820,17 +2827,33 @@
+         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
+         custom_mask = None
+ 
+-        verify_input_ids = draft_tokens.reshape(-1)
++        # Research-only: full draft8 computation and allocation above are unchanged.
++        # The default helper width is8. Prefix experiments are conservative greedy,
++        # non-DP, non-Mamba, no grammar/logprobs/penalties/route-output paths.
++        prefix_eligible = (
++            self._can_skip_verify_logits(batch, batch.sampling_info)
++            and not self._need_mamba_verify_commit
++            and not get_parallel().attn_dp_enabled
++            and SIMULATE_ACC_LEN == 0
++            and batch.seq_lens_cpu is not None
++            and not any(getattr(req, 'return_routed_experts', False) for req in batch.reqs)
++            and getattr(batch, 'replace_embeds', None) is None
++        )
++        verify_width, verify_candidates, verify_positions, verify_slots, verify_cols = resolve_verify_prefix(
++            draft_tokens, positions, verify_out_cache_loc, eligible=prefix_eligible
++        )
++        verify_input_ids = verify_candidates.reshape(-1)
+         verify_input = DFlashVerifyInput(
+             draft_token=verify_input_ids,
+-            positions=positions,
+-            draft_token_num=int(self.block_size),
++            positions=verify_positions,
++            draft_token_num=verify_width,
+             custom_mask=custom_mask,
+             capture_hidden_mode=CaptureHiddenMode.FULL,
+             kv_loc_plan=kv_loc_plan,
+-        )
+-
+-        batch.out_cache_loc = verify_out_cache_loc
++            kv_loc_cols=verify_cols,
++        )
++
++        batch.out_cache_loc = verify_slots
+         sampling_info = batch.sampling_info
+ 
+         seq_lens_pre_verify = (
+@@ -2840,7 +2863,7 @@
+         seq_lens_sum_backup = batch.seq_lens_sum
+         if seq_lens_cpu_backup is not None:
+             # Verify host bound = committed prefix + one verify block (matches draft).
+-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
++            verify_host_seq_lens = seq_lens_cpu_backup + verify_width
+             batch.seq_lens_cpu = verify_host_seq_lens
+             batch.seq_lens_sum = int(verify_host_seq_lens.sum())
+         elif draft_input.nxt_kv_lens_cpu is not None:
+@@ -2911,14 +2934,14 @@
+             apply_dflash_verify_logits_adjustments(
+                 next_token_logits=logits_output.next_token_logits,
+                 sampling_info=sampling_info,
+-                draft_token_num=int(self.block_size),
++                draft_token_num=verify_width,
+             )
+ 
+         # Constrain every chain position before accept picks from it.
+         if grammar_mask is not None:
+             grammar_mask.apply(logits_output.next_token_logits)
+ 
+-        candidates = draft_tokens
++        candidates = verify_candidates
+         (
+             accept_len,
+             commit_lens,
+@@ -2939,7 +2962,7 @@
+             sampling_info,
+             next_token_logits=logits_output.next_token_logits,
+             draft_input=draft_input,
+-            draft_token_num=int(self.block_size),
++            draft_token_num=verify_width,
+             bs=bs,
+         )
+         if sampling_mask_capture is not None:
+@@ -2978,16 +3001,18 @@
+             raise RuntimeError(
+                 "DFLASH verify requires target hidden states, but got None."
+             )
+-        hidden = hidden.view(bs, int(self.block_size), -1)
++        hidden = hidden.view(bs, verify_width, -1)
+ 
+         # Consume in this step: every decode graph size shares one aux output,
+         # which the next target forward overwrites (resolve_aux_hidden_states_width).
+-        cache_loc = self._draft_write_ids(kv_loc_plan)
++        cache_loc = kv_loc_plan.write_ids(
++            self.draft_model_runner.kv_index_translator, cols=verify_cols
++        )
+         self._append_target_hidden_to_draft_kv_by_loc(
+             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+             cache_loc=cache_loc,
+-            cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
+-            positions=positions,
++            cache_loc_2d=cache_loc.view(bs, verify_width),
++            positions=verify_positions,
+             commit_lens=commit_lens,
+         )
+ 

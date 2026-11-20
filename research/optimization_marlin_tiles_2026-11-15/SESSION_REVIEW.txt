@@ -1,0 +1,50 @@
+PROFILING SESSION REVIEW - 2026-11-15
+
+No 1.5x end-to-end serving claim is established. The submitted V4 cached-mapping patch remains unchanged; the existing H200 check is still pending.
+
+Selected experimental patch: candidate_compact32_01/candidate_unsubmitted.diff (20702 bytes)
+SHA256: 4c602c41fed4d0d4d25071eff1e2be82697be9a48a52c319652a5147873bfea1
+This is a cumulative patch against 297e54fd, verified by applying it in an isolated Git root and comparing every output source. It is prepared for H200 validation, not integrated or submitted.
+
+The patch preserves original Marlin arithmetic and selects a compact 32-row route table on the GPU only when each active local expert fits in one tile. Otherwise it retains the baseline tile. Exactly one projection performs active work. Small workloads and unsupported selector sizes retain the original path.
+
+Measured serial max-rank GRAPH proxy (baseline max / candidate max):
+  M= 128 uniform     1.3596x
+  M= 128 hot_rank    1.0000x
+  M= 128 hot_expert  1.0006x
+  M= 128 repeated    1.0031x
+  M= 128 all_remote  1.3505x
+  M= 256 uniform     1.5367x
+  M= 256 hot_rank    0.9985x
+  M= 256 hot_expert  1.0013x
+  M= 256 repeated    0.9991x
+  M= 256 all_remote  1.5096x
+  M= 512 uniform     1.2827x
+  M= 512 hot_rank    1.0025x
+  M= 512 hot_expert  0.9978x
+  M= 512 repeated    0.9969x
+  M= 512 all_remote  1.2482x
+
+These are sequential synthetic expert-partition measurements on one RTX3050, not H200 timings, concurrent distributed execution, stock throughput, or a serving score. Inactive work is excluded from useful-work summaries. A single local 1.60x point from the earlier 16-row policy is not the final result.
+
+What was established:
+- Real CUDA/Triton alignment, both Marlin GEMMs, activation and finalization ran locally at 4096-wide expert dimensions.
+- The local profile put about 99.5% of kernel time in the two GEMMs.
+- Fixed small tiles can regress concentrated routes by roughly 3x; that blanket policy was rejected.
+- Sorted-EP compiled and passed local checks but was essentially neutral.
+- Compact selection preserves every active route; changed-input graph tests cover balanced, concentrated, remote and inactive routing.
+- Independent dense-reference checks also cover duplicate slots and noncontiguous routing inputs.
+- Unchanged baseline execution is not always bitwise repeatable. Original strict failures and repeatability diagnostics are retained. Later replay screens use atol=0.0078125 and relative L2<=0.0005; candidate-vs-baseline uses atol/rtol=0.01/0.01. These are component screens, not token-agreement certification.
+
+Memory:
+  M=128: extra local-layer peak allocated 0.005 MiB
+           extra peak reserved 0.000 MiB
+  M=256: extra local-layer peak allocated 0.005 MiB
+           extra peak reserved 0.000 MiB
+  M=1024: extra local-layer peak allocated 0.005 MiB
+           extra peak reserved 0.000 MiB
+This does not establish the full-model 2GB/GPU limit; graph sharing, other layers, communication and KV cache are absent.
+
+Next: obtain the queued H200 result, then profile/test this candidate on H200 with real routing and full-model correctness, TTFT and peak memory. Do not spend a scored submission based only on these RTX results. Do not revive discarded V5/V6 or the closed mapping-notebook series.
+
+Reproduction: use run_local_linux.py with the isolated WSL venv /home/aditya/.venvs/okc-marlin-tiles. Each newer run retains harness_snapshot and package/compiler metadata. rank_sweep_compact32/exported_candidate_provenance.json identifies the exact candidate source executed. Raw samples, failures, profiler trace, summaries and source hashes are preserved.

@@ -1,0 +1,13 @@
+﻿SWARM OPTIMIZATION 2026-11-16
+Goal: >=1.6x measured end-to-end serving; four agents total.
+Coordinator: root (quotas, patch packaging, integration, remote evaluation).
+Specialists: moe; attention_speculation; projection_communication.
+All implementation in isolated per-agent directories. Preserve active sglang and existing patch artifacts.
+GPU: one 6GB RTX3050, reservation through coordinator. Local timings never represent H200 serving gains.
+Budget: live status reports three checks and one scored run remaining; resets 2026-11-17T00:00:00Z.
+Latest confirmed score: compact32 468701af35b84e07 = 1.0111x, correctness/later-turn/memory passed.
+Cached mapping f1513498e8d84de8 = passed, indicative 1.006x at 16 users.
+Earlier projection 82482c8c07c2422a = rejected (new-file patch mode metadata).
+FP32 projection 32bcbb190b204dd6 = queued, do not duplicate blindly.
+Cycle: evidence-backed hypothesis -> isolated implementation -> correctness and memory validation -> cross-review -> scarce H200 check -> compare -> next iteration.
+No paid hardware, precision reductions, workload-specific shortcuts, or relaxed correctness tests.

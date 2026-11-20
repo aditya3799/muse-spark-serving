@@ -1,0 +1,47 @@
+﻿Humming adapter feasibility - pinned 0.1.12
+
+Dependency verified against python/pyproject.toml: humming-kernels[cu13]==0.1.12.
+Exact wheel metadata/source inspected and installed under this experiment only.
+Official version page: https://pypi.org/project/humming-kernels/0.1.12/
+Wheel SHA256 from PyPI and prior recorded manifest:
+cd3ef712a93f3a9075ea99de2c72bcd3ec89dab3759b3a248d869f5507b60331
+License: Apache-2.0. No source copied into submission, no runtime download needed
+in the judge because this dependency is already pinned by the base checkout.
+Local import succeeds (Torch 2.14.1+cu130). Locally added nvidia-ml-py in the
+same isolated target because pynvml was absent in the component venv.
+
+API and numerical constraints
+HummingMethod.forward_layer accepts outputs, sorted_ids, expert_ids,
+num_tokens_padded, top_k and valid_shape_m. Its indexed backend exposes raw
+uncombined GEMMs; therefore stock post-expert norm and weighted sum can remain.
+HummingInputSchema(a_dtype=bfloat16) and use_f16_accum=False preserve BF16
+activation inputs and FP32 accumulation. No input quantization or weight
+requantization is enabled. Original NVFP4 codes/FP8 block scales are permuted.
+LayerConfig selects WGMMA on SM90 and MMA on the local SM86.
+
+Critical stock rounding boundary
+Marlin marlin_template.h write() first float2num(c), then __hmul2 with the BF16
+global scale. The native Humming global-scale epilogue is not assumed equal.
+Our probe disables Humming weight_scale_2, computes BF16 GEMM output then
+performs BF16 global-scale multiplication before stock activation/finalizer.
+Stock's power-of-two internal encoding is mathematically undone by this form,
+but local numerical tests must establish it, especially small/subnormal values.
+Gate/up use the gate global scale just as stock's Muse Marlin preparation does;
+restoring the distinct up scale would change stock behavior and is not done.
+
+Memory and fallback
+One Humming canonical layout for both indexed decode/prefill: weight bytes
+0.75 GiB + FP8 scales 0.09375 GiB at E32,H=I4096. Current stock Marlin also
+stores FP8 processed scales; earlier BF16-scale memory estimates were too high.
+Keeping two full layouts across the model is disallowed. Replaced parameters
+must be released after each sublayer conversion, and conversion peak checked.
+The probe intentionally holds both layouts only to compare kernels locally.
+For deployment indexed Humming supports general M with one representation;
+unsupported device/backend selection must retain the existing stock path at
+module construction, before changing any weights. Do not keep a second
+Marlin layout as an automatic runtime fallback.
+
+Current artifact humming_probe.py is an experiment, not an integrated candidate.
+No GPU numerical result yet. Thresholds declared before execution: final output
+relative L2 <=0.003 and max absolute <=0.03125 versus baseline. This does not
+replace full-model correctness/token-agreement or whole-model memory checks.

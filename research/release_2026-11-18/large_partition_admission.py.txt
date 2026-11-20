@@ -1,0 +1,173 @@
+def _large_prefill_config_signature(config):
+    """Immutable full tuning signature; list/tuple shapes have equal semantics."""
+    def freeze(value):
+        if isinstance(value, dict):
+            if not all(isinstance(key, str) for key in value):
+                raise TypeError("tuning keys must be strings")
+            return ("dict", tuple((key, freeze(value[key])) for key in sorted(value)))
+        if isinstance(value, (list, tuple)):
+            return ("sequence", tuple(freeze(item) for item in value))
+        if value is None:
+            return ("none",)
+        if type(value) in (bool, int, str):
+            return (type(value).__name__, value)
+        raise TypeError("unsupported tuning value")
+
+    if not isinstance(config, dict):
+        raise TypeError("tuning configuration must be a dictionary")
+    return freeze(config)
+
+
+def prepare_large_prefill_partition(layer, torch):
+    """Admit finite native configurations before any forward/capture.
+
+    This performs host configuration/device-property checks, never kernel build,
+    module load or launch. It is not a native numerical or occupancy guarantee.
+    The caller owns immutable metadata and graph invalidation after preparation.
+    """
+    layer._humming_large_prefill_partition_enabled = False
+    layer._humming_large_prefill_configs = frozenset()
+    try:
+        from copy import deepcopy
+        from dataclasses import fields
+
+        from humming.config import ComputeConfig, LayerConfig, TuningConfig
+        from humming.kernel.humming import HummingKernel
+        from humming.utils.device import fits_device_smem
+
+        metas = layer.humming_metas
+        owned = layer.fp32_configs
+        device = torch.device(layer.w13_post_scale.device)
+        if device.type != "cuda" or layer.w2_post_scale.device != layer.w13_post_scale.device:
+            return False
+        if set(metas) != {"w13", "w2"} or not {"w13", "w2"}.issubset(owned):
+            return False
+        if (metas["w13"].shape_n != 2 * metas["w2"].shape_k
+                or metas["w13"].shape_k != metas["w2"].shape_n
+                or metas["w13"].num_experts != metas["w2"].num_experts):
+            return False
+        for meta in metas.values():
+            if (str(meta.a_dtype) != "bfloat16" or str(meta.c_dtype) != "bfloat16"
+                    or str(meta.b_dtype) != "float4e2m1" or str(meta.bs_dtype) != "float8e4m3"
+                    or meta.input_scale_group_size != 0 or meta.weight_scale_group_size != 16
+                    or meta.has_zero_point or meta.has_bias or meta.use_packed_k_layout):
+                return False
+        admitted = set()
+        with torch.cuda.device(device):
+            props = torch.cuda.get_device_properties(device)
+            sm_version = props.major * 10 + props.minor
+
+            class ValidationKernel(HummingKernel):
+                # KernelRuntime normally caches by CUDA context and compiles in
+                # init_kernel. Bypass both; retain the pinned native validators.
+                def __new__(cls, *args, **kwargs):
+                    return object.__new__(cls)
+
+                def __post_init__(self):
+                    LayerConfig.__post_init__(self)
+                    ComputeConfig.__post_init__(self)
+                    TuningConfig.__post_init__(self)
+                    self.sm_version = sm_version
+                    self.sm_version_str = str(sm_version) + ("a" if sm_version >= 90 else "")
+                    self.check_shape()
+                    self.check_dtype()
+                    self.check_scale()
+                    self.check_config()
+                    self.mma_op_class = self.select_mma_op_class()
+
+                def prepare(self):
+                    raise RuntimeError("configuration admission cannot compile")
+
+                def load_cubin(self):
+                    raise RuntimeError("configuration admission cannot load a module")
+
+            for stage in ("w13", "w2"):
+                intervals = owned[stage]
+                if not isinstance(intervals, (list, tuple)) or not 0 < len(intervals) <= 256:
+                    return False
+                metadata = {
+                    field.name: getattr(metas[stage], field.name)
+                    for field in fields(LayerConfig) if field.init
+                }
+                configs = {}
+                for interval in intervals:
+                    if not isinstance(interval, (list, tuple)) or len(interval) != 3:
+                        return False
+                    config = interval[2]
+                    configs[_large_prefill_config_signature(config)] = deepcopy(config)
+                checked = {}
+
+                def legal(config):
+                    signature = _large_prefill_config_signature(config)
+                    if signature in checked:
+                        return checked[signature]
+                    checked[signature] = False
+                    if len(checked) > 1024:
+                        return False
+                    if config.get("use_f16_accum") is not False or config.get("use_stream_k") is not False:
+                        return False
+                    for name in ("num_ctas_per_sm", "num_write_splits"):
+                        count = config.get(name, 1)
+                        if type(count) is not int or count < 1:
+                            return False
+                    for name in ("block_shape", "warp_shape"):
+                        shape = config.get(name)
+                        if not isinstance(shape, (list, tuple)) or len(shape) != 3:
+                            return False
+                        if any(type(value) is not int or value <= 0 for value in shape):
+                            return False
+                    # Keep layer format and compute contract owned by metadata.
+                    tuning_names = {field.name for field in fields(TuningConfig) if field.init}
+                    if set(config) - tuning_names - {"num_sms", "use_f16_accum"}:
+                        return False
+                    launch_sms = config.get("num_sms", 0)
+                    if type(launch_sms) is not int or launch_sms < 0:
+                        return False
+                    values = dict(metadata)
+                    values.update(gemm_type="indexed", use_f16_accum=False)
+                    values.update(deepcopy(config))
+                    values.pop("num_sms", None)
+                    try:
+                        validator = ValidationKernel(**values)
+                        max_threads = getattr(props, "max_threads_per_block", 1024)
+                        valid = (
+                            0 < validator.num_threads <= max_threads
+                            and validator.use_f16_accum is False
+                            and validator.use_stream_k is False
+                            and fits_device_smem(validator, validator, validator, device)
+                        )
+                    except Exception:
+                        return False
+                    checked[signature] = bool(valid)
+                    return bool(valid)
+
+                # Validate all unchanged heavy configurations first. Only their
+                # K topologies may produce repaired light candidates.
+                heavy_k = set()
+                stage_admitted = set()
+                for signature, config in configs.items():
+                    if legal(config):
+                        stage_admitted.add((stage, signature))
+                        heavy_k.add((config["block_shape"][2], config["warp_shape"][2]))
+                if not heavy_k or len(heavy_k) > 16:
+                    return False
+                eligible_pair = False
+                for config in configs.values():
+                    for block_k, warp_k in heavy_k:
+                        repaired = deepcopy(config)
+                        repaired["block_shape"] = list(repaired["block_shape"])
+                        repaired["warp_shape"] = list(repaired["warp_shape"])
+                        repaired["block_shape"][2] = block_k
+                        repaired["warp_shape"][2] = warp_k
+                        if legal(repaired):
+                            stage_admitted.add((stage, _large_prefill_config_signature(repaired)))
+                            eligible_pair = True
+                if not eligible_pair:
+                    return False
+                admitted.update(stage_admitted)
+        layer._humming_large_prefill_configs = frozenset(admitted)
+        layer._humming_large_prefill_partition_enabled = True
+        return True
+    except Exception:
+        # Missing or changed installed Humming APIs retain the scored helper.
+        return False

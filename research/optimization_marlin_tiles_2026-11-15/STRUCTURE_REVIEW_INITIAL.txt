@@ -1,0 +1,44 @@
+MARLIN TILE EXPERIMENT 01 - LOCAL REVIEW - 2026-11-15
+
+Implemented an isolated tile sweep and one-line EP-density proposal. The active
+V4 + cached mapping source and patch remain unchanged. EP_DENSITY_DELTA.diff is
+relative to that active source, not a cumulative patch for submission.
+
+Passed locally
+- 12 automated tests: source AST isolation, threshold boundaries, no-EP parity,
+  unique routes, partition conservation, deliberate table corruption, hot-rank
+  counterexample and the padding-versus-block-count tradeoff.
+- 19,800 structural records, 4,290 materialized routing-table validations.
+  Four synthetic seeds, EP1/EP2/EP8, fifteen sizes (1 through 4096 tokens),
+  six route patterns, five block sizes and every rank.
+- 300 CUDA graph mapping/count/padding checks with changing inputs on the
+  NVIDIA GeForce RTX 3050 6GB Laptop GPU, Windows PyTorch 2.6.0+cu124.
+  This is PyTorch routing/count code, not the actual SGLang aligner or GEMMs.
+- Notebook schema, actual CPU notebook execution and exported ZIP checksums
+  verified. Python source syntax and Ruff checks passed.
+
+Useful finding, not a performance result
+At 128 tokens / EP8 the baseline selects block 48; global density selects 8.
+Across four synthetic uniform seeds, median maximum-rank active padded rows fall
+from 1536 to 268, while active block counts rise from 32 to 33.5.
+For all routing concentrated on one rank, padded rows fall only 1536 to 1136,
+while blocks rise from 32 to 142. This is why a blind denominator replacement
+is not justified: reduced padding can substantially increase repeated weight work.
+Fractional counts above are medians of integer per-seed maxima.
+
+Unmeasured and blocked locally
+The complete real-kernel GPU benchmark was built but not executed. Windows has
+CUDA PyTorch but this pinned SGLang JIT path requires Linux. WSL system Python and
+the existing sglang-omni-tests environment both lack PyTorch. No packages were
+installed or replaced. The Windows preflight report and WSL failure reports are
+preserved; these are environment failures, not candidate arithmetic failures.
+H200 latency, full-MoE output agreement, distributed effects and serving benefit
+are unmeasured. No policy winner or full-model correctness claim is made.
+
+Next step
+Run the real-kernel smoke in an existing compatible Linux SM80-SM90 environment.
+Then benchmark verified model dimensions on H200 with the same-weight full-path
+paired harness, including uniform and concentrated routes. Retain baseline when
+the complete-path evidence is absent or gains disappear under skew. A T4 repeat
+is optional: it can only replicate the already-passing structural/graph checks.
+Sorted-EP remains a separate subsequent experiment.

@@ -1,0 +1,107 @@
+﻿Serving optimization research — 13 November 2026
+Target: 1.3x overall geometric-mean score across 1, 4, 16 and 32 users
+
+DECISION
+Start with EP-aware Marlin tile selection and explicit support for sorted EP expert blocks. Then port selected parts of our validated MoE kernel into a staged implementation that consumes the existing serving weight layout. Attention is the next major candidate. Do not transplant the entire standalone preparation/cache pipeline.
+
+This is a research result and experiment plan, not a measured 1.3x prediction. No serving source changes or new submissions were made for this research. The queued v4 patch remains frozen.
+
+BASELINE AND SUCCESS METRIC
+Previous scored job 5183861a98ee4825 achieved ratios 0.9884, 1.0076, 1.0053 and 1.0011; geometric mean approximately 1.0006. Correctness passed. The pending v4 one-user check cannot establish an overall gain.
+
+Score = (R1 * R4 * R16 * R32)^(1/4). A uniform 1.3x speedup requires a 23.08% reduction in runtime. Improving only one load by 1.3x gives just 1.0678x overall. If the other three remain unchanged, that one load would need 2.8561x.
+
+With the current DFlash verification width of eight, nominal verification token counts are 8, 32, 128 and 256. Actual scheduler batches vary: dispatch must use runtime shapes, never contest-load identity. Existing results report acceptance around four, but do not provide an accepted-prefix histogram or a reliable breakdown of model, draft, metadata and communication time. No bottleneck fractions are measured here.
+
+1. EP-AWARE MARLIN TILE SIZING — FIRST EXPERIMENT
+File: sglang/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
+The current heuristic estimates rows per expert as tokens * top_k / num_local_experts. For EP8, top_k routes are global, whereas only approximately one eighth land locally under balanced routing. With 256 global experts, 32 local experts and top-k eight, the heuristic overestimates mean local density eightfold.
+
+Nominal M             8      32      128      256
+Current block M       8      16       48       64
+Global-density seed   8       8        8       16
+
+This is a heuristic mismatch, not proof that the smaller tile is faster. Smaller tiles can reduce padded tensor-core work but increase weight reloads and scheduling overhead. Hot experts and rank imbalance matter. Sweep block M in {8,16,32,48,64}, separately for gate/up and down, jointly with existing thread-K/thread-N choices where supported. Include neighboring M values and larger prefill shapes.
+
+The accompanying script simulates 100 seeds of uniform and skewed routing, selecting the busiest EP rank. For skewed routing, changing to the density-based seed reduces padded-row counts by 1.94x, 4.45x and 3.10x at M32/128/256, while weight-tile counts increase approximately 3%, 35% and 29%. These are padding proxies, NOT timing estimates, and are not drawn from judge routing data. Keep a measured fallback if weight reuse wins.
+
+2. SORTED EXPERT BLOCKS UNDER EP — SAME-WEIGHT COMPLEMENT
+Files:
+  kernels/ops/moe/moe_wna16_marlin.py
+  jit/csrc/gemm/marlin_moe/moe_wna16_marlin.cuh
+  jit/csrc/gemm/marlin_moe/marlin_template.h
+(all under sglang/python/sglang)
+
+The wrapper disables sorted-expert and inactive-prefix metadata whenever is_ep is true. CUDA static assertions impose the same restriction. Muse already maps routes to local IDs before alignment; the aligned blocks have inactive -1 blocks first and ascending local expert IDs thereafter. That gives this particular call site the required sorted invariant.
+
+Implement explicit sorted-EP support rather than disguising EP as non-EP. Have alignment publish padded count plus inactive-prefix count, then use direct expert/block indexing. Preserve the generic unsorted fallback. This can avoid repeated negative-block scans and generic scheduling overhead without duplicating weights. It is unlikely to deliver 30% overall by itself.
+
+Required cases: all routes remote; no active blocks; duplicate expert selections; partial tiles; noncontiguous routes; skew/hot ranks; sentinel tails; both GEMMs; graph replay with changing routes; generic non-EP behavior. Compare output after the complete finalize path, including correct zero output for all-remote work.
+
+3. PORT OUR VALIDATED MoE IN STAGES — LARGEST DIRECT EVIDENCE
+Donor: ../muse_moe_w4a16/submission_v139_wgs_kperm3.py
+Frozen size: 214000 bytes. Validated component job: 13cca0e4992b4983.
+Standalone geometric-mean speedup: 2.38986x, with reported interval approximately 2.354–2.426x and correctness passing. Relevant per-shape component ratios are M8 2.246x, M32 1.682x, M128 2.651x and M256 2.983x. These are a different benchmark baseline and routing workload, not serving speedups.
+
+Under an illustrative Amdahl model that transfers these ratios unchanged and assigns the same MoE runtime share to every load:
+  20% MoE share -> 1.127x overall
+  30% MoE share -> 1.203x overall
+  40% MoE share -> 1.292x overall
+  50% MoE share -> 1.394x overall
+This explains why the target is plausible enough to pursue, but depends critically on measured serving fractions and port performance. Four-user performance is the weakest donor ratio and must receive equal attention.
+
+Memory is the main integration obstacle. The standalone prepare path constructs several weight layouts, for both tiny and larger-token variants, plus persistent scratch. One additional complete expert-weight layout is about 0.84375 GiB per layer: roughly 50.625–52.3125 GiB across 60–62 layers. The current two-layout scratch pattern would add about 18.4 GiB across 60 layers. This is incompatible with the extra-memory budget. Do not retain all donor layouts alongside Marlin weights.
+
+Prefer a native-Marlin-layout implementation first, with bounded reusable scratch and existing Marlin fallback. Alternatively replace the persistent layout once, only after providing compatible paths for every serving shape, including prefill. No per-decode repacking or full-model duplicate fallback weights.
+
+Use several useful fused stages: routing/alignment; gate/up GEMM with activation where dependencies permit; down GEMM; post-expert RMS normalization and weighted combine. Gate/up halves may occupy different tiles; split-K partial sums must finish before activation. Preserve the stock BF16 GEMM-output rounding before exact SiLU and stock scale arithmetic. Down-output RMS requires the whole expert row before normalization. A single enormous kernel can increase register pressure and reduce occupancy, especially as load grows.
+
+Serving preprocessing also changes NVFP4 scales and casts global scales. Raw standalone dequantization is not automatically numerically identical. Audit modelopt_quant.py, marlin_utils_fp4.py and muse_spark_nvfp4_moe.py. Preserve post-expert normalization, epsilon and accumulation semantics; do not assume scalar changes cancel exactly through RMS.
+
+4. EXTERNAL REFERENCE REPOSITORY
+https://github.com/gauravjain14/muse-okc-submissions
+https://github.com/gauravjain14/muse-okc-submissions/blob/main/muse_moe_w4a16/README.md
+
+Useful ideas include staged asynchronous copies, work-queue scheduling, warp-uniform polling and selective finalization. Its full source is too large for a direct drop-in under the submission source-size constraint. More importantly, its own README documents a latent scale-compensation bug in milestones 09–11: six-bit compensation reached the eight-bit fallback at M32–256. Any reuse must guard the compensation with the actual six-bit representation and test scale values that do not fit that representation. Prefer our frozen validated donor as the integration starting point.
+
+5. ATTENTION AND PROJECTIONS — NEXT MAJOR PATHS
+Own attention donor ../muse_attention_decode/submission.py has a 2.693485x standalone result (job fcf3d95f5f2046bc). Port only after covering actual variable sequence lengths, q=8 causal prefixes, full and sliding-window attention, page-size-one FP8 KV, cache scales and physical page mappings. An 80K fixed-context component result does not establish end-to-end behavior. Audit reachable macro configurations: the presence of an FP16 softmax helper does not mean the validated path uses it.
+
+Muse already fuses Q/K normalization with RoPE. Its fused KV-store path is restricted to the TRTLLM attention backend, whereas the observed serving target uses FA3. Extending that fusion to the actual FA3 FP8 cache layout is a smaller complementary candidate, including sliding-window translation and speculative commit semantics. Existing output-normalization/gating and residual-normalization fusions should not be counted as new work.
+
+Own projection donor v150 has a 1.585x standalone result, but its source is approximately 682KB and its lossless layout preparation requires a memory audit. Selectively port measured BF16 projection shapes; do not add full-model copies. Hopper's existing single-row GEMV path does not directly address eight-token verification. Benchmark against the actual existing cuBLAS/PyTorch path for M8/32/128/256 and neighboring shapes.
+
+6. SPECULATION, GRAPH GAPS AND COLLECTIVES
+Target and draft model graphs are already captured. The selector is already folded into the draft graph and greedy selection avoids the general sampling branch. Unified target-verification metadata already has a captured path. Enabling CUDA graphs or adding a greedy selector is therefore not a new optimization here.
+
+Logs do identify one gap: draft metadata glue graph is off because the attention backend does not declare host-free draft preparation. Implementing that support may help, but first measure the gap and audit static pointers, metadata views, sliding-window tables and replay correctness. Do not just remove the guard.
+
+Acceptance near four with width eight does not prove width sixteen will help. Measure accepted-prefix distribution and evaluate accepted tokens divided by total draft + verify + commit time. Keep model semantics and sampling behavior unchanged.
+
+The existing collective/finalize fusion path is gated for Blackwell. H200 support requires a real implementation and multi-GPU correctness/performance validation; deleting the guard is insufficient. Standalone layer tests with identity collectives do not establish distributed serving behavior.
+
+Primary references:
+https://github.com/sgl-project/sglang/pull/42489
+This DFlash optimization PR concerns a different model and B300 setup. Reuse concrete applicable ideas, not its percentage gain; several CPU-length/table optimizations already exist locally.
+https://arxiv.org/abs/2602.06036
+DFlash is already in the baseline; the paper's improvement over autoregressive decoding is not an incremental opportunity.
+https://docs.nvidia.com/cuda/archive/13.1.1/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
+https://docs.nvidia.com/cutlass/4.8.0/media/docs/cpp/dependent_kernel_launch.html
+Programmatic dependent launch supports Hopper-class capability and offers controlled overlap between dependent stages. It requires correct synchronization and does not guarantee overlap or a speedup. Consider it after identifying an exposed inter-stage gap.
+
+TODAY'S EXPERIMENT ORDER AND ACCEPTANCE GATES
+A. Preserve v4 and recover its correctness/timing result when available. It tests one user only.
+B. Build independently selectable tile-only, sorted-prefix-only and combined candidates. Validate complete MoE semantics before timing. Dispatch only on legitimate runtime shape/hardware properties.
+C. On H200 EP8, warm up compilation and graph capture, then compare repeated runs with identical precision, request data, generation settings, context distribution and concurrency. Record per-load ratios and their geometric mean, per-rank time/imbalance, correctness and peak memory. Avoid interpreting laptop timings as H200 predictions.
+D. Obtain a short captured-serving CPU/GPU trace if direct profiling access is available. Use the pinned SGLang /start_profile support or Nsight Systems CUDA graph node tracing. Measure MoE, attention, dense projections, draft/metadata and communication fractions. Startup logs are not a performance trace.
+E. Select a native-layout staged MoE port or attention port using measured recoverable time. Do not combine unrelated unmeasured changes just to reduce the number of experiments; use local toggles for attribution, then package the verified combination.
+F. Spend the remaining overall unscored check only after local correctness, memory and performance gates. Use the scored run only after reviewing all four loads. Queue capacity may prevent validating a 1.3x result today even if implementation is ready.
+
+Profiling reference:
+https://docs.sglang.io/docs/developer_guide/benchmark_and_profiling
+Keep graphs enabled for final timing. A separate mapping trace may disable them, but must not be used as the serving speedup measurement.
+
+REPRODUCIBILITY AND LIMITS
+analysis.json records arithmetic, synthetic padding analysis and donor hashes. research_serving_1p3x.py regenerates it using NumPy and asserts the frozen v4 hash. Synthetic routing and Amdahl examples are scenarios, not measured serving results. No target-device trace was available for this research. A credible 1.3x commitment needs those measurements.
+Frozen submission_v4.diff SHA256:
+92054389830a8e5c07a37eb524810ac83690fbbcf88c60e3ae8a132909bb65f1

@@ -1,0 +1,48 @@
+Fresh primary source: https://github.com/sgl-project/sglang/pull/51393
+Audited head36c4cd4d2e8fa600bd5d1587c9b6fc5fd903fe59, open/unmerged Nov19.
+Only the last two commits introduce the new decode mechanisms; earlier stacked
+commits build the generic Hopper NVFP4 backend. Two pinned patches and full final
+kernel/op source are preserved in pr51393/. Parent/MoE own earlier grouped path.
+
+This is not an applicable drop-in for unchanged Muse DFlash verification:
+1. Actual upstream _decode_variant AST was executed on nine shapes using
+   Muse H4096/I4096/localE32/top8. Auto selects fused only at T1/2; T3/4/8/32/128/
+   256/753 retain the grouped backend. C++ explicitly caps both decode kernels
+   at T4. Unchanged DFlash verification has T=batch*block_size, minimum8 in this
+   protocol. Native layernorm sequence parallelism is EXTEND-only, so it does
+   not turn the minimum verify8 into per-rank1. Reducing speculative block size
+   would change the task and is not a free use of this donor.
+2. Gate/up accumulations and global scales remain FP32 until SwiGLU, then round
+   to BF16. Frozen Humming rounds the GEMM to BF16 and applies BF16 global scale
+   with a second rounding before SwiGLU. Final per-route output similarly differs
+   in scale placement. This donor is not boundary-preserving as written; it needs
+   an explicit precision-restoration variant and actual output validation.
+3. The donor's optional direct weighted sum cannot replace Muse's per-expert
+   nonlinear post-norm. Its separate per-route-output API could retain that norm,
+   but then the donor's weighted-sum timings do not describe the same boundary.
+4. Frozen Muse uses its dedicated expert implementation, not this newly added
+   generic backend runner. Its two new kernel/op paths are absent in pinned
+   297e54f's tree. The PR head object is not locally available, so no fabricated
+   git merge-base ancestry result is claimed; source absence and open PR status
+   are directly verified.
+
+Useful mechanisms, conditional rather than integrated:
+- Cooperative one-CTA-per-SM persistent decode exchanges two BF16 values plus
+  a 32-bit epoch in a single aligned64-bit word. Consumers poll epoch-tagged
+  words; a last-CTA counter advances epoch and clears on wrap. This eliminates
+  a separate ready counter for each intermediate payload. All CTAs must be
+  resident; unrelated long-running streams, SM-limited contexts and capture
+  lifetime require explicit handling. HiCache is not excluded in source, but
+  coexistence is not established merely by absence of a guard.
+- The alternative uses programmatic dependent launches: GEMM2 weight movement
+  may overlap GEMM1; activation reads wait for its completion. This is a real
+  Hopper orchestration donor, but it is coupled to the donor's numerical kernel
+  and its T<=4 resource plan, not a flag for the current Humming path.
+- Per-device/stream workspace cache keeps old buffers alive for captured graphs;
+  capture-created zeroed workspaces are keyed by capture ID. Warmed workspaces
+  can be shared by later captures on that stream. Replaying such graphs
+  concurrently on different streams would require a stronger ownership guard.
+
+The reported speedup is against Marlin on other serving configurations. No
+number from it is promoted to the scored Humming parent or full Muse serving.
+No GPU, compilation, remote check or scored submission was performed here.

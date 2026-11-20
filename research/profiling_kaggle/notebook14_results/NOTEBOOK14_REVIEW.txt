@@ -1,0 +1,28 @@
+NOTEBOOK 14: VERIFIED COLAB REPEAT
+Run: 20261114T200742Z_6317d4
+
+PROVIDER AND INTEGRITY
+User explicitly confirmed execution on Colab. The notebook filename requested Kaggle, but it is not evidence of execution provider. Runtime reports PyTorch 2.14.1+cu130, Triton 3.8.0, NumPy 2.4.6 and driver 580.82.07 on one visible Tesla T4.
+All 10 payload hashes and the original Notebook 11 source manifest match. All 48 cases and 2,592 changed-input output checks pass. Recomputed 288 rows from 3,168 samples and verified all 288 comparisons across event, wall and enqueue metrics.
+Trace: 672 kernels, no copies, no unattributed operations. Eight-stage baseline uses 48 kernels, both candidates 32.
+
+MATCHED RESULTS
+Candidate / Reference | Event reduction (wins/48) | Wall reduction | Event savings per stage (us)
+single_owner_eager / baseline_eager | 21.73% (48/48) | 20.87% | 22.521
+single_owner_eager / two_buffer_eager | -11.80% (1/48) | -11.28% | -8.532
+single_owner_graph / baseline_graph | 24.35% (48/48) | 22.08% | 7.349
+single_owner_graph / two_buffer_graph | -0.55% (13/48) | -0.49% | -0.103
+two_buffer_eager / baseline_eager | 30.08% (48/48) | 29.16% | 32.028
+two_buffer_graph / baseline_graph | 25.73% (48/48) | 22.45% | 7.685
+Negative reduction means slower; descriptive paired medians, not confidence intervals.
+
+REPEATABILITY ON COLAB
+Schedule | Earlier Colab Notebook 11 | Latest Colab Notebook 14
+eager | 30.06% | 30.08%
+graph | 24.91% | 25.73%
+Both runs favor two-buffer under static maps. Latest two-buffer wins 48/48 in both schedules. Single-owner is 11.80% slower than two-buffer in eager execution and 0.55% slower at the graph median; the small graph difference is not proof of universal equivalence.
+This repeats the Colab conclusion. It does not measure Kaggle latency and does not produce an H200/full-serving speedup.
+
+STOPPING POINT
+This is the final planned MoE notebook in the current phase. Checks passed, so no new notebook is generated. The intended Kaggle performance replication remains unmeasured; it is documented rather than used to extend the loop.
+The unchanged two-buffer draft remains the preferred research candidate for static/sufficiently reused maps. It is not applied to active V4. See MOE_MAPPING_FINAL_REVIEW.txt for consolidated evidence and remaining integration work.

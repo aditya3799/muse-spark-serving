@@ -1,0 +1,55 @@
+MoE checkpoint: 2026-11-16, recovered runtime, local gate complete
+
+Cold timing session94879 completed with exit0. No MoE GPU/compiler process is active. All preceding listed processes exited 0. No delayed process-control command is pending. Ubuntu restart was explicitly authorized and completed. Never SIGSTOP CUDA-owning processes; use synchronized case-boundary exit. MAX_JOBS=1 and HUMMING_DISABLE_PARALLEL_BUILD=1; one compiler only.
+
+Frozen serving_humming_v1 exports remain unchanged:
+ fp4 426658ee8f7e5e9b226134097d84a57b6b865d51fa132ae7ca7099857c9663f4
+ nvfp4 bc19ab1afd56f204b85c54ff4d80f22bb6c8214e75d978eff37cdef1eeeb0277
+Root owns packaging, remote checks and all submissions. Do not submit from this agent.
+
+Completed exact-helper correctness versus independent stock Marlin BF16 stages with FP32 GEMM reduction:
+ E4/H4096/M1: frozen_recovered_m1, session20569.
+ E4/H4096/M8: frozen_recovered_m8, session2556.
+ E32/H4096/M33: frozen_e32_m33, session93434.
+ E32/H4096/M128: frozen_e32_m128, session30405.
+Each group passed four eager patterns and twelve graph replays, changing inputs/scores/routes including active -> all-remote -> active. E32 supplies genuine hot-rank coverage. Per-expert global scales and post-norm varied. FULL_SHARD_PROOF.json and per-run receipts preserve exact provenance. Local SM86 only, not H200 arithmetic proof.
+
+Completed separate fresh-process memory comparison, exact frozen helpers, E32/H=I4096:
+ stock session50420: memory_stock/memory.json and run_receipt.json.
+ humming session28422: memory_humming/memory.json and run_receipt.json.
+Same harness fac8570130f2aa84346ee2af5148afbeea82afcd3d7fa59261af13f501f620bc.
+Serving-like shared graph pool/stream, largest-first buckets256/128/32/8/1 and shared input buffers; original storage aliases held through preparation.
+MEMORY_COMPARISON.json: Humming persistent +7680B, preparation allocated peak -150993408B, reserved peak -654311424B, max graph allocated peak -5211136B, reserved peak -88080384B. Zero retained original storage/Parameter refs. Single-layer PyTorch allocator scope; does not prove whole-model H200+target/draft+KV+GraphPoolPrecarve/borrow or CUDA driver/module allocations.
+
+Completed serial bounded offline SM90a compiles, no CUDA context/loading/execution:
+ offline_sm90_w2_m1 session16916, 333952B cubin.
+ offline_sm90_w13_m1 session53339, 333568B cubin.
+ offline_sm90_w13_m128 session59352, 345728B cubin.
+ offline_sm90_w2_m128 session43715, 349312B cubin.
+OFFLINE_SM90_PROOF.json and each report/run_receipt/copy cubin preserve hashes, compiler provenance and actual WGMMA BF16 operands/FP32 accumulation. Four representative configs, not every interval. launch_offline_sm90.py wraps whole process group in TERM240s/KILL15s; never run unbounded helper directly.
+
+Next action: root assesses independent gate reviews and remote check. Confirmed serving speedup remains whatever root's live scores show; this agent has established no new H200 speedup.
+
+Optional independent-stage alignment branch proof, only after root slot grant, unique output:
+wsl -d Ubuntu -- /usr/bin/timeout --signal=TERM --kill-after=15s 240s /home/aditya/.venvs/okc-marlin-tiles/bin/python /mnt/d/OpenKernelChallenge/serving/swarm_2026-11-16/moe/launch_frozen_probe.py --sglang-root /mnt/d/OpenKernelChallenge/serving/sglang --out /mnt/d/OpenKernelChallenge/serving/swarm_2026-11-16/moe/frozen_different_blocks_m1 --hidden 4096 --experts 4 --tokens 1 --different-blocks
+This changes only an existing safe FP32 stage2 config in the test process; frozen export remains unchanged. Current exact-helper harness SHA32e2c64b2f4ec5222e1aae150679b2f8e08354002f0f02d07d22496463d0071d.
+
+Lower-priority candidates remain isolated/unpromoted: cap1 Marlin grid experiment (compile cache preserved, no timing proof), and projection's EP-aware selector (can amplify hot-rank block count). No additional compile/timing without slot coordination. No paid resources or kernel-track submissions (track closed).
+
+Follow-up: independent-stage alignment proof PASSED, session79119 exit0, frozen_different_blocks_m1 report+receipt. Four eager cases/twelve graph replays; maxrelative .000575304, maxabsolute .001953125. Root authorized cold timing now active: session94879 E32/H4096 M8/33/128,11 reps, fourpatterns, A/A+B/B, source ef40dea6a5c9f0998e71db5c1a87fdd4cbe1f8f9b6ab451114cdf73932d8dd09. Do not start another GPU/compiler until clean exit.
+
+Cold timing complete, see cold_humming_e32/summary.json and receipt. Active-route geomean 1.021852111983149x stock, no H200 claim. Allremote substantial regressions; do not hide these in an aggregate. Frozen exports unchanged. Root notified of candidate fusion opportunity.
+
+CURRENT ACTIVE: candidate_v2 three-arm E32 cold proof session29951,480sTERM/15sKILL, launched root-authorized exclusiveGPU. No other GPU/compiler. Harness SHA4000d8f1178995b0b6507654c6ec9bbd10da7b88875c4c7557385e5710a7ff76, kernelSHAde4ba73a25b03e145b3396d1839eea5cdac3f4e33585ad7da3e0d3b895521f4b. Outputcandidate_v2/e32. Aftercleanexit, optional prepared bf16_scale_edge_probe.py/launch_bf16_scale_edge.py exact finite-BF16 bitpattern scalingproof. Do not edit live source; report inherited scope phrase needs companionclarification. Astock,BfrozenHumming,Cmaskedscalevariant. torch.equal is exact numeric equality, not signed-zero bit equality.
+
+LATEST: candidate_v2 session29951 and BF16 edge session85762 both exited0. V2report+summary+receipts complete;65,280finiteBF16bits?14scales passed literalbit equality. candidate_v2/serving_export created with metadata guards; export_manifest records hashes b3900320 quanthelper/1fb726a2scale/426658eefp4unchanged. ACTIVE exact exported helper regression session51659,480s bound,E32/M8,33,128,5reps/arm; no other GPU/compiler. Harness0119c37091dc7a54e65ec69f878fc7424cb6bdf77d3eebff226cfabc7d4a36e6. Outputcandidate_v2/exact_export_e32. Root awaits cleanexit and independent export audit forpackaging.
+
+LATEST FINAL GATE: exact exported candidate_v2 session51659 exited0,12eager/36graph casespassed, zero-rowguardpassed. Allsources match export_manifest. OneM8uniform timing row failednoise andexcluded; use11rep e32experiment. GPU released directly toprojection forEP tuning, no MoEprocess active. candidate_v2 export readyforrootpackaging; no submissions byMoE.
+
+CORRECTION: exact_export_e32 summary lists TWO excluded5rep timingrows: M8uniform andM8allremote. Allcorrectnesspassed. Primary11rep e32experiment retainsall12noisegates. EP_HARNESS_CROSS_REVIEW.json passed9f194227 source, GPUownednextbyprojection; no MoEprocess/compiler pending.
+
+LATEST candidate_v3 CPU draft: candidate_v3/serving_export manifest. Optional downscale deferral with explicit BF16 round-back in3finalizer kernels; defaultdirectcalls/genericnormfallbackremain scaled. Root/attention source reviews passed. NoGPUtestyet. finalizer_fusion_probe.py SHA11708c1bdf718603fbed031afd740d5c07a9bb9cd248f625ba10a30b68b29529 correctness-onlyactualmodule, fullfinal-outputbitclaims. cold_humming_fused_bench.py SHAa725e26e7013b5c4a86be8407811f9598033b1d0c18cee974c14e5954be80a87 fullE32default/nondefer/defer. RootauthorizedGPU afterprojectionsplitcleanexit+harnessreview, focused240sfirst thenfull480sifpass. NoMoEprocessactive, projectionownsslot.
+
+LATEST V3: focusedprobe27212 exited0;30eager/90graphreplays+913,920finiteBF16edge fulloutput comparisons andzerorowpassed. Receiptcandidate_v3/finalizer_probe. ACTIVE fullE32 session91965,480sbound,M1/8/33/128,12reps, exactv3helperdefault(nondef) versusdefer+actualv3finalizer plusstock; sourceharness780292f830e9b386a3285a852f18196e3f620c3e7852a299d803334b546c6031. NootherGPU/compiler. ProjectionpreparingCPUcombinedadaptive+v3export; receivesGPUonlyafter91965cleanexit. V3sourcehashesunchanged. ADAPTIVE_SPLIT_RESULTS_REVIEW.json independentlyverifiedfivecases/20class-changingreplays/75checks andtiming tradeoffs.
+
+FINAL COMBINED VALIDATION: combined_final/full_e32 completed and passed10cases/40replays; summary and transparent unknown-exit receipt saved. Boundary session16657 exit0. Process audit90652 exit0 confirms no MoE process/compiler. GPU/compiler released to attention for final offline compile gate; no further optimization or GPU launches planned.

@@ -1,0 +1,1132 @@
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -796,9 +796,47 @@
+         torch.cuda.synchronize()
+         return torch.cuda.memory_stats()["allocated_bytes.all.peak"] - base_bytes
+ 
++    def _initialize_projection_adapters(self):
++        # Scheduler invokes prewarm_sampling on the real forward stream, after
++        # initial pool allocation/graph capture and before post-capture KV resize.
++        if getattr(self, "_projection_adapters_initialized", False):
++            return
++        self._projection_adapters_initialized = True
++        self._prefill_row_projection = None
++        self._decode_n_projection = None
++        ordinary_tp = not get_parallel().attn_dp_enabled and get_parallel().attn_cp_size == 1
++        with draft_tp_context(self.draft_parallel_layout):
++            from sglang.srt.speculative.dflash_projection_row import create_prefill_projection
++            group = get_parallel().tp_group
++            configuration = get_exec().graph.cuda_graph_config
++            prefill_rows = list(configuration.prefill.bs or ())
++            chunk = get_schedule().chunked_prefill_size
++            if chunk is not None and chunk > 0:
++                prefill_rows.append(int(chunk))
++            self._prefill_row_projection = create_prefill_projection(
++                self.draft_model, group, prefill_rows, ordinary_tp=ordinary_tp
++            )
++            # Keep the output-column diagnostic independently toggled. This
++            # collective declaration prevents rank-local environment divergence.
++            import inspect
++            enabled = os.environ.get("SGLANG_EXPERIMENTAL_DFLASH_OUTPUT_N", "0") == "1"
++            supported_model = "projection" in inspect.signature(self.draft_model.project_target_hidden).parameters
++            flags = [None] * group.world_size
++            torch.distributed.all_gather_object(flags, (enabled, ordinary_tp, supported_model), group=group.cpu_group)
++            if all(flag == (True, True, True) for flag in flags):
++                from sglang.srt.speculative.dflash_projection_n import create_projection
++                decode_batches = configuration.decode.bs
++                if decode_batches is None:
++                    decode_batches = range(1, int(configuration.decode.max_bs or 1) + 1)
++                decode_rows = sorted({int(bs) * int(self.block_size) for bs in decode_batches})
++                self._decode_n_projection = create_projection(
++                    self.draft_model.fc, group, mode="qualified", rows=decode_rows, measure=True
++                )
++
+     def prewarm_sampling(self) -> SamplingPrewarmResult:
+         """Rehearse the non-greedy verify path so an undersized graph-pool
+         borrow surfaces at startup rather than under traffic."""
++        self._initialize_projection_adapters()
+         if not is_cuda() or not is_dflash_sampling_verify_available():
+             return self.model_runner.prewarm_sampling()
+ 
+@@ -1827,6 +1865,7 @@
+         cache_loc_2d: Optional[torch.Tensor] = None,
+         commit_lens: Optional[torch.Tensor] = None,
+         extend_lens: Optional[torch.Tensor] = None,
++        prefill_projection: bool = False,
+     ) -> None:
+         """Materialize target context features into the draft KV cache at explicit slots.
+ 
+@@ -1926,7 +1965,11 @@
+             torch.inference_mode(),
+             draft_tp_context(self.draft_parallel_layout),
+         ):
+-            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
++            projection = getattr(self, "_prefill_row_projection" if prefill_projection else "_decode_n_projection", None)
++            if projection is None:
++                ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
++            else:
++                ctx_hidden = self.draft_model.project_target_hidden(target_hidden, projection=projection)
+             if self.lilicorr is not None:
+                 self._lilicorr_anchor = publish_anchor(
+                     draft_sampler=self._draft_sampler,
+@@ -2410,6 +2453,7 @@
+                 cache_loc=self._draft_write_ids(kv_loc_plan),
+                 positions=positions,
+                 extend_lens=ctx_lens,
++                prefill_projection=True,
+             )
+ 
+             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
+--- a/python/sglang/srt/models/dflash.py
++++ b/python/sglang/srt/models/dflash.py
+@@ -827,7 +827,7 @@
+     ) -> torch.Tensor:
+         return ctx_hidden
+ 
+-    def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
++    def project_target_hidden(self, target_hidden: torch.Tensor, *, projection=None) -> torch.Tensor:
+         """Project concatenated target-layer hidden states into draft hidden_size."""
+         expected = int(self.fc.input_size if self.quantizable else self.fc.in_features)
+         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
+@@ -839,7 +839,7 @@
+                 "This usually means the target model is capturing a different number of layer features than "
+                 "the draft checkpoint/config expects."
+             )
+-        projected = self.fc(target_hidden)
++        projected = (self.fc if projection is None else projection)(target_hidden)
+         if self.quantizable:
+             projected = projected[0]
+         return self.hidden_norm(projected)
+--- /dev/null
++++ b/python/sglang/srt/speculative/dflash_projection_row.py
+@@ -0,0 +1,407 @@
++"""Explicitly registered draft-FC row adapter; does not modify or auto-enable SGLang.
++
++Only call this adapter from ordinary replicated-input TP prefill. The model's
++original full-M hidden_norm, distinct rank-owned KV weights, positions and cache
++write path stay outside it. Strict mode shadows native bits; empirical mode is
++a separately declared, runtime-qualified experiment, not a reproducibility proof.
++Destroy captured graphs before close(). Never register inside capture.
++"""
++import ctypes as C
++from pathlib import Path
++import torch
++import torch.distributed as dist
++import torch.nn.functional as F
++
++HERE=Path(__file__).resolve().parent
++
++def _library():
++    lib=C.CDLL(str(_compiled_library()));p=C.c_void_p;i=C.c_int;u=C.c_uint64
++    for name,args,result in [('make_row_plan',[i]*5+[u,i],p),('row_plan_count',[p],i),
++        ('row_plan_attr',[p,i,i],i),('row_plan_call',[p,i,i,p,p,p,p,u,p],i),('row_plan_destroy',[p],None)]:
++        fn=getattr(lib,name);fn.argtypes=args;fn.restype=result
++    return lib
++
++def _workspace():
++    backend=str(torch.backends.cuda.preferred_blas_library()).split('.')[-1].lower()
++    symbol={'cublas':'_ZN2at4cuda22getChosenWorkspaceSizeEv','cublaslt':'_ZN2at4cuda26getCUDABlasLtWorkspaceSizeEv'}.get(backend)
++    if symbol is None:return None
++    lib=C.CDLL(str(Path(torch.__file__).resolve().parent/'lib/libtorch_cuda.so'))
++    call=getattr(lib,symbol);call.argtypes=[];call.restype=C.c_size_t
++    return backend,int(call())
++
++def _policy():
++    return (str(torch.backends.cuda.preferred_blas_library()),
++            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
++            torch.are_deterministic_algorithms_enabled(),torch.is_deterministic_algorithms_warn_only_enabled())
++
++def _identity(w):
++    try:version=w._version
++    except RuntimeError:version=None  # inference tensors; re-register on weight reload
++    return w.data_ptr(),version,tuple(w.shape),tuple(w.stride()),w.dtype,w.device
++def _stream(x):return torch.cuda.current_stream(x.device).cuda_stream if x.is_cuda else None
++
++def eligible(x,w,world):
++    return (world in (2,4,8) and x.is_cuda and w.is_cuda and x.device==w.device
++            and x.dtype==w.dtype==torch.bfloat16 and x.ndim==w.ndim==2
++            and x.shape[0]>=512 and x.shape[0]%world==0 and x.shape[1]==w.shape[1]
++            and x.is_contiguous() and w.is_contiguous() and min(w.shape)>=1024
++            and w.shape[0]%128==0 and w.shape[1]%128==0
++            and x.data_ptr()%256==0 and w.data_ptr()%256==0)
++
++class RowPlan:
++    def __init__(self,lib,handle,world,x,w,workspace_bytes):
++        self.lib,self.handle,self.world=lib,handle,world
++        self.shape=tuple(x.shape);self.n=w.shape[0];self.device=x.device
++        self.identity=_identity(w);self.stream=_stream(x);self.policy=_policy()
++        self.scratch=torch.empty(workspace_bytes,dtype=torch.uint8,device=x.device)
++        self.index=None
++    def invoke(self,index,full,x,w,y):
++        return self.lib.row_plan_call(self.handle,index,int(full),w.data_ptr(),x.data_ptr(),y.data_ptr(),self.scratch.data_ptr(),self.scratch.numel(),_stream(x))
++    def local(self,x,w,rank):
++        if not eligible(x,w,self.world) or tuple(x.shape)!=self.shape or _identity(w)!=self.identity or _stream(x)!=self.stream or _policy()!=self.policy:return None
++        count=x.shape[0]//self.world
++        y=torch.empty((count,self.n),device=x.device,dtype=x.dtype)
++        status=self.invoke(self.index,False,x.narrow(0,rank*count,count),w,y)
++        return y if status==0 else None
++    def close(self):
++        if self.handle:self.lib.row_plan_destroy(self.handle);self.handle=None
++
++@torch.no_grad()
++def discover(examples,world):
++    if torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction is not True:
++        return None,{'reason':'native BF16 reduction policy requires an unsupported Lt preference mask'}
++    examples=list(examples)
++    if not examples:return None,{'reason':'no examples'}
++    x,w=examples[0]
++    if not all(eligible(v,wt,world) and v.shape==x.shape and wt.shape==w.shape for v,wt in examples):return None,{'reason':'unsupported geometry'}
++    if torch.cuda.is_current_stream_capturing():return None,{'reason':'registration inside capture'}
++    try:lib=_library();backend,bytes_=_workspace()
++    except (OSError,AttributeError,TypeError):return None,{'reason':'native ABI unavailable'}
++    m,k=x.shape;n=w.shape[0]
++    handle=lib.make_row_plan(m,m//world,n,k,1,bytes_,16)
++    if not handle:return None,{'reason':'no legal parent/local plan'}
++    plan=RowPlan(lib,handle,world,x,w,bytes_)
++    props=torch.cuda.get_device_properties(x.device)
++    metadata=dict(backend=backend,workspace_bytes=bytes_,shape=[m,n,k],world=world,tried=[],
++                  torch=str(torch.__version__),cuda_runtime=torch.version.cuda,device=props.name,
++                  capability=[props.major,props.minor],sm_count=props.multi_processor_count,policy=_policy())
++    try:
++        local=torch.empty((m//world,n),device=x.device,dtype=x.dtype)
++        for index in range(lib.row_plan_count(handle)):
++            attrs=[lib.row_plan_attr(handle,index,f) for f in range(9)];good=True
++            for value,weight in examples:
++                reference=F.linear(value,weight)
++                # Match every used local result directly against the original
++                # full operation. Avoid retaining an additional full-M Lt
++                # output solely for diagnostics during production startup.
++                for start in range(0,m,m//world):
++                    if plan.invoke(index,False,value[start:start+m//world],weight,local) or not torch.equal(local.view(torch.int16),reference[start:start+m//world].view(torch.int16)):good=False;break
++                del reference
++                if not good:break
++            metadata['tried'].append(dict(attrs=attrs,exact=good))
++            if good:plan.index=index;metadata['chosen']=attrs;return plan,metadata
++        plan.close();return None,dict(metadata,reason='no bitwise-equivalent calibration')
++    except Exception:plan.close();raise
++
++class RowProjectionRouter:
++    def __init__(self,original,group,*,empirical=False):
++        if not isinstance(original,torch.nn.Linear) or original.bias is not None:raise TypeError('requires original ordinary bias-free Linear')
++        self.original,self.group,self.empirical=original,group,empirical
++        self.plans={};self.published=set();self.workspaces={}
++        self.registration_index=0;self.registration_manifest=None;self.registration_ready=False;self.graph_bound=False
++    def prepare_registration(self,shapes):
++        """All ranks validate the entire startup sequence before any GPU work."""
++        try:local=dict(shapes=[tuple(s) for s in shapes],error=None)
++        except Exception as error:local=dict(shapes=None,error=repr(error))
++        declarations=[None]*self.group.world_size
++        dist.all_gather_object(declarations,local,group=self.group.cpu_group)
++        accepted=all(d['error'] is None and d['shapes']==declarations[0]['shapes'] for d in declarations)
++        self.registration_manifest=declarations[0]['shapes'] if accepted else None
++        self.registration_ready=accepted
++        self.registration_index=0
++        return accepted,declarations
++    def register(self,examples,*,discover_fn=discover):
++        plan=None;metadata={};key=None;shape=None
++        try:
++            examples=list(examples)
++            if not self.registration_ready:raise ValueError('startup registration sequence was not collectively accepted')
++            if not examples:raise ValueError('empty calibration examples')
++            shape=tuple(examples[0].shape);key=(shape,_stream(examples[0]))
++            if key in self.plans:raise ValueError('stream/shape already registered')
++            if self.registration_manifest is not None:
++                if self.registration_index>=len(self.registration_manifest) or self.registration_manifest[self.registration_index]!=shape:raise ValueError('registration sequence disagrees with startup manifest')
++            declaration=dict(shape=shape,index=self.registration_index,error=None)
++        except Exception as error:declaration=dict(shape=shape,index=self.registration_index,error=repr(error))
++        declarations=[None]*self.group.world_size
++        dist.all_gather_object(declarations,declaration,group=self.group.cpu_group)
++        self.registration_index+=1
++        if any(d['error'] is not None or d['shape']!=declarations[0]['shape'] or d['index']!=declarations[0]['index'] for d in declarations):
++            return dict(accepted=False,reason='inconsistent registration request',ranks=declarations)
++        try:plan,metadata=discover_fn([(x,self.original.weight) for x in examples],self.group.world_size)
++        except Exception as error:metadata=dict(reason='local discovery error',error=repr(error))
++        # Even an unexpected local discovery failure joins this CPU collective.
++        # Peers therefore fall back together instead of entering a GPU gather.
++        accepted=torch.tensor(int(plan is not None),dtype=torch.int32)
++        dist.all_reduce(accepted,op=dist.ReduceOp.MIN,group=self.group.cpu_group)
++        if not int(accepted):
++            if plan:plan.close()
++            plan=None
++        metadata=dict(metadata,accepted=bool(accepted))
++        self.plans[key]=plan
++        if plan:
++            # Graphs for different shapes replay sequentially on one stream.
++            # Keep one workspace per stream instead of one per capture bucket.
++            # Different streams never alias scratch.
++            if hasattr(plan,'scratch'):
++                workspace_key=(plan.device,plan.stream,plan.scratch.numel())
++                if workspace_key not in self.workspaces:self.workspaces[workspace_key]=plan.scratch
++                plan.scratch=self.workspaces[workspace_key]
++            self.published.add(shape)
++        return metadata
++    def __call__(self,x):
++        shape=tuple(x.shape)
++        if shape not in self.published:return self.original(x)
++        if x.is_cuda and torch.cuda.is_current_stream_capturing():self.graph_bound=True
++        plan=self.plans.get((shape,_stream(x)));native=None
++        local=plan.local(x,self.original.weight,self.group.rank_in_group) if plan else None
++        if local is None:
++            native=self.original(x);count=x.shape[0]//self.group.world_size
++            local=native.narrow(0,self.group.rank_in_group*count,count).contiguous()
++        assembled=self.group.all_gather(local,dim=0)
++        if self.empirical:return assembled
++        if native is None:native=self.original(x)
++        a,b=assembled.view(torch.int16),native.view(torch.int16)
++        return torch.where((a==b).all(),a,b).view(torch.bfloat16)
++    def close(self,*,graphs_destroyed=False):
++        if self.graph_bound and not graphs_destroyed:raise RuntimeError('destroy captured graphs before closing projection plans')
++        if self.graph_bound:torch.cuda.synchronize(self.original.weight.device)
++        for plan in self.plans.values():
++            if plan:plan.close()
++        self.plans.clear();self.published.clear();self.workspaces.clear()
++        self.graph_bound=False
++        self.registration_ready=False
++
++"""Additional deployment helpers appended to the standalone row adapter package."""
++import fcntl
++import contextlib
++import hashlib
++import inspect
++import logging
++import os
++import statistics
++import subprocess
++import sysconfig
++import tempfile
++
++_row_logger=logging.getLogger(__name__)
++
++def _compiled_library():
++    source=HERE/'dflash_row_fc.cc'
++    digest=hashlib.sha256(source.read_bytes()+str(torch.__version__).encode()+str(torch.version.cuda).encode()).hexdigest()[:20]
++    directory=Path(tempfile.gettempdir())/'sglang-dflash-row-fc'/digest
++    directory.mkdir(parents=True,exist_ok=True)
++    output=directory/'row_plans.so'
++    with (directory/'build.lock').open('a') as lock:
++        fcntl.flock(lock,fcntl.LOCK_EX)
++        if output.is_file():return output
++        nvidia=Path(sysconfig.get_paths()['purelib'])/'nvidia'
++        location=next((p for p in (nvidia/'cu13',nvidia/'cublas') if (p/'include/cublasLt.h').is_file()),None)
++        if location is None:raise RuntimeError('installed cuBLASLt headers unavailable')
++        libraries=list((location/'lib').glob('libcublasLt.so.*'))
++        if not libraries:raise RuntimeError('installed cuBLASLt library unavailable')
++        command=[os.environ.get('CXX','c++'),'-O2','-std=c++17','-shared','-fPIC']
++        for path in (location,nvidia/'cuda_runtime'):
++            if (path/'include').is_dir():command+=['-I',str(path/'include')]
++        temporary=directory/('row_plans.'+str(os.getpid())+'.so')
++        command += [str(source),str(libraries[0]),'-Wl,-rpath,'+str(location/'lib'),'-o',str(temporary)]
++        completed=subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=90)
++        if completed.returncode:raise RuntimeError(completed.stderr[-2000:])
++        temporary.replace(output)
++    return output
++
++def _row_gather_output(group,m,n,weight):
++    # Match GroupCoordinator.all_gather's allocator mode as well as its backend.
++    # Some registered communicators require a symmetric output allocation.
++    context=(group.use_symmetric_memory(group,disabled=not group.is_allocation_symmetric())
++             if hasattr(group,'use_symmetric_memory') else contextlib.nullcontext())
++    with context:return torch.empty((m,n),device=weight.device,dtype=weight.dtype)
++
++
++def _row_startup_timing(router,m,k,generator,rounds=4):
++    """Native FC versus full-K local FC and the actual TP all-gather.
++
++    Output allocation and recoverable allocation votes precede timing. Native
++    and gathered outputs never coexist, keeping the calibration memory bound.
++    """
++    group=router.group;weight=router.original.weight
++    x=None;local=None;error=None
++    try:
++        x=torch.empty((m,k),device=weight.device,dtype=weight.dtype).normal_(generator=generator)
++        local=torch.empty((m//group.world_size,weight.shape[0]),device=weight.device,dtype=weight.dtype)
++    except Exception as exc:error=dict(message=repr(exc),fatal=not isinstance(exc,torch.OutOfMemoryError))
++    declarations=[None]*group.world_size
++    dist.all_gather_object(declarations,error,group=group.cpu_group)
++    if any(declarations):
++        if any(d is not None and d['fatal'] for d in declarations):raise RuntimeError('row timing initialization failure: '+repr(declarations))
++        return dict(active=False,errors=declarations)
++    plan=router.plans[(tuple(x.shape),_stream(x))]
++    records={name:[] for name in ('native_us','local_us','gather_us','combined_us')}
++    dispatch_ok=True
++    for step in range(-1,rounds):
++        for arm in (('native','candidate') if step%2==0 else ('candidate','native')):
++            output=None;error=None
++            events=[torch.cuda.Event(enable_timing=True) for _ in range(3)]
++            if arm=='native':
++                try:
++                    events[0].record();output=router.original(x);events[2].record();events[2].synchronize()
++                except Exception as exc:error=dict(message=repr(exc),fatal=not isinstance(exc,torch.OutOfMemoryError))
++            else:
++                try:output=_row_gather_output(group,m,weight.shape[0],weight)
++                except Exception as exc:error=dict(message=repr(exc),fatal=not isinstance(exc,torch.OutOfMemoryError))
++            declarations=[None]*group.world_size
++            dist.all_gather_object(declarations,error,group=group.cpu_group)
++            if any(declarations):
++                if any(d is not None and d['fatal'] for d in declarations):raise RuntimeError('row timing allocation/compute failure: '+repr(declarations))
++                return dict(active=False,errors=declarations)
++            if arm=='candidate':
++                events[0].record()
++                status=plan.invoke(plan.index,False,x.narrow(0,group.rank_in_group*local.shape[0],local.shape[0]),weight,local)
++                events[1].record()
++                # A rejected vendor dispatch still joins this diagnostic gather.
++                # Its output is discarded and every rank disables the shape.
++                group.all_gather_into_tensor(output,local)
++                events[2].record();events[2].synchronize();dispatch_ok &= status==0
++            if step>=0:
++                if arm=='native':records['native_us'].append(events[0].elapsed_time(events[2])*1000)
++                else:
++                    records['local_us'].append(events[0].elapsed_time(events[1])*1000)
++                    records['gather_us'].append(events[1].elapsed_time(events[2])*1000)
++                    records['combined_us'].append(events[0].elapsed_time(events[2])*1000)
++            del output
++    return dict(active=bool(dispatch_ok),scope='Real loaded weights, synthetic calibration input, actual TP transport; not serving throughput',
++                samples=records,medians={name:statistics.median(values) for name,values in records.items()})
++
++
++def create_prefill_projection(model,group,capture_rows,*,ordinary_tp,measure=True):
++    """Collective startup qualification; unsupported or failed shapes stay native.
++
++    The environment switch is an explicit opt-in diagnostic. It never changes
++    model precision, draft KV ownership, normalization or any cache policy.
++    """
++    enabled=os.environ.get('SGLANG_EXPERIMENTAL_DFLASH_ROW_FC','1')=='1'
++    original=getattr(model,'fc',None)
++    rows=[]
++    local=dict(enabled=enabled,rows=rows,ordinary_tp=bool(ordinary_tp),measure=bool(measure),error=None)
++    try:
++        rows=sorted(set(int(m) for m in capture_rows if int(m)>=512 and int(m)%group.world_size==0));local['rows']=rows
++        if not ordinary_tp or group.world_size not in (2,4,8):raise ValueError('requires ordinary replicated-input TP')
++        if not isinstance(original,torch.nn.Linear) or original.bias is not None:raise ValueError('requires unchanged bias-free ordinary Linear')
++        if not original.weight.is_cuda or original.weight.dtype!=torch.bfloat16:raise ValueError('requires CUDA BF16 weights')
++        if 'projection' not in inspect.signature(model.project_target_hidden).parameters:raise ValueError('model projection contract unsupported')
++        local['weight_shape']=tuple(original.weight.shape)
++    except Exception as error:local['error']=repr(error)
++    declarations=[None]*group.world_size
++    dist.all_gather_object(declarations,local,group=group.cpu_group)
++    if not all(d['enabled'] and d['error'] is None and d['measure']==declarations[0]['measure'] and d['rows']==declarations[0]['rows'] and d.get('weight_shape')==declarations[0].get('weight_shape') for d in declarations):return None
++    # Compile/import failure is also voted before anyone starts GPU discovery.
++    error=None
++    try:_library();workspace=_workspace();assert workspace is not None
++    except Exception as exc:error=repr(exc);workspace=None
++    available=torch.tensor(int(error is None),dtype=torch.int32)
++    dist.all_reduce(available,op=dist.ReduceOp.MIN,group=group.cpu_group)
++    if not int(available):
++        _row_logger.warning('DFlash row FC unavailable; native fallback: %s',error)
++        return None
++    n,k=original.weight.shape
++    workspace_bytes=workspace[1]
++    # One input + native reference + local output. Charge three workspaces
++    # (native handle, discovered plan, prior retained plan) and32MiB margin.
++    # Transport checks release the input before allocating gathered output.
++    rows=[m for m in rows if m*(k*2+n*2+n*2//group.world_size)+3*workspace_bytes+(32<<20) < 1_800_000_000]
++    router=RowProjectionRouter(original,group,empirical=True)
++    accepted,_=router.prepare_registration([(m,k) for m in rows])
++    if not accepted:return None
++    gen=torch.Generator(device=original.weight.device).manual_seed(19261119)
++    torch.cuda.synchronize(original.weight.device)
++    allocated_before=torch.cuda.memory_allocated(original.weight.device)
++    reserved_before=torch.cuda.memory_reserved(original.weight.device)
++    peak_allocated_before=torch.cuda.max_memory_allocated(original.weight.device)
++    peak_reserved_before=torch.cuda.max_memory_reserved(original.weight.device)
++    try:
++        for m in rows:
++            x=None;failure=None
++            try:x=torch.empty((m,k),device=original.weight.device,dtype=torch.bfloat16).normal_(generator=gen)
++            except Exception as exc:failure=repr(exc)
++            metadata=router.register([] if x is None else [x])
++            del x;x=None
++            if metadata.get('accepted'):
++                # Validate real TP transport and each rank's actual replicated
++                # checkpoint matrix on two further changing inputs.
++                correct=True
++                for mutation in ('magnitude','integer'):
++                    x=None;reference=None;local_output=None;output=None;local_error=None
++                    try:
++                        x=torch.empty((m,k),device=original.weight.device,dtype=torch.bfloat16)
++                        if mutation=='magnitude':x.normal_(generator=gen);x[:,::5].mul_(8)
++                        else:x.random_(-2,3,generator=gen)
++                        key=((m,k),_stream(x));plan=router.plans[key]
++                        reference=original(x)
++                        local_output=plan.local(x,original.weight,group.rank_in_group)
++                        if local_output is None:
++                            count=m//group.world_size
++                            local_output=reference.narrow(0,group.rank_in_group*count,count).contiguous()
++                        torch.cuda.synchronize(original.weight.device)
++                        del x;x=None
++                        # Allocate the entire collective output before voting;
++                        # one-rank OOM cannot strand peers inside a GPU gather.
++                        output=_row_gather_output(group,m,n,original.weight)
++                    except Exception as exc:
++                        local_error=dict(message=repr(exc),fatal=not isinstance(exc,(torch.OutOfMemoryError,ValueError,TypeError)))
++                        del x;x=None
++                    ready=torch.tensor(int(local_error is None),dtype=torch.int32)
++                    dist.all_reduce(ready,op=dist.ReduceOp.MIN,group=group.cpu_group)
++                    if not int(ready):
++                        errors=[None]*group.world_size
++                        dist.all_gather_object(errors,local_error,group=group.cpu_group)
++                        del output,reference,local_output
++                        if any(e is not None and e['fatal'] for e in errors):raise RuntimeError('collective row-FC startup CUDA failure: '+repr(errors))
++                        correct=False;metadata['transport_allocation_errors']=errors
++                        break
++                    group.all_gather_into_tensor(output,local_output)
++                    correct &= torch.equal(output.view(torch.int16),reference.view(torch.int16))
++                    del output,reference,local_output
++                valid=torch.tensor(int(correct),dtype=torch.int32)
++                dist.all_reduce(valid,op=dist.ReduceOp.MIN,group=group.cpu_group)
++                if not int(valid):
++                    plan=router.plans.pop(key,None)
++                    if plan:plan.close()
++                    router.published.discard((m,k));metadata['accepted']=False
++            if metadata.get('accepted') and measure:
++                timing=_row_startup_timing(router,m,k,gen)
++                timings=[None]*group.world_size
++                dist.all_gather_object(timings,timing,group=group.cpu_group)
++                faster=all(t.get('active') and t['medians']['combined_us']<t['medians']['native_us'] for t in timings)
++                metadata['startup_timings']=timings
++                if not faster:
++                    plan=router.plans.pop(((m,k),_stream(original.weight)),None)
++                    if plan:plan.close()
++                    router.published.discard((m,k));metadata['accepted']=False
++                    metadata['disable_reason']='actual all-rank local FC plus gather latency gate'
++            if group.rank_in_group==0:_row_logger.info('DFlash row FC qualification M=%d accepted=%s metadata=%s allocation_error=%s',m,metadata.get('accepted'),metadata,failure)
++            del x
++        torch.cuda.synchronize(original.weight.device)
++        _row_logger.info('DFlash row FC startup allocator history (no peak reset): %s',dict(
++            allocated_before=allocated_before,reserved_before=reserved_before,
++            peak_allocated_before=peak_allocated_before,peak_reserved_before=peak_reserved_before,
++            allocated_after=torch.cuda.memory_allocated(original.weight.device),reserved_after=torch.cuda.memory_reserved(original.weight.device),
++            peak_allocated_after=torch.cuda.max_memory_allocated(original.weight.device),peak_reserved_after=torch.cuda.max_memory_reserved(original.weight.device),
++            extra_allocated_upper_bound=torch.cuda.max_memory_allocated(original.weight.device)-allocated_before,
++            extra_reserved_upper_bound=torch.cuda.max_memory_reserved(original.weight.device)-reserved_before,
++            upper_bound_includes_prior_global_peak=True,fixed_scratch_bytes=sum(t.numel() for t in router.workspaces.values())))
++        torch.cuda.empty_cache()
++        return router if router.published else None
++    except Exception:
++        # A fatal CUDA/collective error is not recoverable by silently changing
++        # the collective sequence. Surface it as startup failure, never serve
++        # with partially published per-rank state.
++        raise
+--- /dev/null
++++ b/python/sglang/srt/speculative/dflash_row_fc.cc
+@@ -0,0 +1,63 @@
++// Runtime-discovered full-M cuBLASLt plans checked for an unchanged-K local-M call.
++// No model shapes or algorithm IDs are embedded. Exact output qualification is
++// performed by the caller against the actual native operation and weights.
++#include <cublasLt.h>
++#include <cstdint>
++#include <vector>
++
++struct Plan {
++  cublasLtHandle_t handle{};
++  cublasLtMatmulDesc_t op{};
++  cublasLtMatrixLayout_t w{},x{},y{},lx{},ly{};
++  cublasLtMatmulPreference_t pref{};
++  struct Choice {cublasLtMatmulAlgo_t algo; uint64_t full_ws,local_ws;};
++  std::vector<Choice> choices;
++  ~Plan() {
++    if(pref)cublasLtMatmulPreferenceDestroy(pref);
++    for(auto v:{w,x,y,lx,ly})if(v)cublasLtMatrixLayoutDestroy(v);
++    if(op)cublasLtMatmulDescDestroy(op);
++    if(handle)cublasLtDestroy(handle);
++  }
++};
++#define REQUIRE(expr) if((expr)!=CUBLAS_STATUS_SUCCESS){delete p;return nullptr;}
++extern "C" void* make_row_plan(int m,int local_m,int n,int k,int weight_transpose,uint64_t bytes,int count){
++  auto* p=new Plan;
++  REQUIRE(cublasLtCreate(&p->handle));
++  REQUIRE(cublasLtMatmulDescCreate(&p->op,CUBLAS_COMPUTE_32F,CUDA_R_32F));
++  cublasOperation_t tr=weight_transpose?CUBLAS_OP_T:CUBLAS_OP_N;
++  REQUIRE(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_TRANSA,&tr,sizeof(tr)));
++  REQUIRE(cublasLtMatrixLayoutCreate(&p->w,CUDA_R_16BF,weight_transpose?k:n,weight_transpose?n:k,weight_transpose?k:n));
++  REQUIRE(cublasLtMatrixLayoutCreate(&p->x,CUDA_R_16BF,k,m,k));
++  REQUIRE(cublasLtMatrixLayoutCreate(&p->y,CUDA_R_16BF,n,m,n));
++  REQUIRE(cublasLtMatrixLayoutCreate(&p->lx,CUDA_R_16BF,k,local_m,k));
++  REQUIRE(cublasLtMatrixLayoutCreate(&p->ly,CUDA_R_16BF,n,local_m,n));
++  REQUIRE(cublasLtMatmulPreferenceCreate(&p->pref));
++  REQUIRE(cublasLtMatmulPreferenceSetAttribute(p->pref,CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&bytes,sizeof(bytes)));
++  std::vector<cublasLtMatmulHeuristicResult_t> result(count);int got=0;
++  REQUIRE(cublasLtMatmulAlgoGetHeuristic(p->handle,p->op,p->w,p->x,p->y,p->y,p->pref,count,result.data(),&got));
++  for(int i=0;i<got;++i){
++    auto &r=result[i]; if(r.state)continue;
++    cublasLtMatmulHeuristicResult_t local{};
++    if(cublasLtMatmulAlgoCheck(p->handle,p->op,p->w,p->lx,p->ly,p->ly,&r.algo,&local)||local.state)continue;
++    if(r.workspaceSize>bytes||local.workspaceSize>bytes)continue;
++    p->choices.push_back({r.algo,r.workspaceSize,local.workspaceSize});
++  }
++  return p;
++}
++extern "C" int row_plan_count(void* v){return static_cast<Plan*>(v)->choices.size();}
++extern "C" int row_plan_attr(void* v,int index,int field){
++  static const cublasLtMatmulAlgoConfigAttributes_t fields[]={CUBLASLT_ALGO_CONFIG_ID,CUBLASLT_ALGO_CONFIG_TILE_ID,
++    CUBLASLT_ALGO_CONFIG_SPLITK_NUM,CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING,
++    CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION,CUBLASLT_ALGO_CONFIG_STAGES_ID,CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID,
++    CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID};
++  auto*p=static_cast<Plan*>(v);int answer=-1;
++  if(index<0||index>=int(p->choices.size())||field<0||field>=9)return -1;
++  if(cublasLtMatmulAlgoConfigGetAttribute(&p->choices[index].algo,fields[field],&answer,sizeof(answer),nullptr))return -1;
++  return answer;
++}
++extern "C" int row_plan_call(void*v,int index,int full,const void*w,const void*x,void*y,void*workspace,uint64_t bytes,cudaStream_t stream){
++  auto*p=static_cast<Plan*>(v);if(index<0||index>=int(p->choices.size()))return -1;
++  float alpha=1,beta=0;auto ix=full?p->x:p->lx;auto iy=full?p->y:p->ly;
++  return cublasLtMatmul(p->handle,p->op,&alpha,w,p->w,x,ix,&beta,y,iy,y,iy,&p->choices[index].algo,workspace,bytes,stream);
++}
++extern "C" void row_plan_destroy(void*v){delete static_cast<Plan*>(v);}
+--- /dev/null
++++ b/python/sglang/srt/speculative/dflash_projection_n/adapter.py
+@@ -0,0 +1,146 @@
++"""Collective-safe full-K/output-N DFlash FC research adapter.
++
++Explicitly register identical full shapes on every TP rank before graph capture,
++using multiple live calibration inputs and the already loaded original weight.
++No candidate is activated by importing this file. H200 qualification is pending.
++The qualified mode uses finite local parity gates, not a universal proof of
++vendor floating-point equivalence. Shadow mode retains the original result on
++any live mismatch, for diagnostics; its overhead must never be omitted in timing.
++"""
++from dataclasses import dataclass,field
++import ctypes
++import torch
++import torch.distributed as dist
++from .runtime_projection import discover,compatible,native_workspace
++
++def runtime_state():
++ return (native_workspace(),torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
++         torch.are_deterministic_algorithms_enabled(),torch.is_deterministic_algorithms_warn_only_enabled())
++
++def weight_version(w):
++ try:return w._version
++ except RuntimeError:return None  # inference tensor: static checkpoint only
++
++@dataclass
++class Entry:
++ plan: object
++ native_state: object
++ weight_pointer: int
++ weight_version: int
++ weight_shape: tuple
++ weight_stride: tuple
++ workspaces: dict=field(default_factory=dict)
++ metadata: dict=field(default_factory=dict)
++
++class OutputNRouter:
++ def __init__(self,original,group,*,mode='shadow'):
++  if not isinstance(original,torch.nn.Linear) or original.bias is not None:
++   raise TypeError('requires the original bias-free native Linear')
++  if mode not in ('shadow','qualified'):raise ValueError(mode)
++  if group.world_size!=8:raise ValueError('this research gate is TP8 only')
++  self.original=original;self.group=group;self.mode=mode;self.entries={}
++  self.closed=False;self.stream_workspaces={};self.registration_index=0;self.manifest=None
++
++ def prepare_registration(self,shapes):
++  try:local=dict(shapes=[tuple(s) for s in shapes],mode=self.mode,error=None)
++  except Exception as exc:local=dict(shapes=None,mode=self.mode,error=repr(exc))
++  declarations=[None]*self.group.world_size
++  dist.all_gather_object(declarations,local,group=self.group.cpu_group)
++  accepted=all(d['error'] is None and d['shapes']==declarations[0]['shapes'] and d['mode']==declarations[0]['mode'] for d in declarations)
++  self.manifest=declarations[0]['shapes'] if accepted else None
++  self.registration_index=0
++  return accepted,declarations
++
++ def register(self,examples,*,discover_fn=discover):
++  """Collective startup operation, never called automatically from a forward."""
++  key=None;w=self.original.weight
++  try:
++   if self.closed or torch.cuda.is_current_stream_capturing():raise ValueError('registration requires live router outside capture')
++   examples=list(examples)
++   if len(examples)<2:raise ValueError('two or more calibration inputs required')
++   x=examples[0];key=tuple(x.shape)
++   if key in self.entries:raise ValueError('shape already registered')
++   if self.manifest is None or self.registration_index>=len(self.manifest) or self.manifest[self.registration_index]!=key:raise ValueError('startup manifest mismatch')
++   signature=dict(shape=key,weight_shape=tuple(w.shape),dtype=str(x.dtype),weight_dtype=str(w.dtype),
++                  world=self.group.world_size,mode=self.mode,index=self.registration_index,error=None)
++  except Exception as exc:signature=dict(shape=key,index=self.registration_index,error=repr(exc))
++  signatures=[None]*self.group.world_size
++  dist.all_gather_object(signatures,signature,group=self.group.cpu_group)
++  self.registration_index+=1
++  if any(s.get('error') is not None or s!=signatures[0] for s in signatures):
++   return dict(globally_enabled=False,reason='inconsistent registration',ranks=signatures)
++  plan=None;metadata={}
++  try:
++   plan,metadata=discover_fn([(v,w) for v in examples],self.group.world_size)
++   if plan is not None:
++    state=runtime_state();stream=torch.cuda.current_stream().cuda_stream
++    identity=(w.data_ptr(),weight_version(w),tuple(w.shape),w.stride())
++    workspace_key=(w.device,stream,state[0][1])
++    if workspace_key not in self.stream_workspaces:
++     self.stream_workspaces[workspace_key]=torch.empty(state[0][1],device=w.device,dtype=torch.uint8)
++  except Exception as exc:
++   if plan is not None:plan.close();plan=None
++   metadata={'reason':'local qualification failed','error':repr(exc)}
++  available=torch.tensor(int(plan is not None),dtype=torch.int32)
++  dist.all_reduce(available,op=dist.ReduceOp.MIN,group=self.group.cpu_group)
++  if not int(available):
++   if plan is not None:plan.close()
++   self.entries[key]=None
++   return dict(metadata,globally_enabled=False)
++  entry=Entry(plan,state,*identity,
++              {stream:self.stream_workspaces[workspace_key]},dict(metadata,globally_enabled=True))
++  # Discovery's smaller per-plan allocation has no captured users yet.
++  plan.workspace=None
++  self.entries[key]=entry
++  return entry.metadata
++
++ def _local(self,entry,x):
++  w=self.original.weight;plan=entry.plan
++  if (not compatible(x,w,8) or x.device!=plan.device or
++      tuple(x.shape)!=(plan.m,plan.k) or w.data_ptr()!=entry.weight_pointer or
++      weight_version(w)!=entry.weight_version or tuple(w.shape)!=entry.weight_shape or
++      w.stride()!=entry.weight_stride or runtime_state()!=entry.native_state):return None
++  stream=torch.cuda.current_stream().cuda_stream
++  workspace=entry.workspaces.get(stream)
++  if workspace is None:
++   # Graph warmup binds a separate buffer on its own stream. A capture that
++   # skipped warmup uses the collective-safe native-slice branch below.
++   if torch.cuda.is_current_stream_capturing():return None
++   workspace_key=(w.device,stream,entry.native_state[0][1])
++   if workspace_key not in self.stream_workspaces:
++    self.stream_workspaces[workspace_key]=torch.empty(entry.native_state[0][1],device=w.device,dtype=torch.uint8)
++   workspace=self.stream_workspaces[workspace_key]
++   entry.workspaces[stream]=workspace
++  width=plan.n//8;rank=self.group.rank_in_group
++  if not 0<=rank<8:raise ValueError('invalid TP rank')
++  out=torch.empty((plan.m,width),device=x.device,dtype=x.dtype)
++  status=plan.invoke(plan.index,False,w.narrow(0,rank*width,width),x,out,workspace)
++  return None if status else out
++
++ def __call__(self,x):
++  if self.closed:raise RuntimeError('router retired')
++  entry=self.entries.get(tuple(x.shape))
++  if entry is None:return self.original(x)
++  try:local=self._local(entry,x)
++  except (ValueError,TypeError,AttributeError,ctypes.ArgumentError,torch.cuda.OutOfMemoryError):local=None
++  # A sticky CUDA/context error is not recoverable; let the worker abort rather
++  # than claiming a native fallback can repair a poisoned device context.
++  native=None
++  if local is None:
++   native=self.original(x);width=native.shape[-1]//8
++   local=native.narrow(-1,self.group.rank_in_group*width,width).contiguous()
++  # Every registered/enabled rank participates even after a local layout,
++  # pointer, stream, version, workspace or vendor-status rejection.
++  assembled=self.group.all_gather(local,dim=-1)
++  if self.mode=='qualified':return assembled
++  if native is None:native=self.original(x)
++  return torch.where((assembled.view(torch.int16)==native.view(torch.int16)).all(),assembled,native)
++
++ def retire(self,*,graphs_destroyed=False):
++  """Keep descriptors/workspaces alive for the entire captured-graph lifetime."""
++  if not graphs_destroyed:raise RuntimeError('destroy dependent graphs before retiring the router')
++  if self.closed:return
++  torch.cuda.synchronize(self.original.weight.device)
++  for entry in self.entries.values():
++   if entry is not None:entry.plan.close()
++  self.entries.clear();self.stream_workspaces.clear();self.closed=True
+--- /dev/null
++++ b/python/sglang/srt/speculative/dflash_projection_n/entry.py
+@@ -0,0 +1,110 @@
++"""Explicit startup entry for the diagnostic output-N candidate; never auto-enables."""
++import json,statistics
++import torch
++import torch.distributed as dist
++from .adapter import OutputNRouter
++from .runtime_projection import native_workspace
++from .native_build import build_native
++
++def _startup_timing(router,x,rounds=6):
++ """Measure native FC versus own FC plus real group gather, on every rank."""
++ entry=router.entries.get(tuple(x.shape))
++ if entry is None:return {'active':False}
++ records={'native_us':[],'local_us':[],'gather_us':[],'combined_us':[]};bad=0;fallbacks=0
++ reference=router.original(x)
++ for _ in range(2):router(x)
++ torch.cuda.synchronize()
++ for step in range(rounds):
++  for arm in (('native','candidate') if step%2==0 else ('candidate','native')):
++   events=[torch.cuda.Event(enable_timing=True) for _ in range(3)]
++   events[0].record()
++   if arm=='native':out=router.original(x);events[2].record()
++   else:
++    local=router._local(entry,x)
++    if local is None:
++     native=router.original(x);width=native.shape[1]//router.group.world_size
++     local=native[:,router.group.rank_in_group*width:(router.group.rank_in_group+1)*width].contiguous();fallbacks+=1
++    events[1].record();out=router.group.all_gather(local,dim=-1);events[2].record()
++   events[2].synchronize()
++   if arm=='native':records['native_us'].append(events[0].elapsed_time(events[2])*1000)
++   else:
++    records['local_us'].append(events[0].elapsed_time(events[1])*1000)
++    records['gather_us'].append(events[1].elapsed_time(events[2])*1000)
++    records['combined_us'].append(events[0].elapsed_time(events[2])*1000)
++   bad+=int(not torch.equal(out.view(torch.int16),reference.view(torch.int16)))
++ return dict(active=not fallbacks,correct=not bad,mismatches=bad,fallbacks=fallbacks,scope='Synthetic startup inputs and real loaded weights; actual TP gather, not serving throughput',
++             medians={k:statistics.median(v) for k,v in records.items()},samples=records)
++
++@torch.no_grad()
++def create_projection(original,group,*,mode='shadow',rows=(),measure=True,calibration_budget_bytes=128*2**20):
++ """Call collectively after weight loading, before graph capture and serving.
++
++ Return None coherently if prerequisites fail. Only declared rows are enabled;
++ all other shapes keep the original projection. Rows are not workload IDs.
++ """
++ local={'error':None,'mode':mode,'rows':list(rows),'measure':bool(measure),'calibration_budget_bytes':calibration_budget_bytes}
++ try:
++  if not isinstance(original,torch.nn.Linear) or original.bias is not None:raise TypeError('native bias-free Linear required')
++  if original.weight.dtype!=torch.bfloat16 or not original.weight.is_cuda:raise TypeError('CUDA BF16 weight required')
++  if original.weight.ndim!=2 or group.world_size!=8:raise ValueError('requires a TP8 matrix projection')
++  n,k=original.weight.shape
++  if min(n,k)<=0 or n%8 or not original.weight.is_contiguous():raise ValueError('unsupported weight layout')
++  if torch.cuda.is_current_stream_capturing():raise ValueError('startup factory cannot run during capture')
++  if any(not isinstance(m,int) or m<=0 for m in rows):raise ValueError('invalid decode rows')
++  build_native()
++  workspace=native_workspace()
++  if workspace is None:raise ValueError('native workspace unavailable')
++  local['geometry']=[n,k];local['workspace']=workspace
++ except Exception as exc:local['error']=repr(exc)
++ declarations=[None]*group.world_size
++ dist.all_gather_object(declarations,local,group=group.cpu_group)
++ if any(d!=declarations[0] or d['error'] is not None for d in declarations):
++  if group.rank_in_group==0:print('DFLASH_OUTPUT_N_DISABLED '+json.dumps(declarations),flush=True)
++  return None
++ # Account for two BF16 inputs, two native references, one full diagnostic
++ # output, a local output, calibration scratch and the retained stream scratch.
++ bytes_per_row=4*k+6*n+2*(n//group.world_size)
++ allocation_bound=lambda m:2*workspace[1]+m*bytes_per_row
++ unsupported=[m for m in rows if allocation_bound(m)>calibration_budget_bytes]
++ rows=sorted(set(m for m in rows if allocation_bound(m)<=calibration_budget_bytes))
++ if not rows:
++  if group.rank_in_group==0:print('DFLASH_OUTPUT_N_DISABLED no configured rows within calibration budget',flush=True)
++  return None
++ router=OutputNRouter(original,group,mode=mode)
++ accepted,_=router.prepare_registration([(m,k) for m in rows])
++ if not accepted:return None
++ generator=torch.Generator(device=original.weight.device).manual_seed(20261119)
++ logs=[]
++ for m in rows:
++  # One shape at a time, bounded by the declared calibration allocation budget.
++  examples=[]
++  try:
++   x=torch.randn((m,k),device=original.weight.device,dtype=torch.bfloat16,generator=generator)
++   y=torch.randn(x.shape,device=x.device,dtype=x.dtype,generator=generator);y[:,::4]*=32;y[:,1::4]*=.03125
++   examples=[x,y]
++  except torch.cuda.OutOfMemoryError:pass
++  metadata=router.register(examples);row=dict(m=m,qualification=metadata)
++  timing=None;error=None
++  if measure and metadata.get('globally_enabled'):
++   # Recoverable dispatch rejection still gathers a native slice inside the
++   # timing function. A poisoned CUDA context is fatal, not caught here.
++   timing=_startup_timing(router,x)
++   if not timing.get('active') or not timing.get('correct'):error='startup exactness or dispatch failed'
++  reports=[None]*group.world_size
++  dist.all_gather_object(reports,dict(timing=timing,error=error),group=group.cpu_group)
++  faster=not measure or (metadata.get('globally_enabled') and all(r['timing'] is not None and r['timing'].get('active') and r['timing'].get('correct') and r['timing']['medians']['combined_us']<r['timing']['medians']['native_us'] for r in reports))
++  if any(r['error'] is not None for r in reports) or not faster:
++   entry=router.entries.get((m,k))
++   if entry is not None:entry.plan.close()
++   router.entries[(m,k)]=None
++   row['disabled_after_startup']=True
++   row['disable_reason']='exactness/dispatch or all-rank combined latency gate'
++  row['ranks']=reports;logs.append(row)
++  examples.clear()
++  if 'x' in locals():del x
++  if 'y' in locals():del y
++ if group.rank_in_group==0:
++  print('DFLASH_OUTPUT_N_STARTUP '+json.dumps(dict(mode=mode,rows=logs,unsupported_rows=unsupported,calibration_budget_bytes=calibration_budget_bytes,
++   lifecycle='Static checkpoint and math policy only. Weight reload or policy changes require destroying dependent graphs and rebuilding the router.',
++   scratch_bytes=sum(t.numel() for t in router.stream_workspaces.values()))),flush=True)
++ return router
+--- /dev/null
++++ b/python/sglang/srt/speculative/dflash_projection_n/native_build.py
+@@ -0,0 +1,34 @@
++"""Small host-only cuBLASLt bridge, cached outside the installed source tree."""
++import fcntl,hashlib,json,os,subprocess
++from pathlib import Path
++import torch
++
++def native_library_path():
++ source=Path(__file__).resolve().parent/'runtime_lt.cc'
++ key=hashlib.sha256(source.read_bytes()+str(torch.version.cuda).encode()).hexdigest()[:20]
++ base=Path(os.environ.get('SGLANG_JIT_CACHE_DIR',os.environ.get('SGLANG_CACHE_DIR',str(Path.home()/'.cache/sglang'))))
++ return base/'dflash_output_n'/key/'runtime_lt.so'
++
++def build_native():
++ source=Path(__file__).resolve().parent/'runtime_lt.cc'
++ roots=[Path(os.environ.get('CUDA_HOME','/usr/local/cuda')),
++        Path(torch.__file__).resolve().parent.parent/'nvidia/cu13',Path('/usr/local/cuda')]
++ root=next((p for p in roots if (p/'include/cublasLt.h').is_file()),None)
++ if root is None:raise RuntimeError('matching CUDA SDK headers unavailable')
++ libraries=[p for d in ('lib','lib64') for p in (root/d).glob('libcublasLt.so*') if p.is_file()]
++ library=next((p for p in libraries if p.name=='libcublasLt.so'),libraries[0] if libraries else None)
++ if library is None:raise RuntimeError('CUDA SDK cuBLASLt link library unavailable')
++ libdir=library.parent;compiler=os.environ.get('CXX','g++')
++ output=native_library_path();output.parent.mkdir(parents=True,exist_ok=True);stamp=output.with_suffix('.json')
++ identity=dict(source=hashlib.sha256(source.read_bytes()).hexdigest(),cuda=str(root),
++               header=hashlib.sha256((root/'include/cublasLt.h').read_bytes()).hexdigest(),compiler=compiler)
++ with output.with_suffix('.lock').open('a+') as guard:
++  fcntl.flock(guard,fcntl.LOCK_EX)
++  if output.exists() and stamp.exists() and json.loads(stamp.read_text()).get('identity')==identity:return
++  temporary=output.with_name(f'runtime_lt.{os.getpid()}.so')
++  command=[compiler,'-shared','-fPIC','-O2','-std=c++17',str(source),'-I'+str(root/'include'),
++           '-Wl,-rpath,'+str(libdir),str(library),'-o',str(temporary)]
++  result=subprocess.run(command,capture_output=True,text=True,timeout=60)
++  if result.returncode:raise RuntimeError('native build failed: '+result.stderr[-4000:])
++  os.replace(temporary,output)
++  stamp.write_text(json.dumps(dict(identity=identity,command=command,stderr=result.stderr),indent=2))
+--- /dev/null
++++ b/python/sglang/srt/speculative/dflash_projection_n/runtime_lt.cc
+@@ -0,0 +1,81 @@
++// Query runtime full-shape candidates. Accepted plans are legal for both layouts.
++// Matrix descriptors use the column-major transpose identity for row-major F.linear.
++#include <cublasLt.h>
++#include <algorithm>
++#include <cstdint>
++#include <memory>
++#include <vector>
++
++struct Choice {
++    cublasLtHandle_t handle{};
++    cublasLtMatmulDesc_t op{};
++    cublasLtMatrixLayout_t x{}, full_w{}, local_w{}, full_y{}, local_y{};
++    cublasLtMatmulPreference_t pref{};
++    struct Item { cublasLtMatmulAlgo_t algo; size_t local_bytes, full_bytes; int ordinal; };
++    std::vector<Item> items;
++    ~Choice() {
++        if (pref) cublasLtMatmulPreferenceDestroy(pref);
++        for (auto mat:{x,full_w,local_w,full_y,local_y}) if(mat) cublasLtMatrixLayoutDestroy(mat);
++        if(op) cublasLtMatmulDescDestroy(op);
++        if(handle) cublasLtDestroy(handle);
++    }
++};
++
++extern "C" void* projection_prepare(int m,int n,int k,int world,uint64_t bytes) {
++    if(m<=0 || k<=0 || world<=1 || n%world || n<world) return nullptr;
++    auto p=std::make_unique<Choice>();
++    auto mat=[](cublasLtMatrixLayout_t* desc,int rows,int cols) {
++        return cublasLtMatrixLayoutCreate(desc,CUDA_R_16BF,rows,cols,rows);
++    };
++    cublasOperation_t trans=CUBLAS_OP_T;
++    if (cublasLtCreate(&p->handle)
++        || cublasLtMatmulDescCreate(&p->op,CUBLAS_COMPUTE_32F,CUDA_R_32F)
++        || cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_TRANSA,&trans,sizeof(trans))
++        || mat(&p->x,k,m) || mat(&p->full_w,k,n) || mat(&p->local_w,k,n/world)
++        || mat(&p->full_y,n,m) || mat(&p->local_y,n/world,m)
++        || cublasLtMatmulPreferenceCreate(&p->pref)
++        || cublasLtMatmulPreferenceSetAttribute(p->pref,CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&bytes,sizeof(bytes)))
++        return nullptr;
++    cublasLtMatmulHeuristicResult_t results[64]{};
++    int count=0;
++    if(cublasLtMatmulAlgoGetHeuristic(p->handle,p->op,p->full_w,p->x,p->full_y,p->full_y,
++                                     p->pref,64,results,&count)) return nullptr;
++    for(int i=0;i<count;++i) {
++        auto &a=results[i];
++        cublasLtMatmulHeuristicResult_t local{};
++        if(a.state || a.workspaceSize>bytes) continue;
++        if(cublasLtMatmulAlgoCheck(p->handle,p->op,p->local_w,p->x,p->local_y,p->local_y,&a.algo,&local)
++           || local.state || local.workspaceSize>bytes) continue;
++        p->items.push_back({a.algo,local.workspaceSize,a.workspaceSize,i});
++    }
++    return p.release();
++}
++extern "C" uint64_t projection_lt_version(){return cublasLtGetVersion();}
++extern "C" void projection_drop(void* q){delete static_cast<Choice*>(q);}
++extern "C" int projection_count(void* q){return static_cast<Choice*>(q)->items.size();}
++extern "C" uint64_t projection_attr(void* q,int i,int a) {
++    auto &v=static_cast<Choice*>(q)->items.at(i);
++    return a==0?v.ordinal:(a==1?v.local_bytes:v.full_bytes);
++}
++extern "C" int projection_call(void* q,int i,int full,const void* w,const void* x,void* y,
++                              void* scratch,uint64_t bytes,cudaStream_t stream) {
++    auto* p=static_cast<Choice*>(q);
++    auto &choice=p->items.at(i);
++    auto weight=full?p->full_w:p->local_w, out=full?p->full_y:p->local_y;
++    if(bytes<(full?choice.full_bytes:choice.local_bytes)) return CUBLAS_STATUS_INVALID_VALUE;
++    float alpha=1, beta=0;
++    return cublasLtMatmul(p->handle,p->op,&alpha,w,weight,x,p->x,&beta,y,out,y,out,
++                         &choice.algo,scratch,bytes,stream);
++}
++
++
++extern "C" int projection_config(void* q,int index,int field) {
++ static const cublasLtMatmulAlgoConfigAttributes_t fields[]={
++  CUBLASLT_ALGO_CONFIG_ID,CUBLASLT_ALGO_CONFIG_TILE_ID,CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
++  CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING,
++  CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION,CUBLASLT_ALGO_CONFIG_STAGES_ID,
++  CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID,CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID};
++ if(field<0 || field>=9)return -1;
++ auto* p=static_cast<Choice*>(q);int value=-1;
++ return cublasLtMatmulAlgoConfigGetAttribute(&p->items.at(index).algo,fields[field],&value,sizeof(value),nullptr)==CUBLAS_STATUS_SUCCESS?value:-1;
++}
+--- /dev/null
++++ b/python/sglang/srt/speculative/dflash_projection_n/runtime_projection.py
+@@ -0,0 +1,167 @@
++"""Runtime full-shape discovery and complete-column parity calibration for native BF16 linear.
++
++Keep the original replicated layer for unknown shapes and exact fallback. The fast path
++is empirical until a matching native reduction order is independently established.
++"""
++import ctypes as ct
++from pathlib import Path
++from functools import lru_cache
++
++import torch
++from .native_build import native_library_path
++from torch.nn import functional as F
++
++HERE = Path(__file__).resolve().parent
++
++
++def runtime_lib():
++    lib = ct.CDLL(str(native_library_path()))
++    ptr,num,size=ct.c_void_p,ct.c_int,ct.c_uint64
++    for name,signature,returns in [
++        ("projection_prepare",[num,num,num,num,size],ptr),("projection_count",[ptr],num),
++        ("projection_lt_version",[],size),("projection_config",[ptr,num,num],num),("projection_attr",[ptr,num,num],size),
++        ("projection_call",[ptr,num,num,ptr,ptr,ptr,ptr,size,ptr],num),("projection_drop",[ptr],None)]:
++        fn=getattr(lib,name)
++        fn.argtypes,fn.restype=signature,returns
++    return lib
++
++
++@lru_cache(maxsize=2)
++def workspace_accessor(blas):
++    symbol={"cublas":"_ZN2at4cuda22getChosenWorkspaceSizeEv",
++            "cublaslt":"_ZN2at4cuda26getCUDABlasLtWorkspaceSizeEv"}.get(blas)
++    if symbol is None: return None
++    native=ct.CDLL(str(Path(torch.__file__).resolve().parent/"lib/libtorch_cuda.so"))
++    fn=getattr(native,symbol)
++    fn.argtypes,fn.restype=[],ct.c_size_t
++    return fn
++
++
++def native_workspace():
++    # Cache only the symbol. The active override is re-read on each call.
++    try:
++        blas=str(torch.backends.cuda.preferred_blas_library()).split(".")[-1].lower()
++        fn=workspace_accessor(blas)
++        return None if fn is None else (blas,int(fn()))
++    except (OSError,AttributeError,RuntimeError):
++        return None
++
++
++def compatible(x,w,world):
++    return (x.is_cuda and w.device==x.device and torch.cuda.current_device()==x.device.index
++            and x.dtype==w.dtype==torch.bfloat16 and x.ndim==w.ndim==2
++            and x.shape[0]>0 and w.shape[1]==x.shape[1] and world>1 and w.shape[0]%world==0
++            and x.is_contiguous() and w.is_contiguous() and x.data_ptr()%256==0 and w.data_ptr()%256==0
++            and (w.shape[0]//world)*w.shape[1]*w.element_size()%256==0)
++
++
++class VendorPlan:
++    def __init__(self,lib,handle,world,n,m,device):
++        self.lib,self.handle,self.world=lib,handle,world
++        self.n,self.m,self.device=n,m,device
++        self.index=None
++        self.workspace=None
++        self.stream=None
++        self.k=None
++
++    def close(self):
++        if self.handle:
++            self.lib.projection_drop(self.handle)
++            self.handle=None
++
++    def __enter__(self): return self
++    def __exit__(self,*args): self.close()
++
++    def choices(self):
++        return self.lib.projection_count(self.handle)
++
++    def details(self,index):
++        return dict(zip(("vendor_ordinal","local_workspace","full_workspace"),
++                    [self.lib.projection_attr(self.handle,index,i) for i in range(3)]),
++                    attrs=dict(zip("id tile split reduction swizzle custom stages inner cluster".split(),
++                    [self.lib.projection_config(self.handle,index,i) for i in range(9)])))
++
++    def invoke(self,index,full,w,x,out,temp):
++        return self.lib.projection_call(self.handle,index,int(full),w.data_ptr(),x.data_ptr(),out.data_ptr(),
++            temp.data_ptr() if temp.numel() else None,temp.numel(),torch.cuda.current_stream().cuda_stream)
++
++    def local(self,x,w,rank):
++        if self.index is None or not compatible(x,w,self.world) or x.device!=self.device:
++            return None
++        if (x.shape[0],x.shape[1],w.shape[0])!=(self.m,self.k,self.n) or not 0<=rank<self.world:
++            return None
++        if torch.cuda.current_stream().cuda_stream!=self.stream: return None
++        width=self.n//self.world
++        out=torch.empty(self.m,width,device=x.device,dtype=x.dtype)
++        status=self.invoke(self.index,False,w.narrow(0,rank*width,width),x,out,self.workspace)
++        return None if status else out
++
++
++@torch.no_grad()
++def discover(examples,world):
++    """Examples share full geometry and device, with genuinely different weights/inputs.
++
++    No static IDs. Try the full-operation heuristic order, using this process's active
++    backend/workspace. A retained plan must reproduce full native output and every shard.
++    """
++    # Native PyTorch restricts Lt reduction schemes under stricter BF16
++    # policies. This bridge intentionally supports only the tested native
++    # default; do not silently re-enable reduced-precision partial reductions.
++    if torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction is not True:
++        return None,{"reason":"native BF16 reduction policy requires an unsupported Lt preference mask"}
++    examples=list(examples)
++    if not examples: return None,{"reason":"no calibration examples"}
++    x,w=examples[0]
++    if not all(compatible(v,wt,world) and v.shape==x.shape and wt.shape==w.shape
++               and v.device==x.device for v,wt in examples): return None,{"reason":"unsupported layout"}
++    if torch.cuda.is_current_stream_capturing(): return None,{"reason":"new plan during capture"}
++    actual=native_workspace()
++    if actual is None: return None,{"reason":"unknown torch backend/workspace"}
++    try: lib=runtime_lib()
++    except OSError: return None,{"reason":"unavailable native plan library"}
++    prop=torch.cuda.get_device_properties(x.device)
++    backend,size=actual
++    information={"blas":backend,"native_workspace":size,"cublasLt_version":lib.projection_lt_version(),
++        "device":prop.name,"sm_count":prop.multi_processor_count,"capability":[prop.major,prop.minor],
++        "torch":str(torch.__version__),"cuda_runtime":torch.version.cuda,"world":world,
++        "shape":[x.shape[0],w.shape[0],w.shape[1]],"calibration_examples":len(examples),
++        "reduced_bf16":torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction}
++    m,k=x.shape
++    n=w.shape[0]
++    handle=lib.projection_prepare(m,n,k,world,size)
++    if not handle: return None,{**information,"reason":"no exposed plan"}
++    plan=VendorPlan(lib,handle,world,n,m,x.device)
++    try:
++        refs=[F.linear(v,wt) for v,wt in examples]
++        full,local=torch.empty_like(refs[0]),torch.empty((m,n//world),device=x.device,dtype=x.dtype)
++        information["eligible"]=plan.choices()
++        tried=[]
++        information["tried"]=tried
++        for i in range(plan.choices()):
++            info=plan.details(i)
++            scratch=torch.empty(max(info["local_workspace"],info["full_workspace"]),
++                                dtype=torch.uint8,device=x.device)
++            ok=True
++            for (v,wt),ref in zip(examples,refs):
++                if plan.invoke(i,True,wt,v,full,scratch) or not torch.equal(full.view(torch.int16),ref.view(torch.int16)):
++                    ok=False
++                    break
++                for j,weights in enumerate(wt.split(n//world)):
++                    status=plan.invoke(i,False,weights,v,local,scratch)
++                    if status or not torch.equal(local.view(torch.int16),ref.narrow(1,j*(n//world),n//world).view(torch.int16)):
++                        ok=False
++                        break
++                if not ok: break
++            tried.append({**info,"passed":ok})
++            if ok:
++                plan.index=i
++                plan.k=k
++                plan.workspace=torch.empty(info["local_workspace"],dtype=torch.uint8,device=x.device)
++                plan.stream=torch.cuda.current_stream().cuda_stream
++                return plan,{**information,"chosen":info}
++        plan.close()
++        return None,{**information,"reason":"no bitwise match"}
++    except Exception:
++        plan.close()
++        raise
++
+--- /dev/null
++++ b/python/sglang/srt/speculative/dflash_projection_n/__init__.py
+@@ -0,0 +1 @@
++from .entry import create_projection

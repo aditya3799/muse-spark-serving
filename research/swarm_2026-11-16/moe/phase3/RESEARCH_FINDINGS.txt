@@ -1,0 +1,15 @@
+MoE high-impact research checkpoint ? 2026-11-16
+
+Result: one canonical Humming weight layout can supply v139 KPERM3 tile bytes without a second persistent weight copy. The CPU address proof passed 10 independent checks. The SM86 CUDA oracle passed 32 exact-byte eager/changed-input graph checks, with output canaries intact. This is a layout result, not an expert GEMM or serving speedup.
+
+The direct donor ports are unsuitable: private v139 holds eight full layouts (6.75 GiB per layer), and the latest public i4 also retains several layouts plus raw weights. Public i4 documents a latent valid-8-bit-scale fallback bug. Both use arithmetic and reduction choices different from the scored serving path. Donor kernel-track scores of 2.39?2.63x do not measure gain over current Humming.
+
+The useful mechanism is narrower. A donor down word maps to one canonical32-bit word; a gate/up word maps to two. A complete256-row x256-K stage spans exactly32KiB codes+4KiB scales in128-byte sectors. Cooperating across warpgroups avoids the per-group gate/up sector rereads. Consume canonical words directly into BF16register fragments rather than doing a global repack. The current CUDA file is intentionally an integer correctness oracle; it has no optimized producer or GEMM.
+
+Memory: existing resident localMoE weights are0.84375*L GiB, with unknown verified layer countL. New persistent weight delta iszero. The existing scored preparation bound is W_other+0.84375*L+0.875GiB for contiguous inputs plus metadata/allocator overhead, source-derived only. No new whole-model loading step is introduced. A proposed adapter must reuse the original stage ring: donor default rings already consume204KiB before metadata, so adding36KiB scratch exceeds the pinned227KiB SM90 dynamic shared-memory cap. No whole-model memory claim follows from the diagnostic's18MiB allocation peak.
+
+Next gate: down-stage canonical BF16fragment decoding first, exhaustive originalcode/FP8scale semantics, then boundedSM90 resource proof and isolatedexpertGEMM preserving currentFP32accumulation/global-scale BF16rounding andfinalizer. The existing raw-output and end-to-end thresholds remain fixed. ActualH200 WGMMA correctness/coldA/B andwhole-modelmemory are still required. No additional compile/GPU task is running; no remote submission was made.
+
+User target:3?3.5x is a stretch objective, not a forecast. Relative to1.2237currentserving, it requires2.452?2.860x further gain. Even ifexperts consume80% ofcurrenttime, anexpert-only path needs3.85?5.35x overcurrentHumming. Measuringthatfraction andgainingoutsideexperts remains essential.
+
+Detailed provenance, source digests, resource equations, original failure receipt, all gates and next steps: RESEARCH_HANDOFF.json. Passing run:canonical_tile_gpu_retry; initial pre-case driver-context failure preserved:canonical_tile_gpu_run.

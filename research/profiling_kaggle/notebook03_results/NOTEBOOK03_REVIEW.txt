@@ -1,0 +1,50 @@
+NOTEBOOK 03: VERIFIED MAPPING-CANDIDATE REVIEW
+Run: 20261114T150333Z_00dac4
+
+DECISION
+The cached lookup candidate has consistent isolated T4 evidence. Proceed to a narrow integration/lifecycle review, keeping active V4 unchanged until that review is complete. Rebuilding the table each call is not a robust optimization.
+
+VALIDATION
+All 11 member checksums and source provenance matched. Recomputed all 588 event AND wall medians from 6,468 samples; verified all 384 comparison rows.
+672 correctness cases / 4,032 output checks passed. All 96 benchmark cases, 1,152 changed-input benchmark graph checks and six setup graph checks passed.
+The profiler captured 114 actual kernels, all attributed. GPU annotation spans are excluded.
+
+RESULTS: matched configuration/trial comparisons
+Scope | Candidate | Mode | wins/total | median reduction | reduction range
+helper_only | cached_lookup | eager | 48/48 | 38.07% | 31.85% to 54.35%
+helper_only | cached_lookup | graph | 48/48 | 29.66% | 21.19% to 42.14%
+helper_only | rebuilt_lookup | eager | 35/48 | 1.50% | -7.24% to 24.86%
+helper_only | rebuilt_lookup | graph | 47/48 | 3.21% | -1.22% to 10.42%
+fallback_cast_map | cached_lookup | eager | 48/48 | 32.66% | 25.69% to 66.19%
+fallback_cast_map | cached_lookup | graph | 48/48 | 22.64% | 16.63% to 30.43%
+fallback_cast_map | rebuilt_lookup | eager | 28/48 | 0.76% | -13.89% to 9.49%
+fallback_cast_map | rebuilt_lookup | graph | 42/48 | 1.70% | -0.83% to 5.42%
+
+FOCUSED GRAPH CASES: fallback cast+map, int64, hot-local
+Tokens | Baseline us* | Cached candidate us* | median paired trial reduction
+9 | 24.17 | 18.77 | 22.35%
+32 | 25.61 | 20.35 | 21.46%
+128 | 31.94 | 25.74 | 18.96%
+256 | 29.39 | 23.57 | 18.74%
+* Times are medians of three trial medians. Percentages are medians of within-trial percentage reductions, so they need not equal the ratio of these two aggregated times.
+
+MECHANISM
+At 128 tokens, int64 fallback input, each baseline invocation used seven kernels; cached lookup used five; rebuilding the table restored seven.
+Separate profiler-on kernel-duration sums, median of iterations 2-6: baseline 36.80 us, cached 29.92 us, rebuilt 36.32 us. These trace times are not benchmark latency and cannot be subtracted from it.
+The cached fallback graph variant saved a median 5.63 us per isolated call across 48 configuration/trial comparisons (range about 4.77-7.42 us). This is more relevant than unusually large eager wins under host variability.
+
+CACHE COSTS
+Build new table: eager 20.86 us, captured graph 4.71 us. Refresh existing table via build+copy: eager 30.82 us, captured graph 6.25 us. All are medians of trial medians from separate setup measurements.
+Extra storage is 1,028 bytes per 256-entry int32 mapping. Cached timing excludes setup and refresh. Per-call rebuild gains are small and inconsistent: fallback eager wins only 28/48 comparisons, with a median reduction of 0.76%; fallback graph median reduction is 1.70%.
+Do not add separately measured stage medians into an exact break-even formula. Actual table lifetime, refresh frequency, graph use and device movement must be validated.
+
+SOURCE REVIEW AND NEXT STEP
+MuseSpark1xFp4Experts creates _expert_map during initialization and registers it as a nonpersistent buffer (muse_spark_fp4_moe.py:170-177). The same file reads it in _marlin_expert_outputs; no other writes were found in that file. This suggests a reusable table is feasible, but is not proof against external updates.
+Prepare an isolated candidate that owns a companion nonpersistent lookup buffer. Verify device migration, buffer lifetime, arbitrary mapping content, checkpoint behavior, refresh/invalidation on mapping changes, and stable pointers during graph replay.
+Apply the lookup only where the standalone mapping fallback is already used. Keep the existing eligible <=64-route fused alignment path and its threshold unchanged. Include the standard dispatcher only if its separate ownership/lifecycle is reviewed.
+Test the integrated wrapper against baseline with repeated eager/graph measurements on T4. Preserve an independently reviewable patch and V4 baseline; do not claim a model speedup from this component result.
+
+LIMITS
+This run used Tesla T4, torch 2.14.1+cu130, Triton 3.8.0 and driver 580.82.07. Its clock snapshot differs from Notebook 02; use within-run comparisons.
+Three trials are within one runtime/session, not independent hardware runs. Eager measurements show host variability; wins near zero in the rebuilt variant are not a strong basis for a change.
+Not measured: actual alignment/GEMMs, eight-GPU communication, full serving latency, scheduler/tokenizer startup, or H200 performance. No full-model correctness claim.

@@ -1,0 +1,902 @@
+diff --git a/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py b/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
+--- a/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
++++ b/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
+@@ -272,6 +272,8 @@
+         layer.fp32_configs[stage] = owned
+     from sglang.kernels.ops.moe.muse_spark_humming_split import prepare_large_prefill_partition
+     prepare_large_prefill_partition(layer, torch)
++    from sglang.kernels.ops.moe.muse_spark_grouped_gate import prepare_build
++    prepare_build(layer)
+     return layer
+ 
+ 
+@@ -313,10 +315,21 @@
+     return (cache3.view(m, topk, k), local_ids)
+ 
+ 
+-def _humming_expert_outputs(layer, x, local_ids, torch, retain=False, *,
++def _humming_expert_outputs_reference(layer, x, local_ids, torch, retain=False, *,
+                             defer_downscale=False, global_experts=None):
+     from sglang.kernels.ops.moe.muse_spark_humming_split import split_expert_outputs
+     return split_expert_outputs(
+         _humming_expert_outputs_default,layer,x,local_ids,torch,global_experts,
+         retain=retain,defer_downscale=defer_downscale,
+     )
++
++
++def _humming_expert_outputs(layer, x, local_ids, torch, retain=False, *,
++                            defer_downscale=False, global_experts=None):
++    from sglang.kernels.ops.moe.muse_spark_grouped_gate import try_grouped
++    result = try_grouped(_humming_expert_outputs_reference, layer, x, local_ids, torch,
++        retain=retain, defer_downscale=defer_downscale, global_experts=global_experts)
++    if result is not None:
++        return result
++    return _humming_expert_outputs_reference(layer, x, local_ids, torch, retain=retain,
++        defer_downscale=defer_downscale, global_experts=global_experts)
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_grouped_build.py b/python/sglang/kernels/ops/moe/muse_spark_grouped_build.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/muse_spark_grouped_build.py
+@@ -0,0 +1,313 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Local build of one pinned CUTLASS SM90a grouped NVFP4 kernel; no downloads."""
++import ctypes as ct
++import fcntl
++import hashlib
++import importlib.util
++import json
++import logging
++import os
++from pathlib import Path
++import resource
++import signal
++import subprocess
++import tempfile
++from functools import lru_cache
++
++LOG = logging.getLogger(__name__)
++HEADER_SHA = '6bc2a648b879b8555c4c3337021ac39906befa4aaa0865c47866058f698ae562'
++GROUP_SHA = 'ae3a9a82c245c068e30d71dae6f6877bb02080e1914d168a10589107b0f059b3'
++REL = 'cutlass/detail/collective/mixed_input_utils.hpp'
++GROUP = 'cutlass/gemm/collective/sm90_mma_array_tma_gmma_rs_warpspecialized_mixed_input.hpp'
++
++
++def _headers():
++    for package, suffix in [('deep_gemm', 'include'), ('flashinfer', 'data/cutlass/include')]:
++        try:
++            spec = importlib.util.find_spec(package)
++            if spec is None or spec.origin is None:
++                continue
++            path = Path(spec.origin).parent / suffix
++            if (hashlib.sha256((path/REL).read_bytes()).hexdigest() == HEADER_SHA and
++                    hashlib.sha256((path/GROUP).read_bytes()).hexdigest() == GROUP_SHA):
++                return path
++        except (ImportError, OSError):
++            continue
++    raise RuntimeError('exact pinned CUTLASS headers unavailable; keep original Humming')
++
++
++def _no_core():
++    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
++    try:
++        Path('/proc/self/coredump_filter').write_text('0')
++    except OSError:
++        pass
++
++
++@lru_cache(maxsize=1)
++def library_path():
++    from torch.utils.cpp_extension import CUDA_HOME
++    if not CUDA_HOME:
++        raise RuntimeError('CUDA_HOME unavailable')
++    home = Path(CUDA_HOME)
++    include = _headers()
++    raw = (include/REL).read_text()
++    if raw.count(NEEDLE) != 2:
++        raise RuntimeError('unexpected pinned scale conversion anchors')
++    fixed = raw.replace(NEEDLE, CUSTOM, 1)
++    digest = hashlib.sha256(('normal-g16-t64-s3-v1'+SOURCE+fixed+str(home)).encode()).hexdigest()[:20]
++    cache = Path(tempfile.gettempdir()) / ('sglang_muse_grouped_' + digest)
++    cache.mkdir(exist_ok=True)
++    target = cache/'kernel.so'
++    with (cache/'build.lock').open('w') as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX)
++        failed = cache/'build.failed'
++        if failed.exists():
++            raise RuntimeError('cached grouped build failure: '+failed.read_text()[-1500:])
++        if not target.exists():
++            overlay = cache/'overlay'/REL
++            overlay.parent.mkdir(parents=True, exist_ok=True)
++            overlay.write_text(fixed)
++            source = cache/'kernel.cu'
++            source.write_text(SOURCE)
++            libdirs = [home/'lib64', home/'lib', home/'lib64/stubs',
++                       Path('/usr/lib/wsl/lib'), Path('/usr/lib/x86_64-linux-gnu')]
++            cudart = next((x for q in libdirs for x in q.glob('libcudart.so*') if x.is_file()), None)
++            driver = next((x for q in libdirs for x in q.glob('libcuda.so*') if x.is_file()), None)
++            if cudart is None or driver is None:
++                raise RuntimeError('CUDA runtime/driver link libraries unavailable')
++            args = [str(home/'bin/nvcc'), '-std=c++17', '-arch=sm_90a', '--shared',
++                    '-Xcompiler=-fPIC', '--expt-extended-lambda', '--expt-relaxed-constexpr',
++                    '-O2', '-Xptxas=-v', '-DPACKED_FP4', '-DPACKED_SCALE',
++                    '-DPROBE_CTA_K=64', '-DPROBE_TOKEN_TILE=64',
++                    '-I'+str(cache/'overlay'), '-I'+str(include), '-I'+str(home/'include/cccl'), '-cudart=none',
++                    str(source), '-L'+str(cudart.parent), '-l:'+cudart.name,
++                    '-L'+str(driver.parent), '-l:'+driver.name,
++                    '-Xlinker=-rpath='+str(cudart.parent), '-o', str(cache/'kernel.tmp.so')]
++            version = subprocess.check_output([str(home/'bin/nvcc'), '--version'], text=True)
++            process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++                                       text=True, preexec_fn=_no_core, start_new_session=True)
++            try:
++                output, _ = process.communicate(timeout=600)
++            except subprocess.TimeoutExpired:
++                os.killpg(process.pid, signal.SIGKILL)
++                output, _ = process.communicate()
++                output += '\nGrouped build exceeded 600 seconds; compiler process group stopped.'
++            (cache/'build.log').write_text(output)
++            LOG.info('Muse grouped compile: headers=%s nvcc=%s returncode=%s log=%s',
++                     include, version.strip().splitlines()[-1], process.returncode, cache/'build.log')
++            if process.returncode:
++                failed.write_text(output[-1500:])
++                raise RuntimeError('grouped CUDA build failed: '+output[-1500:])
++            os.replace(cache/'kernel.tmp.so', target)
++    LOG.info('Muse grouped binary: path=%s sha256=%s', target,
++             hashlib.sha256(target.read_bytes()).hexdigest())
++    return target
++
++
++def library():
++    return ct.CDLL(str(library_path()))
++
++SOURCE = r"""// Standalone research host adapter for the pinned CUTLASS grouped packed-FP4 kernel.
++// The caller owns every operand and stream. Create/destroy outside graph capture.
++// CUTLASS grouped Hopper R/S mixed-input compile probe based on NVIDIA example 69.
++#include "cutlass/cutlass.h"
++#include "cute/tensor.hpp"
++#include "cutlass/gemm/group_array_problem_shape.hpp"
++#include "cutlass/gemm/collective/collective_builder.hpp"
++#include "cutlass/epilogue/collective/collective_builder.hpp"
++#include "cutlass/gemm/kernel/gemm_universal.hpp"
++#include "cutlass/device_kernel.h"
++using namespace cute;
++using Bf16 = cutlass::bfloat16_t;
++#ifdef PACKED_FP4
++using Quant = cutlass::float_e2m1_t;
++#else
++using Quant = cutlass::float_e4m3_t;
++#endif
++using GroupShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>;
++#ifndef PROBE_TOKEN_TILE
++#define PROBE_TOKEN_TILE 16
++#endif
++using ProbeTile = Shape<_128,Int<PROBE_TOKEN_TILE>,Int<PROBE_CTA_K>>;
++using Cluster = Shape<_1,_1,_1>;
++using Row = cutlass::layout::RowMajor;
++using Col = cutlass::layout::ColumnMajor;
++using Epi = cutlass::epilogue::collective::CollectiveBuilder<
++    cutlass::arch::Sm90,cutlass::arch::OpClassTensorOp,ProbeTile,Cluster,cutlass::epilogue::collective::EpilogueTileAuto,
++    float,float,Bf16,Col*,8,Bf16,Col*,8,
++    cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative>::CollectiveOp;
++#ifdef PACKED_SCALE
++using Scale = uint32_t;
++#else
++using Scale = Bf16;
++#endif
++#ifdef SHARED_HUMMING_WEIGHT
++#include "humming_atom.hpp"
++using WeightLayout = HummingWeightLayout;
++#else
++using WeightLayout = Row;
++#endif
++// Judge CUTLASS builder passes StageCountType::bytes as the manual-stage template argument.
++// Preserve exactly three stages without editing installed headers.
++struct ManualStages3 : cutlass::gemm::collective::StageCount<3> { static constexpr int bytes = 3; };
++using Main = cutlass::gemm::collective::CollectiveBuilder<
++    cutlass::arch::Sm90,cutlass::arch::OpClassTensorOp,
++    cute::tuple<Quant,Scale>,WeightLayout*,(128 / cutlass::sizeof_bits<Quant>::value),Bf16,Col*,8,float,ProbeTile,Cluster,
++    ManualStages3,
++    cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative>::CollectiveOp;
++using Kernel = cutlass::gemm::kernel::GemmUniversal<GroupShape,Main,Epi>;
++template __global__ void cutlass::device_kernel<Kernel>(CUTLASS_GRID_CONSTANT Kernel::Params const params);
++
++#include "cutlass/gemm/device/gemm_universal_adapter.h"
++#include <cuda_runtime.h>
++#include <new>
++#include <cstdint>
++
++using DeviceGemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
++using Problem = Shape<int,int,int>;
++#ifdef SHARED_HUMMING_WEIGHT
++using WS = HummingWeightLayout;
++#else
++using WS = cute::remove_pointer_t<cutlass::detail::TagToStrideA_t<Row*>>;
++#endif
++using XS = cute::remove_pointer_t<cutlass::detail::TagToStrideB_t<Col*>>;
++using DS = Kernel::InternalStrideD;
++using SS = Main::StrideScale;
++constexpr int kMaxGroups = 32;
++
++struct alignas(128) Descriptors {
++  Problem problems[kMaxGroups];
++  Quant const* w[kMaxGroups];
++  Bf16 const* x[kMaxGroups];
++  Bf16 const* c[kMaxGroups];
++  Bf16* y[kMaxGroups];
++  uint32_t const* scales[kMaxGroups];
++  WS ws[kMaxGroups];
++  XS xs[kMaxGroups];
++  SS ss[kMaxGroups];
++  DS ds[kMaxGroups];
++};
++
++struct Context {
++  DeviceGemm gemm;
++  Descriptors* desc = nullptr;
++  void* workspace = nullptr;
++  cutlass::KernelHardwareInfo hw{};
++  int groups = 0, n = 0, k = 0;
++};
++
++__global__ void descriptors(Descriptors* d, int groups, int n, int k,
++                            uint8_t const* w, uint32_t const* s, Bf16 const* x, Bf16* y,
++                            int const* starts, int const* padded) {
++  int g = threadIdx.x;
++  if (g >= groups) return;
++  int64_t base = starts[g];
++  d->problems[g] = make_shape(n, padded[g], k);
++  d->w[g] = reinterpret_cast<Quant const*>(w + int64_t(g)*n*(k/2));
++  d->scales[g] = s + int64_t(g)*(k/64)*n;
++  d->x[g] = x + base*k;
++  d->y[g] = y + base*n;
++  d->c[g] = y + base*n;
++#ifdef SHARED_HUMMING_WEIGHT
++  d->ws[g] = make_humming_layout(n,k);
++#else
++  d->ws[g] = WS{k,_1{},_0{}};
++#endif
++  d->xs[g] = XS{k,_1{},_0{}};
++  d->ss[g] = SS{_1{},n,_0{}};
++  d->ds[g] = DS{_1{},n,_0{}};
++}
++
++static DeviceGemm::Arguments arguments(Context const& ctx) {
++  auto* d = ctx.desc;
++  DeviceGemm::Arguments args{};
++  decltype(args.epilogue.thread) op{};
++  op.alpha = 1.0f;
++  op.beta = 0.0f;
++  op.alpha_ptr = nullptr; op.beta_ptr = nullptr;
++  op.alpha_ptr_array = nullptr; op.beta_ptr_array = nullptr;
++  op.dAlpha = {_0{},_0{},0};
++  op.dBeta = {_0{},_0{},0};
++  return {cutlass::gemm::GemmUniversalMode::kGrouped,
++          {ctx.groups,d->problems,nullptr},
++          {d->w,d->ws,d->x,d->xs,d->scales,d->ss,64},
++          {op,d->c,d->ds,d->y,d->ds},ctx.hw};
++}
++
++// 1..999 CUDA error numbers; >=1000 indicates a CUTLASS failure.
++extern "C" int okc_destroy(void* handle) {
++  auto* ctx=static_cast<Context*>(handle);
++  if (!ctx) return 0;
++  cudaError_t a=ctx->workspace?cudaFree(ctx->workspace):cudaSuccess;
++  cudaError_t b=ctx->desc?cudaFree(ctx->desc):cudaSuccess;
++  delete ctx;
++  return int(a!=cudaSuccess?a:b);
++}
++
++extern "C" int okc_create(void** out,int groups,int n,int k,cudaStream_t stream) {
++  if (!out || groups<1 || groups>kMaxGroups || n<64 || k<64 || n%64 || k%64)
++    return int(cudaErrorInvalidValue);
++  *out=nullptr;
++  int device,major,minor,sms;
++  cudaError_t err=cudaGetDevice(&device);
++  if (err==cudaSuccess) err=cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device);
++  if (err==cudaSuccess) err=cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,device);
++  if (err==cudaSuccess) err=cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,device);
++  if (err!=cudaSuccess) return int(err);
++  if (major!=9 || minor!=0) return int(cudaErrorInvalidDeviceFunction);
++  auto* ctx=new(std::nothrow) Context;
++  if (!ctx) return int(cudaErrorMemoryAllocation);
++  ctx->hw.device_id=device;
++  ctx->hw.sm_count=sms;
++  ctx->groups=groups; ctx->n=n; ctx->k=k;
++  err=cudaMalloc(&ctx->desc,sizeof(Descriptors));
++  if (err!=cudaSuccess) { okc_destroy(ctx); return int(err); }
++  auto args=arguments(*ctx);
++  auto rc=ctx->gemm.can_implement(args);
++  if (rc!=cutlass::Status::kSuccess) { okc_destroy(ctx); return 1000+int(rc); }
++  auto bytes=DeviceGemm::get_workspace_size(args);
++  if (bytes) err=cudaMalloc(&ctx->workspace,bytes);
++  if (err!=cudaSuccess) { okc_destroy(ctx); return int(err); }
++  rc=ctx->gemm.initialize(args,ctx->workspace,stream);
++  if (rc!=cutlass::Status::kSuccess) { okc_destroy(ctx); return 1000+int(rc); }
++  *out=ctx;
++  return 0;
++}
++
++extern "C" int okc_run(void* handle,uint8_t const* w,uint32_t const* s,Bf16 const* x,Bf16* y,
++                       int const* starts,int const* padded,cudaStream_t stream) {
++  auto* c=static_cast<Context*>(handle);
++  if (!c || !w || !s || !x || !y || !starts || !padded)
++    return int(cudaErrorInvalidValue);
++  descriptors<<<1,kMaxGroups,0,stream>>>(c->desc,c->groups,c->n,c->k,w,s,x,y,starts,padded);
++  auto err=cudaGetLastError();
++  if (err!=cudaSuccess) return int(err);
++  auto rc=c->gemm.run(stream);
++  return rc==cutlass::Status::kSuccess?0:1000+int(rc);
++}
++
++extern "C" size_t okc_owned_bytes(void* handle) { auto* c=static_cast<Context*>(handle); return c ? sizeof(Descriptors)+DeviceGemm::get_workspace_size(arguments(*c)) : 0; }
++"""
++NEEDLE = r"""      if constexpr (is_same_v<DstType, ElementScale>) {
++        CUTLASS_PRAGMA_UNROLL
++        for (int i = 0; i < size<1>(dst_vm); ++i) {
++          LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));"""
++CUSTOM = r"""      if constexpr (is_same_v<ElementScale, uint32_t> && is_same_v<DstType, cutlass::bfloat16_t>) {
++        CUTLASS_PRAGMA_UNROLL
++        for (int i = 0; i < size<1>(dst_vm); ++i) {
++          LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
++          CUTLASS_PRAGMA_UNROLL
++          for (int j = 0; j < size<0>(dst_vm); ++j) {
++            const uint32_t word = scales_vm(j, i);
++            const uint8_t byte = uint8_t(word >> (8 * k_block));
++            const auto scale = cutlass::float_e4m3_t::bitcast(byte);
++            const auto normalized_scale = cutlass::bfloat16_t(float(scale) * 0.25f);
++            dst_vm(j, i) *= normalized_scale;
++          }
++        }
++      }
++      else if constexpr (is_same_v<DstType, ElementScale>) {
++        CUTLASS_PRAGMA_UNROLL
++        for (int i = 0; i < size<1>(dst_vm); ++i) {
++          LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));"""
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_grouped_gate.py b/python/sglang/kernels/ops/moe/muse_spark_grouped_gate.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/muse_spark_grouped_gate.py
+@@ -0,0 +1,254 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Conservative startup qualification; original Humming remains the fallback.
++
++The kernel uses original E2M1/E4M3 group16 coefficients, BF16 activations,
++FP32 accumulators and original post-GEMM scales. Exact bit agreement is a
++conservative activation gate, stronger than ordinary FP32-summation equivalence.
++"""
++import gc
++import json
++import logging
++import statistics
++import threading
++import torch
++from .muse_spark_grouped_build import library_path
++from .muse_spark_grouped_runtime import Arena, MAX_M
++
++LOG=logging.getLogger(__name__)
++_BUILD=None
++_STATE={}
++MIN_M=4096
++MAX_REQUEST_M=16384
++
++
++def _meta_ok(layer):
++    from humming import dtypes
++    if layer.w13_post_scale.numel()!=32 or layer.w2_post_scale.numel()!=32:
++        return False
++    for stage,n in (('w13',8192),('w2',4096)):
++        meta=layer.humming_metas[stage]
++        if (meta.a_dtype!=dtypes.bfloat16 or meta.c_dtype!=dtypes.bfloat16 or
++            meta.b_dtype!=dtypes.float4e2m1 or meta.bs_dtype!=dtypes.float8e4m3 or
++            meta.weight_scale_group_size!=16 or meta.input_scale_group_size or
++            meta.has_bias or meta.has_zero_point or meta.should_apply_bs_on_c or
++            meta.use_fused_e8m0_scale or meta.shape_n!=n or meta.shape_k!=4096 or
++            'wgmma' not in str(meta.mma_type).lower()):
++            return False
++        w=getattr(layer,meta.weight_name)
++        sf=getattr(layer,meta.weight_scale_name)
++        if (not w.is_contiguous() or not sf.is_contiguous() or
++            w.numel()*w.element_size()!=32*n*4096//2 or
++            sf.numel()*sf.element_size()!=32*n*4096//16):
++            return False
++    return True
++
++
++def prepare_build(layer):
++    global _BUILD
++    if _BUILD is not None:
++        return
++    device=layer.w13_post_scale.device
++    if device.type!='cuda' or torch.cuda.get_device_capability(device)!=(9,0):
++        return
++    if not _meta_ok(layer):
++        return
++    try:
++        library_path()
++        _BUILD=True
++    except Exception as exc:
++        _BUILD=False
++        LOG.warning('Muse grouped build unavailable; original Humming retained: %s',exc)
++
++
++def _difference(a,b):
++    a=a.reshape(-1);b=b.reshape(-1)
++    unequal=0;max_abs=0.;error2=0.;reference2=0.
++    # Bound diagnostic scratch rather than materializing whole FP32 projections.
++    for first in range(0,a.numel(),1<<20):
++        av=a[first:first+(1<<20)];bv=b[first:first+(1<<20)]
++        unequal+=int((av.view(torch.int16)!=bv.view(torch.int16)).sum())
++        af=av.float();bf=bv.float();delta=af-bf
++        max_abs=max(max_abs,float(delta.abs().max()))
++        error2+=float(delta.square().sum());reference2+=float(af.square().sum())
++    return dict(values=a.numel(),unequal_bits=unequal,max_abs=max_abs,
++                relative_l2=(error2/max(reference2,1e-40))**.5)
++
++
++def _raw_difference(a,b,ids):
++    rows=[]
++    for first in range(0,a.size(0),64):
++        live=ids[first:first+64]>=0
++        rows.append(_difference(a[first:first+64][live],b[first:first+64][live]))
++    return dict(values=sum(x['values'] for x in rows),
++                unequal_bits=sum(x['unequal_bits'] for x in rows),
++                max_abs=max((x['max_abs'] for x in rows),default=0.),
++                max_chunk_relative_l2=max((x['relative_l2'] for x in rows),default=0.))
++
++
++def _inputs(device,m,local,seed):
++    generator=torch.Generator(device=device).manual_seed(seed)
++    x=torch.empty((m,4096),device=device,dtype=torch.bfloat16).normal_(std=.017,generator=generator)
++    ids=torch.full((m,8),-1,device=device,dtype=torch.int32)
++    if local:
++        rows=torch.arange(m,device=device,dtype=torch.int32)
++        for slot in range(local):
++            ids[:,slot]=(rows*local+slot)%32
++    return x,ids
++
++
++def _checkpoint_difference(host,candidate,ids=None):
++    records=[]
++    for first in range(0,candidate.size(0),64):
++        gold=host[first:first+64].to(candidate.device)
++        actual=candidate[first:first+64]
++        if ids is not None:
++            live=ids[first:first+64]>=0
++            gold=gold[live];actual=actual[live]
++        records.append(_difference(gold,actual))
++    return dict(values=sum(x['values'] for x in records),
++                unequal_bits=sum(x['unequal_bits'] for x in records),
++                max_abs=max((x['max_abs'] for x in records),default=0.),
++                max_chunk_relative_l2=max((x['relative_l2'] for x in records),default=0.))
++
++
++def _memory(device):
++    free,total=torch.cuda.mem_get_info(device)
++    return dict(allocated=torch.cuda.memory_allocated(device),
++                reserved=torch.cuda.memory_reserved(device),
++                historical_peak_allocated=torch.cuda.max_memory_allocated(device),
++                historical_peak_reserved=torch.cuda.max_memory_reserved(device),
++                cuda_free=free,cuda_total=total)
++
++
++def _release_cache(device):
++    torch.cuda.synchronize(device)
++    gc.collect()
++    torch.cuda.empty_cache()
++
++
++def _times(fn):
++    fn();fn()
++    values=[]
++    for iteration in range(6):
++        begin=torch.cuda.Event(enable_timing=True);end=torch.cuda.Event(enable_timing=True)
++        begin.record();fn();end.record();end.synchronize()
++        values.append(begin.elapsed_time(end)*1000.)
++    return values
++
++
++def _qualify(reference,layer,device):
++    from .muse_spark_post_expert_finalize_triton import fused_post_expert_norm_weighted_sum as finish
++    memory={'before':_memory(device)}
++    norm=torch.ones(4096,device=device,dtype=torch.bfloat16)
++    checkpoints=[]
++    # Native reference temporaries never coexist with the candidate arena.
++    # Each checkpoint retains CPU BF16 only; input generation uses isolated seeds.
++    for m,local,seed in ((4096,1,917411),(4097,1,917413),(4096,4,917419),(256,0,917421)):
++        x,ids=_inputs(device,m,local,seed)
++        scores=torch.full((m,8),.125,device=device,dtype=torch.float32)
++        gold,_=reference(layer,x,ids,torch,retain=False,defer_downscale=True,global_experts=256)
++        final=finish(gold,scores,norm_weight=norm,eps=1e-8,weight_first=True,
++                     slot_expert_ids=ids,expert_output_scale=layer.w2_post_scale)
++        checkpoints.append((m,local,seed,gold.cpu(),final.cpu()))
++        del x,ids,scores,gold,final
++    x,ids=_inputs(device,4096,1,917431)
++    parent=_times(lambda:reference(layer,x,ids,torch,retain=False,defer_downscale=True,global_experts=256))
++    del x,ids
++    memory['native_before_arena']=_memory(device)
++    _release_cache(device)
++    arena=Arena(device)
++    memory['arena_allocated']=_memory(device)
++    records=[];exact=True
++    for m,local,seed,gold_cpu,final_cpu in checkpoints:
++        x,ids=_inputs(device,m,local,seed)
++        scores=torch.full((m,8),.125,device=device,dtype=torch.float32)
++        candidate,_=arena.forward(layer,x,ids,True)
++        final=finish(candidate,scores,norm_weight=norm,eps=1e-8,weight_first=True,
++                     slot_expert_ids=ids,expert_output_scale=layer.w2_post_scale)
++        raw=_checkpoint_difference(gold_cpu,candidate,ids)
++        final_diff=_checkpoint_difference(final_cpu,final)
++        exact=exact and raw['unequal_bits']==0 and final_diff['unequal_bits']==0
++        records.append(dict(m=m,local_slots=local,seed=seed,raw=raw,final=final_diff))
++        del x,ids,scores,candidate,final
++    x,ids=_inputs(device,4096,1,917431)
++    candidate_times=_times(lambda:arena.forward(layer,x,ids,True))
++    del x,ids,checkpoints,gold_cpu,final_cpu
++    memory['candidate_before_release']=_memory(device)
++    owned_bytes=arena.owned_bytes
++    packed_bytes=sum(t.numel() for t in arena.packed)
++    arena.close();del arena
++    _release_cache(device)
++    # Post-candidate native control catches gross clock/thermal drift without
++    # retaining an arena during the native reference's large temporary GEMMs.
++    x,ids=_inputs(device,4096,1,917431)
++    control=_times(lambda:reference(layer,x,ids,torch,retain=False,defer_downscale=True,global_experts=256))
++    del x,ids,norm
++    memory['native_control_after_release']=_memory(device)
++    _release_cache(device)
++    parent_median=statistics.median(parent);control_median=statistics.median(control)
++    gain=min(parent_median,control_median)/statistics.median(candidate_times)
++    drift=abs(parent_median-control_median)/min(parent_median,control_median)
++    enabled=bool(exact and gain>1.10 and drift<=.05)
++    result=Arena(device) if enabled else False
++    memory['after_qualification']=_memory(device)
++    LOG.info('Muse grouped qualification %s',json.dumps(dict(device=str(device),
++        dtype='BF16/BF16, E2M1+E4M3 group16, FP32 accumulation, original post scales',
++        token_tile=64,chunk_rows=MAX_M,minimum_request_rows=MIN_M,
++        qualification_scope='first actual layer, finite synthetic inputs; not universal parity',
++        timing_scope='separate parent/candidate/control epochs; conservative startup filter, not paired promotion',
++        original_weight_storage_retained=True,packed_bytes=packed_bytes,
++        owned_scratch_bytes=owned_bytes,memory=memory,
++        records=records,times_us=dict(parent=parent,candidate=candidate_times,control=control),
++        synthetic_gain=gain,parent_control_drift=drift,exact=exact,enabled=enabled)))
++    return result
++
++
++def _serialized_execution():
++    from sglang.srt.layers.moe.utils import is_tbo_enabled,is_sbo_enabled
++    from sglang.srt.distributed.parallel_state import get_pipeline_model_parallel_world_size
++    return not is_tbo_enabled() and not is_sbo_enabled() and get_pipeline_model_parallel_world_size()==1
++
++
++def _stream_allowed(arena):
++    from sglang.srt.runtime_context import get_resources
++    if threading.get_ident()!=arena.thread_id:
++        return False
++    current=torch.cuda.current_stream(arena.device)
++    capture=get_resources().streams.get('cuda_graph_capture')
++    if capture is not None and current==capture:
++        # GroupCoordinator.graph_capture waits for the warmup stream before entering;
++        # runner_utils/pool.py explicitly guarantees prefill/decode replay serialization.
++        return True
++    if torch.cuda.is_current_stream_capturing():
++        return False
++    if current==torch.cuda.default_stream(arena.device):
++        return arena.forward_stream is None
++    if arena.forward_stream is None:
++        # One-time transition from initialization/capture to the scheduler forward stream.
++        torch.cuda.synchronize(arena.device)
++        arena.forward_stream=current
++        LOG.info('Muse grouped bound scheduler stream %s',current.cuda_stream)
++    return current==arena.forward_stream
++
++
++def try_grouped(reference,layer,x,ids,torch_module,retain=False,*,defer_downscale=False,global_experts=None):
++    if (_BUILD is not True or retain or global_experts!=256 or x.ndim!=2 or
++        not MIN_M<=x.size(0)<=MAX_REQUEST_M or x.size(1)!=4096 or
++        x.dtype!=torch.bfloat16 or ids.dtype!=torch.int32 or ids.shape!=(x.size(0),8) or
++        not x.is_cuda or ids.device!=x.device or not x.is_contiguous() or not ids.is_contiguous() or
++        not _meta_ok(layer) or not _serialized_execution()):
++        return None
++    index=x.device.index
++    if index not in _STATE:
++        if torch.cuda.is_current_stream_capturing():
++            return None
++        # No fallback after a device execution error: a damaged CUDA context must fail loudly.
++        _STATE[index]=_qualify(reference,layer,x.device)
++        if _STATE[index] is False:
++            return None
++    arena=_STATE[index]
++    if arena is False or not _stream_allowed(arena):
++        return None
++    if torch.cuda.is_current_stream_capturing():
++        LOG.info("Muse grouped captured activation M=%s stream=%s",x.size(0),torch.cuda.current_stream(x.device).cuda_stream)
++    return arena.forward(layer,x,ids,defer_downscale)
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_grouped_prep.py b/python/sglang/kernels/ops/moe/muse_spark_grouped_prep.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/muse_spark_grouped_prep.py
+@@ -0,0 +1,158 @@
++"""Device-only packing of the scored Humming BF16/FP4 operands into Hopper grouped-GEMM arrays."""
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _pack_codes(src, dst, chosen, N: tl.constexpr, K: tl.constexpr, WG: tl.constexpr,
++                BN: tl.constexpr, PAIRS: tl.constexpr):
++    n = tl.program_id(0) * BN + tl.arange(0, BN)
++    k = (tl.program_id(1) * PAIRS + tl.arange(0, PAIRS)) * 2
++    slot = tl.program_id(2)
++    expert = tl.load(chosen + slot).to(tl.int64)
++    nn, kk = n[:, None], k[None, :]
++    lane = (nn % 8) * 4 + (kk % 8) // 2
++    word = (expert * (K // 16) + kk // 16) * (N * 2)
++    word += nn // 64 * 128 + lane * 4 + (nn % 64) // 16
++    if WG:
++        pair = ((kk // 8) % 2) * 2 + (nn // 8) % 2
++    else:
++        pair = ((nn // 8) % 2) * 2 + (kk // 8) % 2
++    bits = tl.load(src + word).to(tl.uint32) >> (pair * 4).to(tl.uint32)
++    pair_byte = (bits & 15) | ((bits >> 12) & 240)
++    tl.store(dst + (slot.to(tl.int64) * N + nn) * (K // 2) + kk // 2, pair_byte)
++
++
++@triton.jit
++def _pack_scales(src, dst, chosen, N: tl.constexpr, K: tl.constexpr, BN: tl.constexpr):
++    n = tl.program_id(0) * BN + tl.arange(0, BN)
++    col = tl.program_id(1)
++    slot = tl.program_id(2)
++    expert = tl.load(chosen + slot).to(tl.int64)
++    swizzle = n // 64 * 64 + (n % 8) * 8 + (n % 64) // 8
++    base = (expert * (K // 16) + col * 4) * N + swizzle
++    word = tl.full((BN,), 0, tl.uint32)
++    for i in tl.static_range(4):
++        word |= tl.load(src + base + i * N).to(tl.uint32) << (8 * i)
++    tl.store(dst + (slot.to(tl.int64) * (K // 64) + col) * N + n, word)
++
++
++def convert(weights, scales, chosen, scratch, n, k, wgmma):
++    groups = chosen.numel()
++    codes_bytes = groups * n * k // 2
++    total = codes_bytes + groups * n * k // 16
++    if n % 64 or k % 64 or scratch.dtype != torch.uint8 or scratch.numel() < total:
++        raise ValueError("requires aligned N,K and sufficient byte workspace")
++    if not all(a.is_contiguous() for a in (weights, scales, chosen, scratch)):
++        raise ValueError("requires contiguous tensors")
++    if chosen.dtype != torch.int32 or any(a.device != scratch.device for a in (weights, scales, chosen)):
++        raise ValueError("invalid expert list or device")
++    if weights.numel()*weights.element_size()%(n*k//2) or scales.numel()*scales.element_size()!=(weights.numel()*weights.element_size())//8:
++        raise ValueError("incompatible weight or group-16 scale storage")
++    flat = scratch.view(-1)
++    codes = flat[:codes_bytes].reshape(groups, n, k//2)
++    words = flat[codes_bytes:total].view(torch.int32).reshape(groups, k//64, n)
++    _pack_codes[(n//16,k//64,groups)](weights.view(torch.int32), codes, chosen, n, k, wgmma, 16, 32)
++    _pack_scales[(n//64,k//64,groups)](scales.view(torch.uint8), words, chosen, n, k, 64)
++    return codes, words
++
++
++@triton.jit
++def _rank(ids, excess, dest, S: tl.constexpr, E: tl.constexpr, B: tl.constexpr):
++    e, chunk = tl.program_id(0), tl.program_id(1)
++    slot = chunk*B+tl.arange(0,B)
++    match = tl.load(ids+slot, slot<S, other=-1)==e
++    n = tl.cumsum(match.to(tl.int32),0)
++    tl.store(dest+slot, n-1, match)
++    tl.store(excess+chunk*E+e, tl.sum(match.to(tl.int32),0))
++
++
++@triton.jit
++def _bases(prefix, offset, count, padded, CHUNKS: tl.constexpr, E: tl.constexpr, EB: tl.constexpr):
++    e=tl.arange(0,EB)
++    n=tl.load(prefix+(CHUNKS-1)*E+e,e<E,other=0)
++    length=tl.where(e<E,tl.maximum(16,(n+15)//16*16),0)
++    start=tl.cumsum(length,0)-length
++    tl.store(offset+e,start,e<E)
++    tl.store(count+e,n,e<E)
++    tl.store(padded+e,length,e<E)
++
++
++@triton.jit
++def _map(ids, dest, prefix, offset, S:tl.constexpr, E:tl.constexpr, B:tl.constexpr):
++    ch=tl.program_id(0)
++    i=ch*B+tl.arange(0,B)
++    e=tl.load(ids+i,i<S,other=-1)
++    live=(e>=0)&(e<E)
++    local=tl.load(dest+i,live,other=0)
++    prev=tl.load(prefix+(ch-1)*E+e,live&(ch>0),other=0)
++    first=tl.load(offset+e,live,other=0)
++    tl.store(dest+i,tl.where(live,first+prev+local,-1),i<S)
++
++
++def route_buffers(ids, experts):
++    s=ids.numel()
++    chunks=triton.cdiv(s,256)
++    kw=dict(device=ids.device,dtype=torch.int32)
++    return (torch.empty((chunks,experts),**kw),torch.empty((chunks,experts),**kw),
++            torch.empty(s,**kw),*(torch.empty(experts,**kw) for _ in range(3)))
++
++
++def route(ids, bufs):
++    partial,prefix,dest,base,counts,padded=bufs
++    s=ids.numel()
++    chunks,e=partial.shape
++    if not ids.is_contiguous() or ids.dtype!=torch.int32 or ids.ndim!=2 or ids.size(1)!=8 or not s:
++        raise ValueError("requires local contiguous int32 top-8 route IDs")
++    if chunks!=triton.cdiv(s,256) or dest.numel()!=s:
++        raise ValueError("workspace mismatches route shape")
++    _rank[(e,chunks)](ids,partial,dest,s,e,256)
++    torch.cumsum(partial,dim=0,dtype=torch.int32,out=prefix)
++    _bases[(1,)](prefix,base,counts,padded,chunks,e,triton.next_power_of_2(e))
++    _map[(chunks,)](ids,dest,prefix,base,s,e,256)
++    return dest,base,counts,padded
++
++
++@triton.jit
++def _rows(src,dst,dest,H:tl.constexpr,PACK:tl.constexpr,RESTORE:tl.constexpr,B:tl.constexpr):
++    s=tl.program_id(0)
++    cols=tl.program_id(1)*B+tl.arange(0,B)
++    row=tl.load(dest+s)
++    if PACK:
++        if row>=0:
++            tl.store(dst+row.to(tl.int64)*H+cols,tl.load(src+(s//8).to(tl.int64)*H+cols))
++    else:
++        val=tl.load(src+row.to(tl.int64)*H+cols,row>=0,other=0.)
++        if RESTORE:
++            val=(val.to(tl.float32)*4.).to(tl.bfloat16)
++        tl.store(dst+s.to(tl.int64)*H+cols,val)
++
++
++@triton.jit
++def _clear_pad(dst,base,counts,padded,H:tl.constexpr,B:tl.constexpr):
++    e=tl.program_id(0)
++    r=tl.program_id(1)
++    col=tl.program_id(2)*B+tl.arange(0,B)
++    count=tl.load(counts+e)
++    if count+r<tl.load(padded+e):
++        row=tl.load(base+e)+count+r
++        tl.store(dst+row.to(tl.int64)*H+col,0.)
++
++
++def gather(x, out, mapping):
++    dest,base,counts,padded=mapping
++    h=x.size(1)
++    b=min(256,h)
++    if h%b or x.shape[0]*8!=dest.numel() or out.shape[0]<dest.numel()+16*len(base) or out.shape[1]!=h:
++        raise ValueError("invalid source or row workspace")
++    _rows[(dest.numel(),h//b)](x,out,dest,h,True,False,b)
++    _clear_pad[(len(base),16,h//b)](out,base,counts,padded,h,b)
++
++
++def scatter(grouped, canonical, dest, restore=True):
++    h=grouped.size(1)
++    b=min(256,h)
++    if h%b or canonical.shape!=(dest.numel(),h):
++        raise ValueError("invalid canonical output")
++    _rows[(dest.numel(),h//b)](grouped,canonical,dest,h,False,restore,b)
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_grouped_runtime.py b/python/sglang/kernels/ops/moe/muse_spark_grouped_runtime.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/muse_spark_grouped_runtime.py
+@@ -0,0 +1,122 @@
++# SPDX-License-Identifier: Apache-2.0
++"""One bounded scratch arena, reused across layers and sequential chunks."""
++import ctypes as ct
++import threading
++import torch
++import triton
++import triton.language as tl
++from .muse_spark_grouped_prep import convert, gather, route, route_buffers, scatter
++from .muse_spark_grouped_build import library
++
++MAX_M = 2048
++EXTRA_LIMIT = 1_380_000_000
++
++@triton.jit
++def _restore_labels(up, ids, dest, labels, W:tl.constexpr, B:tl.constexpr):
++    s=tl.program_id(0)
++    row=tl.load(dest+s)
++    if row>=0:
++        c=tl.program_id(1)*B+tl.arange(0,B)
++        ix=row.to(tl.int64)*W+c
++        tl.store(up+ix,tl.load(up+ix).to(tl.float32)*4.)
++        if tl.program_id(1)==0:
++            tl.store(labels+row,tl.load(ids+s))
++
++def checked(rc):
++    if rc:
++        raise RuntimeError('grouped Hopper adapter status '+str(rc))
++
++class Arena:
++    def __init__(self, device):
++        self.device=torch.device(device)
++        self.stream=torch.cuda.current_stream(self.device)
++        self.thread_id=threading.get_ident()
++        self.forward_stream=None
++        self.lib=library()
++        void=ct.c_void_p
++        self.lib.okc_create.argtypes=(ct.POINTER(void),ct.c_int,ct.c_int,ct.c_int,void)
++        self.lib.okc_run.argtypes=(void,void,void,void,void,void,void,void)
++        self.lib.okc_destroy.argtypes=(void,)
++        self.lib.okc_owned_bytes.argtypes=(void,)
++        self.lib.okc_owned_bytes.restype=ct.c_size_t
++        for method in (self.lib.okc_create,self.lib.okc_run,self.lib.okc_destroy):
++            method.restype=ct.c_int
++        self.handles=[]
++        try:
++            for n in (8192,4096):
++                handle=ct.c_void_p()
++                checked(self.lib.okc_create(ct.byref(handle),32,n,4096,self.stream.cuda_stream))
++                self.handles.append(handle)
++            kw=dict(device=self.device)
++            self.chosen=torch.arange(32,**kw,dtype=torch.int32)
++            self.packed=[torch.empty(32*n*4096*9//16,**kw,dtype=torch.uint8) for n in (8192,4096)]
++            rows=MAX_M*8+16*32
++            self.main=torch.empty((rows,8192),**kw,dtype=torch.bfloat16)
++            self.mid=torch.empty((rows,4096),**kw,dtype=torch.bfloat16)
++            self.labels=torch.empty(rows,**kw,dtype=torch.int32)
++            self.rbuf=route_buffers(torch.empty((MAX_M,8),**kw,dtype=torch.int32),32)
++            tensors=[self.chosen,*self.packed,self.main,self.mid,self.labels,*self.rbuf]
++            self.owned_bytes=sum(x.numel()*x.element_size() for x in tensors)
++            self.owned_bytes+=sum(self.lib.okc_owned_bytes(h) for h in self.handles)
++            if self.owned_bytes>EXTRA_LIMIT:
++                raise RuntimeError('grouped scratch exceeds explicit memory budget')
++            self.operands={}
++        except Exception:
++            self.close()
++            raise
++
++    def close(self):
++        with torch.cuda.device(self.device):
++            while self.handles:
++                checked(self.lib.okc_destroy(self.handles.pop()))
++
++    def prepare(self,layer):
++        # All original packed coefficients/scales remain untouched and resident.
++        # Both temporary stages are overwritten once per layer call, then reused by chunks.
++        for j,stage in enumerate(('w13','w2')):
++            meta=layer.humming_metas[stage]
++            self.operands[stage]=convert(getattr(layer,meta.weight_name),
++                getattr(layer,meta.weight_scale_name),self.chosen,self.packed[j],
++                meta.shape_n,meta.shape_k,'wgmma' in str(meta.mma_type).lower())
++
++    def _gemm(self,j,stage,x,y,base,padded):
++        codes,words=self.operands[stage]
++        checked(self.lib.okc_run(self.handles[j],
++            *(t.data_ptr() for t in (codes,words,x,y,base,padded)),self.stream.cuda_stream))
++
++    def chunk(self,layer,x,ids,defer_downscale):
++        from sglang.kernels.ops.activation.activation import silu_and_mul
++        from .muse_spark_humming_scale import scale_active_rows
++        m=x.size(0)
++        slots=m*8
++        rows=slots+16*32
++        partial,prefix,dest,base,counts,padded=self.rbuf
++        chunks=triton.cdiv(slots,256)
++        mapping=route(ids,(partial[:chunks],prefix[:chunks],dest[:slots],base,counts,padded))
++        mid=self.mid[:rows]
++        main=self.main[:rows]
++        labels=self.labels[:rows]
++        dest,base,_,padded=mapping
++        gather(x,mid,mapping)
++        self._gemm(0,'w13',mid,main,base,padded)
++        labels.fill_(-1)
++        _restore_labels[(slots,8192//256)](main,ids,dest,labels,8192,256)
++        scale_active_rows(main,labels,layer.w13_post_scale)
++        silu_and_mul(main,mid,expert_ids=labels,expert_step=1)
++        down=main.view(-1)[:rows*4096].view(-1,4096)
++        self._gemm(1,'w2',mid,down,base,padded)
++        canonical=mid[:slots]
++        scatter(down,canonical,dest,restore=True)
++        if not defer_downscale:
++            scale_active_rows(canonical,ids,layer.w2_post_scale)
++        return canonical.view(m,8,4096)
++
++    def forward(self,layer,x,ids,defer_downscale):
++        self.stream=torch.cuda.current_stream(self.device)
++        self.prepare(layer)
++        # The canonical output is the same contract-sized allocation as the original helper.
++        out=torch.empty((x.size(0),8,4096),device=x.device,dtype=torch.bfloat16)
++        for first in range(0,x.size(0),MAX_M):
++            end=min(first+MAX_M,x.size(0))
++            out[first:end].copy_(self.chunk(layer,x[first:end],ids[first:end],defer_downscale))
++        return out,ids

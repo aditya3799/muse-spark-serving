@@ -1,0 +1,8 @@
+Upload 10_kaggle_router_contract.ipynb to Kaggle.
+Select GPU T4, keep defaults and Run All. Only GPU 0 is used.
+Internet can remain off; no installs, datasets or weights are needed.
+Download v4_router_contract_*.zip into D:\OpenKernelChallenge\serving\profiling_kaggle\notebook10_results.
+Export even if a section fails and return the complete ZIP. Stop the GPU session after downloading.
+
+Expected: 18 cases, 144 timing rows, 1,584 raw samples, 1,296 changed-input output checks and 252 comparisons, plus lifecycle/input-contract gates.
+Compare unchanged mapping code under int32/int64 IDs and float16/float32 scores. int32/float32 matches inspected router default output allocations, but the router itself is not executed. Combined graphs hold 1/8 independent prefixes, not real model layers. No startup, full-model or H200 performance claim. Active V4 stays unchanged.

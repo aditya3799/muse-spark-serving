@@ -1,0 +1,177 @@
+# FastLLM
+
+[English](README_EN.md) · [快速开始](#快速开始) · [`--auto` 调节指南](docs/auto.md) · [文档](docs/README.md) · [Benchmark](docs/benchmark.md) · [版本日志](docs/version.md)
+
+FastLLM 是用于本地运行和服务部署的大模型推理引擎，支持语言模型、图片生成和视频生成。核心运行时使用 C++，不依赖 PyTorch；支持稠密与 MoE 模型、GPU/CPU/NUMA/磁盘混合推理，以及多卡部署。
+
+- **自动部署**：使用 `--auto` 规划设备、内存、专家缓存和上下文，也可覆盖常用参数。
+- **浏览器启动器**：下载模型、保存配置、查看日志，直接在工作室中对话或使用 Agent。
+- **兼容 API**：提供 OpenAI Chat Completions、Responses 和 Anthropic Messages 接口。
+- **多种权重格式**：支持 Safetensors、FastLLM、AWQ、已适配的 GGUF 和 EXL3；DeepSeek-V4.1-Flash 支持原版、Unsloth 与 GSQ-RCO 量化模型，见[支持范围与部署](docs/deepseek_v41.md#模型与权重格式)。
+- **图片与视频生成**：支持 MiniMax-H3、Pika H3 Flex、MiniMax-H3-Image 和 Qwen-Image-2.1，提供原生推理与 HTTP 接口。启动器、量化、多卡和 API 用法见[图片与视频生成指南](docs/image-video.md)。
+
+## 快速开始
+
+### 安装
+
+Linux / Windows + NVIDIA GPU：
+
+```sh
+python -m pip install -U ftllm
+```
+
+<details>
+<summary>Windows 首次安装依赖</summary>
+
+```sh
+python -m pip install https://www.modelscope.cn/models/huangyuyang/fastllmdepend-windows/resolve/master/ftllmdepend-0.0.0.2-py3-none-win_amd64.whl
+```
+
+</details>
+
+AMD GPU 见 [ROCm 安装](docs/rocm.md)；CPU-only 和其他平台见[源码安装](docs/deployment.md#源码安装)。安装问题见 [FAQ](docs/faq.md)。
+
+### 浏览器启动
+
+单机多副本可使用独立的 `ftllm deploy` 组件，复用原生服务参数，提供后台进程管理和
+流式请求路由；现有 `ftllm serve/server` 用法不变。配置与命令见 [多副本部署](docs/deploy.md)。
+
+~~~bash
+# API Server，默认监听 0.0.0.0:8080
+ftllm server Qwen/Qwen3-0.6B
+
+# 命令行对话
+ftllm run Qwen/Qwen3-0.6B
+
+# WebUI，连接上面的 API Server，默认监听 127.0.0.1:1616
+ftllm webui --api_base http://127.0.0.1:8080/v1
+~~~
+
+浏览器部署启动器可直接运行：
+
+```sh
+ftllm
+```
+
+选择模型 → 自动配置 → 保存并启动。需要调整时展开“资源限制”或“模型参数”，其余留给自动规划。启动后可直接打开工作室对话；详细操作见[启动器指南](docs/launcher.md)。
+
+### 命令行启动
+
+将路径替换为本地模型目录或已支持的 GGUF 文件，也可使用 Hugging Face 仓库 ID：
+
+```sh
+ftllm server /path/to/model --auto
+```
+
+`--auto` 当前适用于 Linux NVIDIA CUDA 上已支持的模型；其他平台或未适配模型见[手动部署](docs/deployment.md)。默认服务地址为 `http://127.0.0.1:8080`。
+
+只需追加要调整的参数，例如限制为 32K 上下文、最多 2 个并发请求：
+
+```sh
+ftllm server /path/to/model --auto --max_context_length 32768 --max_batch 2
+```
+
+显存/内存预算、专家缓存、分块、推测解码和快速 Prefill 的设置见 [`--auto` 调节指南](docs/auto.md)。命令行对话使用 `ftllm run`，终端向导使用 `ftllm tui`，性能测试使用 `ftllm bench`。
+
+### 调用 API
+
+启动时可以指定服务名称和 API Key：
+
+```sh
+ftllm server /path/to/model --auto --model_name local-model --api_key local-key
+```
+
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer local-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"local-model","messages":[{"role":"user","content":"你好"}],"stream":false}'
+```
+
+也可运行 `ftllm webui --api_base http://127.0.0.1:8080/v1 --api_key local-key` 打开独立聊天页面。思考、工具调用和多模态能力依模型而定。
+
+## 模型部署指南
+
+| 模型 | 部署文档 |
+| --- | --- |
+| Qwen4-Exp / Qwen3.8-Flash-Next | [Flash-Next 用户手册](docs/qwen3.8-flash-next/README.md) |
+| Qwen3.5 / Qwen3.6 / Qwen3.8 | [Qwen 指南](docs/qwen3.md) |
+| DeepSeek-V4 / V4-Flash | [DeepSeek-V4 指南](docs/deepseek.md) |
+| DeepSeek-V4.1-Flash 1017（原版 / Unsloth / GSQ-RCO / EXL3） | [格式支持、自动部署与 DSpark](docs/deepseek_v41.md) |
+| Clover-35B-A3B-Preview | [Clover 单卡指南](docs/clover.md) |
+| Kimi-K3 | [Kimi-K3 指南](docs/kimi_k3.md) |
+| GLM-5 / GLM-5.3-Flash | [GLM-5 指南](docs/glm5.md) |
+| Dots3-Note / Laguna | [Dots3-Note](docs/dots3_note.md) · [Laguna](docs/laguna.md) |
+| HY-Nomas | [世界模型与 HTTP Demo 部署](docs/hy_nomas.md) |
+| LingBot World 2.0 1.3B | [原生推理、世界会话与 HTTP Demo](docs/lingbot_world.md) |
+| MiniMax-H3 / Pika H3 Flex | [视频生成、首尾帧与参考素材](docs/image-video.md#视频生成minimax-h3--pika-h3-flex) |
+| MiniMax-H3-Image | [图片生成与参考图编辑](docs/image-video.md#图片生成minimax-h3-image) |
+| Qwen-Image-2.1 | [图片生成、编辑与 HTTP 服务](docs/image-video.md#图片生成qwen-image-21) |
+
+其他模型见[支持列表](docs/models.md)。让 Agent 帮忙部署时，可先提供[模型与参数速查](docs/model-deployment-agent.md)。实测速度与硬件、请求和量化格式有关，见 [Benchmark](docs/benchmark.md)。
+
+## 常用参数
+
+日常使用看 [`--auto` 参数与影响](docs/auto.md)；需要手动指定设备或模型专属选项时，看[完整参数参考](docs/deployment.md#常用参数)。当前安装版本以 `ftllm server --help` 为准。
+
+<a id="3-如何设定运行设备"></a>
+<a id="工具调用"></a>
+
+[设备设置](docs/deployment.md#模型设备与精度) · [解码、模板与工具调用](docs/deployment.md#解码模板与工具调用) · [模型下载与导出](docs/deployment.md#模型格式下载与导出)
+
+## 源码安装
+
+C++ / CUDA / CPU 构建步骤见[源码安装说明](docs/deployment.md#源码安装)，平台排错见 [FAQ](docs/faq.md)。
+
+## 文档导航
+
+- [全部文档](docs/README.md) · [启动器与工作室](docs/launcher.md) · [Agent 接入](docs/launcher-agents.md)
+- [混合推理](docs/mixforward.md) · [专家显存缓存](docs/cuda-expert-cache.md) · [上下文扩展](docs/context-length-extension.md)
+- [开发与验证](docs/development-validation.md) · [自定义模型](docs/custom.md) · [自定义算子](docs/custom_op.md)
+- [稳定版日志](docs/version.md) · [Nightly](docs/nightly.md)
+
+## 社区与贡献
+
+欢迎通过 [Issues](https://github.com/ztxz16/fastllm/issues) 报告问题，通过 [Pull Requests](https://github.com/ztxz16/fastllm/pulls) 参与开发。部署交流 QQ 群：`831641348`。
+
+<details>
+<summary>微信用户群与开发群</summary>
+
+用户交流（使用、部署）：
+
+<img src="docs/wechat_group0.jpg" width="220" alt="FastLLM 用户交流群二维码">
+
+社区开发（贡献、开发讨论）：
+
+<img src="docs/develop-group.png" width="220" alt="FastLLM 社区开发群二维码">
+
+</details>
+
+项目采用 [Apache License 2.0](LICENSE)。
+
+## 参考代码和文章
+
+<details>
+<summary>开源项目与引用</summary>
+
+FastLLM 的实现参考或使用了以下开源项目与文章中的思路或代码：
+
+- [PyTorch](https://github.com/pytorch/pytorch)：底层算子实现思路。
+- [Transformers](https://github.com/huggingface/transformers)：模型结构与参考实现。
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) 和 [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)：GGUF 量化格式与 kernel。
+- [Strata](https://github.com/Niko1221/Strata)：一些算子。
+- [ExLlamaV3](https://github.com/turboderp-org/exllamav3)（Turboderp，MIT）：EXL3 格式、码本、trellis 解码及 Tensor Core tile 解码的原始参考来源；保留其 [MIT 许可证](third_party/maya_exl3/LICENSE.exllamav3)。
+- [Project Maya](https://github.com/mw00/project-maya)（MIT）：FastLLM 的 EXL3 CUDA 内核直接移植自其基于 ExLlamaV3 的适配实现，并增加 FastLLM 的算子接入与优化；保留 [Maya 许可证](third_party/maya_exl3/LICENSE)。导入版本、源码哈希、来源链和本地修改见 [EXL3 引用说明](third_party/maya_exl3/NOTICE.txt)。EXL3 CPU 和 portable CUDA 回退算子由 FastLLM 独立实现。 仅内置上述 CUDA 算子及其必要头文件，不需要外部 Maya 工程、Python 包或推理运行时；后端选择见[算子策略](docs/kernel-policy.md)。
+- [KVMem / kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp)：分层 KV 缓存与内容检索的设计参考，包括固定 GPU 工作集、主机 KV 备份和 pre-RoPE mean-K 检索。FastLLM 接入说明见 [KVMem 文档](docs/kvmem.md)。
+- [FlashInfer](https://github.com/flashinfer-ai/flashinfer)：Attention、MLA 等算子。MiMo/Naive 的 SM120 MXFP4 可选 EP 后端直接调用其 [SM120 CuTeDSL MegaMoE](https://github.com/flashinfer-ai/flashinfer/tree/main/flashinfer/moe_ep/kernel_src/sm120/split_cutedsl_megakernel)（Apache-2.0）；FastLLM 提供同进程对称内存、权重适配与原生 CUDA 图回放。此后端使用随包分发的预编译 CUBIN；权重重排、P2P 工作区和完整图均由原生 C++/CUDA 管理，运行时不依赖 FlashInfer、PyTorch、Triton、CuTeDSL 或 cuda-python。开发者重新生成算子包时才需要这些编译工具；当前随包提供 SM120/110 SM、EP4/EP8、H4096/I2048/E256/top-k8 的版本；不同模型维度或 EP 配置需要重新生成。来源见[引用说明](third_party/flashinfer_sm120_ep/NOTICE.txt)，容量分桶、分块和生成方法见[使用说明](tools/mega_moe_sm120/USAGE.txt)。原 SM90 FP8 后端保持内置。
+- [TurboMind / LMDeploy 的 GEMM 内核](https://github.com/InternLM/lmdeploy/tree/main/src/turbomind/kernels/gemm)：仓内 `third_party/turbomind` 的 SM70 s884（`SM70_MMA_884` / HMMA 8x8x4）核心由其源码移植，并在其上接入 AWQ INT4、块缩放 FP8 与 NVFP4 Linear。
+- [1Cat-vLLM 的 SM70 TurboMind 适配](https://github.com/1CatAI/1Cat-vLLM/tree/main/csrc/sm70_turbomind)：AWQ 接入及 FP8/NVFP4 类型、布局和小批量 tactic 的参考来源；FastLLM 侧另行实现了无 Torch 的原始指针桥接、模型权重格式转换、非对齐 padding、回退和调度。
+- [KTransformers](https://github.com/kvcache-ai/ktransformers/blob/main/csrc/ktransformers_ext/cpu_backend/backend.cpp)：MoE 动态线程调度；另见[思路介绍](https://zhuanlan.zhihu.com/p/1900318746402329329)。
+- [Lvllm](https://github.com/guqiong96/Lvllm/blob/main/csrc/lk/moe.cpp)：NUMA MoE 动态调度。
+- [FreeToken](https://github.com/FlashML-org/FreeToken)：CUDA 专家缓存及相关混合推理优化的设计参考，包括 GPU 端路由与 LRU 缓存管理、主机专家权重按需回填，以及 CUDA Graph 兼容的执行流程。具体实现与扩展方式见 [CUDA 专家缓存说明](docs/cuda-expert-cache.md)。
+- [vLLM](https://github.com/vllm-project/vllm/tree/main/vllm/entrypoints/openai/tool_parsers)：工具调用解析。
+- [json11](https://github.com/dropbox/json11)：JSON 构造与解析。
+
+感谢所有开源贡献者。如发现遗漏的代码来源或引用，请通过 Issue 告知。
+
+</details>

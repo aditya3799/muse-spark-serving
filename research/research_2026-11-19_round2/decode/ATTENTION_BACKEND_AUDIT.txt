@@ -1,0 +1,27 @@
+Pinned upstream attention dispatch audit — 2026-11-19
+
+Primary source snapshots: attention_sources/manifest.json. These are selective
+source audits, not performance benchmarks or complete engine compatibility.
+
+FA4: Dao-AILab/flash-attention@68bd095cdd338c5171bccb9c200529f3620b85c9.
+https://github.com/Dao-AILab/flash-attention/blob/68bd095cdd338c5171bccb9c200529f3620b85c9/flash_attn/cute/interface.py#L859
+The general FA4 README says Hopper and Blackwell. However actual interface
+dispatch explicitly asserts arch//10==10 for FP8 input. SM90 implementation is
+therefore not a drop-in replacement for frozen FP8Q/K/V attention. Recasting
+inputs BF16 would retain their values but changes attention reduction/Pprecision,
+adds conversion/traffic and requires a separate numeric and speedqualification.
+No generic FA4 speed claim is evidence for MuseH200FP8decode.
+
+FlashInfer: flashinfer-ai/flashinfer@855eece4e9b5b796a46148664a3e27da571cd98b.
+https://github.com/flashinfer-ai/flashinfer/blob/855eece4e9b5b796a46148664a3e27da571cd98b/flashinfer/decode.py#L981
+_xqa_mtp_decode_has_measured_shape is explicitly a provisionalSM90graphpolicy,
+not generalHopperperformance. It accepts FP16Q/KV,d128,page16,Q32/KV8,fullattention,
+fixed equalKVlengths,B4/16/64 andq4/8 underparticular8192/1024contexts. It excludes
+the MuseFP8d64,page1,Q16/KV2,SWA geometry and cannot justify copyingauto-policy.
+These restrictions delimit the measuredauto dispatch; they do not prove every
+other FlashInfer manualbackend impossible. Lower-level kernels need separateaudit.
+
+Generic FA4 pagedSM90 does expose non-TMA loading when page_size!=tile_n, asnative
+FA3 does. This supports investigating byte-preserving contiguous staging rather
+than assuming a newbackend automatically removes page1 overhead. Prefilllane
+owns that investigation and charges staging/copy costs.

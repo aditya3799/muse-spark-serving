@@ -1,0 +1,60 @@
+Native FA3 prologue fusion: bounded next mechanism, source-only
+2026-11-19. No implementation, execution, activation, or speed claim.
+
+Observed path:
+- MuseSpark1xAttention._fused_kv_store in models/muse_spark.py only permits
+  TRTLLMHAAttnBackend, unit scales and compatible pools. FA3 returns None.
+- FusedQKNorm therefore normalizes18 heads/token (16Q+2K), writes BF16 Q/K.
+- FA3 prepare_paged_mha_query casts Q to the FP8 cache dtype.
+- MHATokenToKVPool.set_kv_buffer separately casts BF16 K/V to FP8 and calls
+  native store_cache, which skips reserved graph-padding slot0.
+- FA3 get_fused_kv_write_buffers already centralizes physical K/V buffers,
+  sliding-window write locations, translation/shard/CP guards and row strides,
+  but it currently accepts BF16 caches only.
+
+Proposed prototype:
+Keep the exact18-row Q/K normalization grid and its existing _triton_config.
+After the original norm and optional original FP32 cached RoPE, explicitly
+round to BF16 before converting Q/K to FP8. Each K-head row additionally loads
+its corresponding raw BF16 V head and writes both K and V to the cache.
+This avoids the existing TRT fused store's20-row grid and extra V norm work.
+Existing head/feature layout and reduction expressions remain unchanged;
+compiler equality still requires empirical qualification.
+
+Use a distinct FA3-specific fused-op dispatch, not a global change to TRT.
+The model passes the backend's authoritative write locations and sets
+save_kv_cache=False only when the complete compatible fused path is active.
+FA3's q.to(same_FP8_dtype) then becomes a no-op. Native attention scheduler,
+softmax, split handling, tile traversal, output BF16 boundary and output norm
+remain exactly their existing implementations.
+
+Required guards:
+- BF16 QKV, FP8 E4M3 cache, d64, ordinary Muse Q/K/V layout, supported strides.
+- Unit K/V scale; unknown scale uses original path. No approximate reciprocal.
+- Backend-authoritative full/SWA locations; reject CP, DCP mask, translation,
+  sharded/unified or incompatible pools until separately implemented.
+- Preserve two BF16 K boundaries around RoPE and BF16 Q output before FP8.
+- Match deployed Torch FP8 cast semantics, including overflow/NaN/signed zero.
+  Local Torch2.14.1 saturates, but do not infer an uninspected deployed wheel.
+- Reserved slot0 is untouched, full backing pools compare; exact pointer and
+  graph storage lifetimes, no shape-dependent stale writes.
+
+Qualification:
+First compare native Q/K/V bytes against fused output for all configured
+decode/verify row counts plus7-request threshold (56tokens:18heads gives1008
+rows, whereas old20-head fused grid crosses1024). Include full/SWA, position
+changes, random/signed/integer/scaled/exceptional inputs, padding, changed graph
+replays and both contiguous/noncontiguous supported strides.
+Then compare actual native FA3 attention output and wider target outputs with
+the identical backend, real weights, token agreement and actual transport.
+Time the whole norm+casts+cache-write+attention chain, not the isolated fused
+kernel; separately report which launches/allocations were actually removed.
+
+Potential scope: remove up to four cast/store launches per eligible target
+layer and intermediate Q/K buffers. This is analytical launch-count scope,
+not a measured latency saving; pre-existing graph/allocator optimizations may
+reduce its value. The full62-layer workload matters more than a single kernel.
+
+This is a future compact alternative to replacing native FA3 with the public
+donor. It is intentionally outside the frozen output-N package and current
+unscored check. Do not treat this plan as a qualified candidate.

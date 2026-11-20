@@ -1,0 +1,131 @@
+--- D:\OpenKernelChallenge\serving\sglang\python\sglang\kernels\jit\csrc\muse_spark\norm_residual.cuh
++++ norm_residual_aux.cuh
+@@ -35,6 +35,8 @@
+   void* __restrict__ output;
+   void* __restrict__ new_stream;
+   void* __restrict__ router_out;
++  void* __restrict__ aux_out;
++  int64_t aux_row_stride;
+   const void* __restrict__ post_weight;
+   const void* __restrict__ pre_weight;
+   const void* __restrict__ alpha;
+@@ -194,6 +196,7 @@
+       }
+     }
+     F32Vec new_stream_v[kFParts];
++    BF16Vec aux_v;
+ #pragma unroll
+     for (int q = 0; q < kPairs; ++q) {
+       const int h = q / kFPairs;
+@@ -218,6 +221,7 @@
+         new_s.y = s.y + normed_b.y;
+       }
+       new_stream_v[h][l] = new_s;
++      if (params.aux_out != nullptr) aux_v[q] = cast<bf16x2_t>(new_s);
+       const fp32x2_t pre_v = pre_bf16 ? round_bf16(new_s) : new_s;
+       vals[p][q] = pre_v;
+       pre_sum_sq = fmaf(pre_v.x, pre_v.x, pre_sum_sq);
+@@ -226,6 +230,10 @@
+ #pragma unroll
+     for (int j = 0; j < kFParts; ++j)
+       new_stream_v[j].store(new_stream, idx * kFParts + j);
++    if (params.aux_out != nullptr) {
++      auto aux = static_cast<bf16_t*>(params.aux_out) + static_cast<int64_t>(blockIdx.x) * params.aux_row_stride;
++      aux_v.store(aux, idx);
++    }
+   }
+ 
+   pre_sum_sq = cta::reduce_sum<kNumThreads>(pre_sum_sq, kNumWarps == 1 ? smem : smem + kNumWarps);
+@@ -632,12 +640,15 @@
+       const tvm::ffi::Optional<tvm::ffi::TensorView> beta,
+       double post_eps,
+       double pre_eps,
+-      bool pre_norm_bf16) {
++      bool pre_norm_bf16,
++      const tvm::ffi::Optional<tvm::ffi::TensorView> aux_out,
++      int64_t aux_slot) {
+     using namespace host;
+ 
+     auto M = SymbolicSize{"num_tokens"};
+     auto H = SymbolicSize{"hidden_size"};
+     auto G = SymbolicSize{"gate_dim"};
++    auto W = SymbolicSize{"aux_width"};
+     auto device_ = SymbolicDevice{};
+     H.set_value(kHidden);
+     device_.set_options<kDLCUDA>();
+@@ -668,6 +679,11 @@
+       gate_channel_wise = (n == kHidden);
+     }
+ 
++    if (aux_out.has_value()) {
++      TensorMatcher({M, W}).with_dtype<bf16_t>().with_device(device_).verify(aux_out.value());
++      RuntimeCheck(kClusterSize == 1, "aux store requires original single-CTA path");
++      RuntimeCheck(W.unwrap() % kHidden == 0 && aux_slot >= 0 && aux_slot < W.unwrap() / kHidden, "invalid aux feature slot");
++    }
+     const auto num_rows = static_cast<int>(M.unwrap());
+     if (num_rows == 0) return;
+ 
+@@ -677,6 +693,8 @@
+         .output = output.data_ptr(),
+         .new_stream = new_stream.data_ptr(),
+         .router_out = kHasRouter ? router_out.value().data_ptr() : nullptr,
++        .aux_out = aux_out.has_value() ? static_cast<bf16_t*>(aux_out.value().data_ptr()) + aux_slot * kHidden : nullptr,
++        .aux_row_stride = aux_out.has_value() ? W.unwrap() : 0,
+         .post_weight = post_weight.has_value() ? post_weight.value().data_ptr() : nullptr,
+         .pre_weight = pre_weight.has_value() ? pre_weight.value().data_ptr() : nullptr,
+         .alpha = gate ? alpha.value().data_ptr() : nullptr,
+--- D:\OpenKernelChallenge\serving\sglang\python\sglang\kernels\ops\layernorm\muse_spark_norm_residual_jit.py
++++ norm_residual_aux.py
+@@ -13,6 +13,7 @@
+ from __future__ import annotations
+ 
+ from typing import TYPE_CHECKING, Optional, Tuple
++from pathlib import Path
+ 
+ import torch
+ 
+@@ -125,9 +126,9 @@
+         cluster_size,
+     )
+     return load_jit(
+-        "muse_spark_norm_residual",
++        "muse_spark_norm_residual_aux_research",
+         *args,
+-        cuda_files=["muse_spark/norm_residual.cuh"],
++        cuda_files=[str(Path(__file__).with_name("norm_residual_aux.cuh"))],
+         cuda_wrappers=[
+             ("run_std", f"MuseSparkNormResidual<{args}, false, false>::run"),
+             ("run_std_router", f"MuseSparkNormResidual<{args}, false, true>::run"),
+@@ -154,6 +155,8 @@
+     router_out: Optional[torch.Tensor] = None,
+     launch_config: Optional[tuple[int, bool]] = None,
+     cluster_size: Optional[int] = None,
++    aux_out: Optional[torch.Tensor] = None,
++    aux_slot: int = 0,
+ ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+     """Return ``(output, new_stream, router_out)`` for a ``[M, H]`` row batch.
+ 
+@@ -169,6 +172,12 @@
+     assert branch.is_contiguous() and stream.is_contiguous()
+ 
+     m, hidden_size = branch.shape
++    if aux_out is not None:
++        if (aux_out.dtype != torch.bfloat16 or aux_out.device != branch.device
++            or aux_out.ndim != 2 or aux_out.shape[0] != m
++            or not aux_out.is_contiguous() or aux_out.shape[1] % hidden_size
++            or type(aux_slot) is not int or not 0 <= aux_slot < aux_out.shape[1] // hidden_size):
++            raise ValueError("invalid auxiliary output owner or slot")
+ 
+     if output is None:
+         output = torch.empty_like(branch)
+@@ -222,5 +231,9 @@
+         float(post_eps),
+         float(pre_eps),
+         bool(pre_norm_bf16),
+-    )
++        aux_out if cluster_size == 1 else None,
++        aux_slot,
++    )
++    if aux_out is not None and cluster_size != 1:
++        aux_out[:, aux_slot * hidden_size : (aux_slot + 1) * hidden_size].copy_(new_stream_out)
+     return output, new_stream_out, router_out

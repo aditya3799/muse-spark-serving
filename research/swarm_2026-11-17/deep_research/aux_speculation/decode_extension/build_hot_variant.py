@@ -1,0 +1,27 @@
+from pathlib import Path
+import ast,difflib,hashlib,json
+P=Path(__file__).resolve().parent
+reports=[]
+for variant in ['direct','fused']:
+    src=P/(variant+'_sources');dst=P/('hot_'+variant+'_sources');patch=[];files=[]
+    for path in src.rglob('*'):
+        if not path.is_file() or path.suffix not in ['.py','.cuh']:continue
+        rel=path.relative_to(src).as_posix();base=path.read_text();s=base
+        if rel.endswith('/layers/decode_aux_output.py'):
+            s=s.replace('        self.buffer = buffer','        self.buffer = buffer\n        self._binding = (buffer.data_ptr(), tuple(buffer.shape), buffer.stride(), buffer.dtype, buffer.device)')
+            old='    def validate_binding(self, buffer, spec):\n        if (spec != (self.hidden_size, self.capture_ids)\n            or not self.owns(buffer) or buffer.shape != self.buffer.shape):\n            raise RuntimeError("decode auxiliary binding changed; rebuild captured runner")\n'
+            new='    def owns(self, output):\n        if not torch.is_tensor(output) or output.ndim != 2:\n            return False\n        pointer, shape, stride, dtype, device = self._binding\n        return (\n            output.data_ptr() == pointer\n            and 0 < output.shape[0] <= shape[0]\n            and output.shape[1] == shape[1]\n            and output.stride() == stride\n            and output.dtype == dtype\n            and output.device == device\n        )\n\n    def validate_binding(self, buffer, spec):\n        # Immutable capture-time fingerprint detects even in-place storage/view\n        # mutation of the canonical Tensor, not only replacement of its object.\n        if (spec != (self.hidden_size, self.capture_ids)\n            or not self.owns(buffer) or tuple(buffer.shape) != self._binding[1]):\n            raise RuntimeError("decode auxiliary binding changed; rebuild captured runner")\n'
+            assert s.count(old)==1;s=s.replace(old,new)
+        if rel.endswith('/speculative/dflash_worker_v2.py'):
+            start=s.index('    def _aux_output_owners(self):');end=s.index('    def _append_target_hidden_to_draft_kv_by_loc_impl(',start)
+            new='    def _aux_output_owners(self):\n        model_runner = self.target_worker.model_runner\n        prefill_runner = getattr(model_runner, "prefill_cuda_graph_runner", None)\n        decode_runner = getattr(model_runner, "decode_cuda_graph_runner", None)\n        prefill = getattr(prefill_runner, "prefill_aux_output_owner", None)\n        decode = getattr(decode_runner, "decode_aux_output_lease", None)\n        cached = self.__dict__.get("_cached_aux_output_owners")\n        if cached is None or cached[0] is not prefill or cached[1] is not decode:\n            cached = (prefill, decode)\n            self._cached_aux_output_owners = cached\n        return cached\n\n    def _append_target_hidden_to_draft_kv_by_loc(self, **kwargs) -> None:\n        prefill, decode = self._aux_output_owners()\n        output = kwargs["target_hidden"]\n        pointer = output.data_ptr() if torch.is_tensor(output) else None\n        owner = None\n        if decode is not None and pointer == decode._binding[0]:\n            owner = decode\n        elif prefill is not None and pointer == prefill.buffer.data_ptr():\n            owner = prefill\n        # consume performs the complete metadata/state check once. The pointer\n        # selection above merely avoids repeating it for each candidate owner.\n        with owner.consume(output) if owner is not None else nullcontext():\n            self._append_target_hidden_to_draft_kv_by_loc_impl(**kwargs)\n\n'
+            s=s[:start]+new+s[end:]
+            old='    def forward_batch_generation(self, *args, **kwargs):\n        generations = [(owner, owner.generation) for owner in self._aux_output_owners()]\n        try:\n            return self._forward_batch_generation_with_aux_output(*args, **kwargs)\n        except Exception:\n            for owner, generation in generations:\n                owner.discard_ready(generation + 1)\n            raise\n'
+            new='    def forward_batch_generation(self, *args, **kwargs):\n        prefill, decode = self._aux_output_owners()\n        prefill_generation = prefill.generation if prefill is not None else None\n        decode_generation = decode.generation if decode is not None else None\n        try:\n            return self._forward_batch_generation_with_aux_output(*args, **kwargs)\n        except Exception:\n            if prefill is not None:\n                prefill.discard_ready(prefill_generation + 1)\n            if decode is not None:\n                decode.discard_ready(decode_generation + 1)\n            raise\n'
+            assert s.count(old)==1;s=s.replace(old,new)
+        if path.suffix=='.py':ast.parse(s)
+        out=dst/rel;out.parent.mkdir(parents=True,exist_ok=True);out.write_text(s)
+        patch.extend(difflib.unified_diff(base.splitlines(True),s.splitlines(True),fromfile='a/'+rel,tofile='b/'+rel))
+        files.append({'path':rel,'sha256':hashlib.sha256(s.encode()).hexdigest()})
+    (P/('hot_'+variant+'_delta.diff')).write_text(''.join(patch));reports.append({'variant':variant,'bytes':len(''.join(patch).encode()),'files':files})
+(P/'hot_manifest.json').write_text(json.dumps({'status':'CPU_PREPARED','variants':reports,'invariants':'Full runtime spec and immutable metadata validation retained before replay; original generation state machine unchanged.'},indent=2)+'\n');print('Prepared guarded hot variants')

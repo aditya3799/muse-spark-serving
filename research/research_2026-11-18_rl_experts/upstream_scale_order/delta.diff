@@ -1,0 +1,167 @@
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_humming_split.py b/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
+--- a/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
++++ b/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
+@@ -77,7 +77,7 @@
+ 
+ def split_expert_outputs(original_helper, layer, x, local_ids, torch, global_experts=None,
+                          *, retain=False, defer_downscale=False):
+-    from humming.layer import HummingMethod
++    from sglang.kernels.ops.moe.scale_order import scale_order_forward
+     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+     from sglang.kernels.ops.activation.activation import silu_and_mul
+     from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
+@@ -116,7 +116,7 @@
+     for name,ids in partitions:
+         config = plan[name]['w13']
+         sorted_ids,expert_ids,padded = alignment(name,ids,config['block_shape'][0])
+-        HummingMethod.forward_layer(layer,inputs=x,outputs=cache1,top_k=topk,sublayer_name='w13',
++        scale_order_forward(layer,inputs=x,outputs=cache1,top_k=topk,sublayer_name='w13',
+             tuning_config=config,sorted_ids=sorted_ids,expert_ids=expert_ids,num_tokens_padded=padded,
+             valid_shape_m=valid,compute_config={'gemm_type':'indexed','use_f16_accum':False})
+     # Both up partitions are complete before scaling/activation or down-buffer reuse.
+@@ -127,7 +127,7 @@
+     for name,ids in partitions:
+         config = plan[name]['w2']
+         sorted_ids,expert_ids,padded = alignment(name,ids,config['block_shape'][0])
+-        HummingMethod.forward_layer(layer,inputs=cache2,outputs=cache3,top_k=1,sublayer_name='w2',
++        scale_order_forward(layer,inputs=cache2,outputs=cache3,top_k=1,sublayer_name='w2',
+             tuning_config=config,sorted_ids=sorted_ids,expert_ids=expert_ids,num_tokens_padded=padded,
+             valid_shape_m=valid,compute_config={'gemm_type':'indexed','use_f16_accum':False})
+     if not defer_downscale:
+@@ -195,7 +195,7 @@
+ 
+ def _split_large_prefill_expert_outputs(original_helper, layer, x, local_ids, torch, global_experts=None,
+                          *, retain=False, defer_downscale=False):
+-    from humming.layer import HummingMethod
++    from sglang.kernels.ops.moe.scale_order import scale_order_forward
+     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+     from sglang.kernels.ops.activation.activation import silu_and_mul
+     from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
+@@ -234,7 +234,7 @@
+     for name,ids in partitions:
+         config = plan[name]['w13']
+         sorted_ids,expert_ids,padded = alignment(name,ids,config['block_shape'][0])
+-        HummingMethod.forward_layer(layer,inputs=x,outputs=cache1,top_k=topk,sublayer_name='w13',
++        scale_order_forward(layer,inputs=x,outputs=cache1,top_k=topk,sublayer_name='w13',
+             tuning_config=config,sorted_ids=sorted_ids,expert_ids=expert_ids,num_tokens_padded=padded,
+             valid_shape_m=valid,compute_config={'gemm_type':'indexed','use_f16_accum':False})
+     # Both up partitions are complete before scaling/activation or down-buffer reuse.
+@@ -245,7 +245,7 @@
+     for name,ids in partitions:
+         config = plan[name]['w2']
+         sorted_ids,expert_ids,padded = alignment(name,ids,config['block_shape'][0])
+-        HummingMethod.forward_layer(layer,inputs=cache2,outputs=cache3,top_k=1,sublayer_name='w2',
++        scale_order_forward(layer,inputs=cache2,outputs=cache3,top_k=1,sublayer_name='w2',
+             tuning_config=config,sorted_ids=sorted_ids,expert_ids=expert_ids,num_tokens_padded=padded,
+             valid_shape_m=valid,compute_config={'gemm_type':'indexed','use_f16_accum':False})
+     if not defer_downscale:
+diff --git a/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py b/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
+--- a/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
++++ b/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
+@@ -280,7 +280,7 @@
+ 
+ First and final outputs alias one buffer as in the stock Marlin path.
+ The caller applies the original per-expert norm and weighted finalization."""
+-    from humming.layer import HummingMethod
++    from sglang.kernels.ops.moe.scale_order import scale_order_forward
+     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+     from sglang.kernels.ops.activation.activation import silu_and_mul
+     from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
+@@ -296,7 +296,7 @@
+     cache13 = torch.empty((m * topk * max(2 * i, k),), device=x.device, dtype=x.dtype)
+     cache1 = cache13[:m * topk * 2 * i].view(m * topk, 2 * i)
+     common = dict(sorted_ids=sorted_ids, expert_ids=expert_ids, num_tokens_padded=padded, valid_shape_m=valid, compute_config={'gemm_type': 'indexed', 'use_f16_accum': False})
+-    HummingMethod.forward_layer(layer, inputs=x, outputs=cache1, top_k=topk, sublayer_name='w13', tuning_config=selected['w13'], **common)
++    scale_order_forward(layer, inputs=x, outputs=cache1, top_k=topk, sublayer_name='w13', tuning_config=selected['w13'], **common)
+     # GEMM output has already rounded to BF16. Apply the BF16 global scale
+     # in a separate BF16 operation, preserving Marlin's second rounding.
+     scale_active_rows(cache1, local_ids, layer.w13_post_scale)
+@@ -306,7 +306,7 @@
+     if selected['w2']['block_shape'][0] != block:
+         second = moe_align_block_size(local_ids, selected['w2']['block_shape'][0], layer.w2_post_scale.numel(), ignore_invalid_expert=True)
+         common.update(sorted_ids=second[0], expert_ids=second[1], num_tokens_padded=second[2])
+-    HummingMethod.forward_layer(layer, inputs=cache2, outputs=cache3, top_k=1, sublayer_name='w2', tuning_config=selected['w2'], **common)
++    scale_order_forward(layer, inputs=cache2, outputs=cache3, top_k=1, sublayer_name='w2', tuning_config=selected['w2'], **common)
+     # Preserve the same BF16-output -> BF16-scale boundary for GEMM2.
+     if not defer_downscale:
+         scale_active_rows(cache3, local_ids, layer.w2_post_scale)
+diff --git a/python/sglang/kernels/ops/moe/scale_order.py b/python/sglang/kernels/ops/moe/scale_order.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/scale_order.py
+@@ -0,0 +1,75 @@
++# SPDX-License-Identifier: Apache-2.0
++# Adapted from vLLM Humming PR 107, lesj0610, by selecting probed scale lanes in the pinned reader.
++# https://github.com/vllm-project/humming/pull/107
++import hashlib
++import json
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++import humming
++from humming import ops
++from humming.kernel.humming import HummingKernel
++from humming.layer import HummingMethod
++
++HEADER_SHA = '315d2c6b0bc965dd77485a15b522c96585b11de15e39a69108cdb3b3de02f75b'
++OLD_SWAP = '        scalar_t *dq_bs_scalar_ptr = reinterpret_cast<scalar_t *>(dq_bs);\n\n        PRAGMA_UNROLL\n        for (uint32_t j = 0; j < 2; j++) {\n          scalar_t tmp = dq_bs_scalar_ptr[2 + 4 * j];\n          dq_bs_scalar_ptr[2 + 4 * j] = dq_bs_scalar_ptr[1 + 4 * j];\n          dq_bs_scalar_ptr[1 + 4 * j] = tmp;\n        }\n\n'
++OLD_INDEX = 'bs_f16_ptr[i] = this->num2num2(bs_half_ptr[i]);'
++NEW_INDEX = 'if constexpr (ElementBS::kBits == 8 && !kUseFusedE8m0Scale) {\n            auto *raw_scale = reinterpret_cast<scalar_t *>(dq_bs);\n            const uint32_t lane = j < 4 ? (j / 2) * 4 + i * 2 + j % 2 : j * 2 + i;\n            bs_f16_ptr[i] = this->num2num2(raw_scale[lane]);\n          } else {\n            bs_f16_ptr[i] = this->num2num2(bs_half_ptr[i]);\n          }'
++@lru_cache(maxsize=1)
++def adapted_source():
++    headers = Path(humming.__file__).resolve().parent / "include/humming"
++    kernel = (headers / "kernel/humming.cuh").read_text()
++    main = (headers / "arith/mainloop_arith.cuh").read_text()
++    if hashlib.sha256(main.encode()).hexdigest() != HEADER_SHA:
++        return None
++    assert main.count(OLD_SWAP) == main.count(OLD_INDEX) == 1
++    main = main.replace(OLD_SWAP, "").replace(OLD_INDEX, NEW_INDEX)
++    return kernel.replace("#include <humming/arith/mainloop_arith.cuh>", main)
++
++class ScaleOrderKernel(HummingKernel):
++    def prepare(self):
++        anchor = "#include <humming/kernel/humming.cuh>"
++        assert self.code.count(anchor) == 1 and adapted_source() is not None
++        self.code=self.code.replace(anchor,adapted_source())
++        super().prepare()
++
++@lru_cache(maxsize=256)
++def kernel_handle(context, meta_json, compute_json, tuning_json):
++    config=json.loads(meta_json)
++    config.pop("sublayer_name",None)
++    config.update(json.loads(compute_json))
++    config.update(json.loads(tuning_json))
++    num_sms=config.pop("num_sms",0)
++    kernel=ScaleOrderKernel(**config)
++    return torch.tensor([kernel.kernel_id,num_sms],dtype=torch.int64,device="cpu")
++
++def eligible(kwargs):
++    x=kwargs["inputs"]
++    c=kwargs["tuning_config"]
++    compute=kwargs["compute_config"]
++    return (kwargs["valid_shape_m"]>=1 and kwargs["top_k"] in (1,8)
++            and x.is_cuda and x.dtype==torch.bfloat16
++            and isinstance(c,dict) and c.get("use_stream_k") is False
++            and c.get("use_f16_accum") is False and not c.get("use_warp_spec")
++            and not c.get("use_tma") and c.get("multi_cast_size_a",1)==1
++            and c.get("multi_cast_size_b",1)==1
++            and compute.get("gemm_type")=="indexed" and compute.get("use_f16_accum") is False)
++
++def scale_order_forward(layer, **kwargs):
++    if not eligible(kwargs) or adapted_source() is None:
++        return HummingMethod.forward_layer(layer,**kwargs)
++    meta=layer.humming_metas[kwargs["sublayer_name"]]
++    if (meta.input_scale_group_size or meta.has_bias or meta.has_zero_point
++            or str(meta.b_dtype)!="float4e2m1" or str(meta.bs_dtype)!="float8e4m3"
++            or meta.weight_scale_group_size!=16):
++        return HummingMethod.forward_layer(layer,**kwargs)
++    handles=kernel_handle(HummingKernel.current_context(),meta.to_str(),
++        json.dumps(kwargs["compute_config"],sort_keys=True),json.dumps(kwargs["tuning_config"],sort_keys=True))
++    return ops.launch_kernel(
++        configs=handles,inputs=kwargs["inputs"],outputs=kwargs["outputs"],
++        weight=getattr(layer,meta.weight_name),weight_scale=getattr(layer,meta.weight_scale_name),
++        weight_scale_2=getattr(layer,meta.weight_scale_2_name,None),
++        sorted_ids=kwargs["sorted_ids"],expert_ids=kwargs["expert_ids"],
++        num_tokens_padded=kwargs["num_tokens_padded"],locks=getattr(layer,"locks",None),
++        top_k=kwargs["top_k"],valid_shape_m=kwargs["valid_shape_m"])

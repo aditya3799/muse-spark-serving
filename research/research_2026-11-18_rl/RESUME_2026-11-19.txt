@@ -1,0 +1,71 @@
+SERVING RESEARCH CHECKPOINT
+Saved 2026-11-19 approximately 02:30 IST
+Workspace D:\OpenKernelChallenge\serving
+
+USER DIRECTION
+Research is paused. User explicitly confirmed resume November 19, 2026 at 12:00 PM IST (06:30 UTC). Resume with a brief research pass, then prepare submissions. Earlier explicit approval requirement for scored submissions persists. Make the exact patch, flags, evidence, risks and quota reviewable before requesting final scored approval. Target remains 2x stock, earlier requested minimum credible projection 1.8x. Current evidence does not establish that threshold. Discuss any conflict with the desired submission timing candidly rather than fabricating a projection.
+This file is a saved restart plan. No automatic wake-up was configured.
+
+REFERENCE AND HARNESS
+Frozen reference release_2026-11-18/candidate.diff
+SHA256 8c7547213fb993a318321a26f84e2872db8c87b358ee3d3ea638695702b0dc2b
+Official score 1.2363x, job 317c88a5fd474cd2
+Pinned SGLang 297e54fd105e974cdf401e5b4d20253a22c16f90
+Local GPU RTX 3050 6 GB, one rank. Complete Muse 816B TP8 service cannot run locally.
+Protocol research_2026-11-18_rl/PROTOCOL.md
+Use plugin paired statistics, changed inputs, AB/BA timing, duplicate parent, independent seed, correctness veto. Reward is 100*ln(speedup), incorrect output -100. This is reward-guided experimentation, with no model-weight RL training.
+Latest consolidated ledger has 60 scopes (33 positive,13 penalized,12 neutral,2 unmeasured),26 locally confirmed. Some newer receipts have not been consolidated.
+
+OFFICIAL EVIDENCE
+Best full-frontier score remains1.2363x.
+Mixed-chunk check b2fa80590214468b passed C16,1.2657x stock,15557.2 tokens/s/GPU.
+DFlash projection check76866640ab6f4b9f passed C16,1.2631x stock,15686.5 tokens/s/GPU. Parent C16 was15546.7 on another node. Optimization activation unconfirmed by logs.
+Scored expert50a2f4d696224d6b passed correctness but every load excluded; C16 throughput6450.1 and first TTFT174.256s vs parent15546.7 and61.385s. Retired. Per-kernel failure cause unresolved.
+Hopper expert check0afdc0b191dd4b42 was queued at last inspection. Refresh status and quota on resume. Earlier day's quota exhausted; reset00:00 UTC.
+See research_2026-11-18_frontier/judge_review.json and DECISION.md.
+
+MEASURED LOCAL RESULTS
+Attention-entry custom kernel2.349x/2.311x, exact bytes; research_2026-11-18_rl_prefill/decode_qkv/entry_reward.json.
+Scored allocator suffix page metadata2.681x/2.716x; direct global table19.979x/21.856x isolated, adds lifetime fence and consumer indexing.
+Private page snapshot b2048w4 selected on discovery then independent2.444x (discovery2.818x); research_2026-11-18_rl/decode_snapshot/snapshot_reward.json. Preserves original early shared-read publication. Cumulative candidate SHA128e6a3c8e5c83677e3aa8fdd625d74955642ce189cb8c42b458d493f0c846f1.
+Draft selector1.290x/1.197x; research_2026-11-18_window_repair/decode_selector/selector_direct_walk_reward.json.
+16K whole local FFN1.028x/1.041x; production_joint_ffn_reward.json.
+Grouped expert scatter elimination1.0241x/1.0236x; rl_experts/grouped_route/fused_held_reward.json.
+Coupled draft context1.017x/1.015x; rl_dflash/joint_combined_reward.json.
+SSEngine graph staging saved26-85us and53-66us on two seeds; rl_experts/ssengine_graph_prep/GPU_RESULTS.md.
+Detailed historical results research_2026-11-18_rl/RESULTS.md.
+These operations overlap; never multiply their ratios.
+
+BROADER ATTENTION EVIDENCE
+Metadata plus two portable attention calls1.0610x/1.0601x. Then native BF16 full62-layer schedule (16full,46sliding), seed768103, completed and all outputs matched.
+Schedule reuse1.013221x CI1.011040-1.015350; one seed only.
+Direct+schedule1.002222x CI0.996068-1.008860.
+Private+schedule1.001268x CI0.995265-1.007739.
+Files research_2026-11-18_rl/swa_schedule/native_*_reward.json.
+Synthetic distinct queries/shared bounded KV banks, real SM86 BF16 native FA3. H200 FP8 and TP8 absent. Confirm holdout before promotion.
+
+REJECTED PATHS
+Wider live Qwen/DFlash tree12/16 rows ran1.28x/1.43x on six public coding prompts but changed16/192 outputs vs duplicate parents. Correctness rejection. Old eight-row tree reduced102 to97 target calls but metadata cost12.65/25ms at C16/C32 made it unattractive.
+Compact expert routes0.65-0.66x on clustered tests.
+Expert full-layout fallback0.276-0.449x external,0.718-0.784x scalar,0.793-0.809x vector despite exact output.
+Small feature-sharded shape changed raw outputs; fused gated O changed bits atM1 and slowerM4-16.
+
+PENDING, PRIORITIZED FOR BRIEF RESUME
+1. Check host RAM/disk, WSL responsiveness and remaining research processes before any GPU allocation. Last free physical RAM was under1GB and drives only~400-500MB. Two offline compilers and a root stage diagnostic stalled. Agents stopped their launchers. In-guest cleanup remained unverified. Root orchestration cell1340 was absent when pause was handled. Do not assume its WSL child exited. Identify exact task processes before stopping anything. Avoid concurrent compiler/Torch jobs.
+2. Run integrated four-block decoder fixture research_2026-11-18_rl_prefill/decoder_chain/run.ps1. Source/import checked only. Real QKV, native BF16 FA3 bridge from FP8, Humming FFN, live residual across4blocks; missing peer sums declared. Cases1x74160,4x8192,16x4096. No completed GPU result.
+3. Confirm62-layer native schedule holdout with native_stack.py --seed1159837, then score_native.py pilot --holdout holdout.
+4. Most substantive custom GEMM lead rl_experts/cutlass_g16/SHARED_WEIGHTS.md. CuTe four-N atom matches40960/40960 original Humming WGMMA coefficient addresses, allowing sharing768MiB/layer with changed96MiB scales. Original grouped SM90 kernel compiled; shared-layout build, scale CPU test and scale-only local timing incomplete. No Hopper measured gain.
+5. Cached real Qwen test rl/lattice_tree/public_pair/wide_live.py --public --cached-draft uses committed draft K/V and close-margin fallback to original chain, with extra verification charged. NOT run. Needs streamed public weights, substantial GPU+RAM. Existing wide_live.json is earlier uncached-draft result.
+6. Compact sliding-window experiment swa_schedule/compact_window.py,window_trials.py,window_oracle.py exists. CPU oracle954cases/6996query rows/12822804page reads passed. GPU run never started. Rebased origin may alter native FP8 tile boundaries/reductions and dynamic splits. Must measure exactness.
+7. Speculation fixed_tree FlashInfer one-table FP8 custom predicate implemented; native compile/oracle interrupted. Memory~16.25MiB vs old146MiB atB32; actual H200 correctness/timing unverified. Two-pass draft refinement only source-reviewed; training support uncertain, no implementation.
+
+UNFINISHED ROOT QUEUE AT PAUSE
+Private snapshot seed1839501 finished and scored.
+expert_slab/gpu_probe.py --seed81239 --rows128 --diagnose stalled; slab_stage_81239.json complete=false.
+swa_schedule/time_pinned.py seeds845372/891801 did not produce results.
+Portable62layer metadata_stack_725681 pilot exists; holdout1358219 not run.
+
+SUBMISSION PREPARATION
+Refresh actual deadline/quota and completed queued receipts. Prefer verified broader scopes. Compose only compatible source changes and validate cumulative patch against pinned commit, allowed paths,400KB,400chars/added line,memory,dispatch and correctness. Existing decode_combined/three_candidate.diff and direct_three_candidate.diff compose earlier isolated wins; their whole-server gain unmeasured.
+User was told rough planning scenarios1.267-1.327x stock, conditional on whole-prefill3-5% and whole-decode2-10% gains. Upper10% decode assumption optimistic/unverified. This is Amdahl sensitivity from frontier_budget.json, NOT measured score or confidence interval. Need +45.6% over parent for1.8x,+61.8% for2x.
+Keep uncertainty explicit. Prepare exact proposed patch+flags and ask permission before a scored submission.

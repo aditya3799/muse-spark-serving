@@ -1,0 +1,28 @@
+Attention traversal follow-up, 2026-11-19
+
+Pinned nativeFA3 mainloop_fwd_sm90_tma_gmma_ws.hpp initializes
+n_block=n_block_max-1 and decrements it (1241,1365,1430-1465).
+Public donor and restored variant instead process start+i*TILE, increasingi.
+The older attention_softmax_oracle.py/json holds direction reverse for both
+arms, so it is a tile-size-only mechanism ablation, NOT the whole restored
+donor's softmax ordering. Its results remain valid only for that limitedscope.
+
+attention_softmax_direction_oracle.py/json adds the actual directional
+distinction with freshseed8371931, normalizedBF16→FP8Q/K, originalMuse
+softmaxscale5.4730064863875/8, variablecausalmasks includingfullymaskedrow,
+FP8PVprobabilities scaled256 and unroundedFP32denominators.
+NativeBlockN128/reverse versus restoredBlockN64/forward relativeL2:
+N128:0.2576%;N2048:0.7591%;N8192:1.1153%.
+Forcomparison, same-directionBlockN64/reverse differsfromnative0.0139%,
+0.1631%,0.0361%. Thus direction can dominate the tile-size difference.
+
+AgainstFP64softmax, native/restored relativeL2respectively:
+N128:0.5879%/0.5393%;N2048:0.4490%/0.6538%;N8192:0.7914%/0.8292%.
+These smallsyntheticCPUexamples are not kernel correctness or servinggates.
+They do not emulate WGMMAreduction, GPUapproximateexp2, splitmerges, oractual
+modelactivations. No favorablecomparison can authorize integration. A future
+Hopperdiagnostic must compareactualK/Vandoutputs and thenfullmodelbehavior.
+
+No compiledvariant or servingpackage was changed by this follow-up. The
+directional ablation is separate from ATTENTION_DIAGNOSTIC_REVIEW.json's
+previous sourcepacket, and both remain unqualified.

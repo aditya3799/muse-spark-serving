@@ -1,0 +1,10 @@
+﻿# Full-K CTA output-column audit
+
+Three independently scored alternatives changed the CTA output span from 256 to 128 columns. The W13-only trial reached 0.9712× [0.9652, 0.9776], W2-only reached 0.9854× [0.9799, 0.9915], and changing both reached 0.9553× [0.9490, 0.9622]. The paired plugin returned SLOWER in each case. These trials used eight alternating rounds on M128/M768 and the official kernel-task normal/skewed busiest-rank route fixtures. Each round changed activations, routing IDs and weights assigned to routes. The packed checkpoint weights remained fixed within the seed. The 32 finalized three-candidate comparisons passed bitwise equality. All eight nonempty light/heavy stage instances additionally passed random and mixed-exponent raw BF16 tests, including untouched output sentinels. No candidate advanced to a held-out seed.
+
+The vendor full-K instruction sequence and per-output K ownership stay fixed. A narrower CTA includes fewer independent output-column warps, which decreases available parallelism within a CTA and increases the number of CTAs loading the same input rows. The timing alone does not identify which change drove the regression.
+
+Prior coverage includes Marlin persistent launch limits, scored-Humming launch width (halved cap regressed, doubled cap inconclusive), Hopper warp-N and K-reduction topology changes, pipelining depth and resident CTA sweeps, fused or packed expert layouts, and raster order. This experiment changed only CTA-N. It preserved M tiles, the entire warp tile, block/warp K, accumulator type, stage count, physical grid, route alignment and activation operations. Both widths compiled offline for two representative full W13/W2 shapes on SM86 and SM90a, and the RTX trial records each actually loaded cubin. [Native pilot and launch identities](pilot.json) · [Paired ranking](pilot_ranking.json) · [Offline cubins](offline.json)
+
+Canonical reward ledgers are [W13](pilot_w13.json), [W2](pilot_w2.json), and [both](pilot_both.json), with [W13 reward](pilot_w13_reward.json), [W2 reward](pilot_w2_reward.json), and [both reward](pilot_both_reward.json).
+

@@ -1,0 +1,39 @@
+﻿Split-readiness variants: source and offline-build evidence, disabled.
+
+Original finite-only source remains frozen at SHA3a958850aa6cc360b1c90fe7ba4b36808c57226a6a8b62b4edb7513198afc40e.
+The first variant separates existing weight/activation full barriers. The second
+adds an optional128..255ns suspend hint computed from all8 decoded pair registers.
+All coefficient arithmetic, WGMMA order, epilogues, ring depth and release points
+remain unchanged. Per-lane suspension timing changes in the second variant.
+
+Independent decode-lane review found no new barrier-count or early-reuse defect:
+BW_F and BX_F each have one producer arrival and their own byte completion;
+BW_F acquire precedes coefficient loads; BX_F acquire precedes first WGMMA;
+BW_E follows the final shared weight read; BX_E follows retired WGMMA groups.
+Both producers and consumer seq retain continuous3-slot parity through both phases.
+The CPU protocol model passes128 schedules,65,536 consumer stages and21 phase wraps
+per slot, including deliberate missing-input-wait and undersized-ring negatives.
+This does not prove actual async proxy visibility, compiler behavior or SM90 progress.
+
+Compiled source order was insufficient: split_ready initially left16/32 entry sites
+with zero BF16 multiplies before entering the retry loop. There are32 additional
+outlined retry copies; counting64 instructions as64 independent sites was misleading.
+The dependency variant puts all16 BF16 multiplies before the retry branch at32/32
+entries. Static dataflow verifies all8 decoded pair registers feed NANOSLEEP.SYNCS
+at every retry loop. The initial TRYWAIT instruction itself can still be scheduled
+early. No claim that it never suspends, or that this improves runtime, is established.
+Both variants compile96registers with zero spills. These counts are not speedups.
+
+Required future gates, no launch authorized here:
+1. Actual H200 coefficient test including signed zeros and subnormal E4M3/FP4 values;
+   full raw and post-normalization outputs against unchanged WGS and scored parent.
+2. Shape/routing matrix M8/32/128/256/384 plus chunk boundaries385/753/4097;
+   all-local, remote-only, uniform, skewed, empty experts, changing routes/weights;
+   finite certification must reject either signed NaN SF code and follow v2 lease.
+3. Long graph replay with alternating seeds and explicit watchdog/progress gate;
+   phaseA/B dependencies and three-slot reuse under skewed expert loads.
+4. Baseline LUT, finite-only, split-ready and dependency variants measured separately;
+   duplicate parent controls and balanced long graph arms, no concurrent work.
+5. Full-serving peak+2GB and output-quality checks before any scored consideration.
+
+No H200 execution, serving integration, measured2x gain or submission recommendation.

@@ -1,0 +1,29 @@
+FA3 split policy research checkpoint
+
+The isolated overlay is default off. No active serving source, patch, launch flags, submission, remote check or GPU job changed. The only numerical operation selected differently is FA3 KV split count. Original FP8 operands/probabilities and FP32 accumulators/partials/combine remain mandatory native binary audit gates; this prototype changes no exp2 implementation.
+
+Implemented:
+- One immutable policy per newly constructed target FA3 backend. Draft FA4, prefill split defaults and unsupported roles are excluded or preserved. Both split fields change together inside the current phase, so target verify and scheduler generation cannot disagree with decode.
+- Original metadata/forward method bodies retained under decorators. Scheduler provenance requires its actual result or an explicitly recorded original source copy to the preallocated contiguous buffer prefix. Wrong-source, wrong-offset and stale/cross-phase metadata are rejected.
+- Full CUDA graph binding includes graph identity, metadata object and split phase. Whole capture_one_shape failure poisons the backend; old graphs cannot silently revive after failed recapture. Cleanup invalidates bindings. Metadata glue, TBO, PDMux, ragged verify and other graph backends remain excluded.
+- CPU source-extracted tests pass34 checks. Actual base dispatch, native call expressions, scheduler function and complete FullCudaGraphBackend capture/replay/cleanup functions execute with tensor/CUDA services mocked. No CUDA ordering, native precision or performance proof is implied.
+- native_fa3_sweep.py defaults to CPU preflight. --run requires an explicit independently audited installed binary/wrapper hash contract and H200 SM90. It is a per-rank native component fixture using real FA3 and CUDA graphs, not a full ModelRunner or all-rank serving gate. Exhaustive257-key one-hot coverage, causal masking, changed captured Q/K/V/pages/lengths, same-policy eager/captured error diagnostics, and requested split0/1/2/4/8 comparisons are prepared. Error differences are reported without inventing a serving tolerance. Requested split count is not claimed to equal dynamic scheduler execution count.
+
+Run CPU checks (WSL Python3.12, no real Torch import; initializer suite uses explicit mocks):
+  python test_policy_cpu.py
+  python test_initializer_cpu.py
+  python build_overlay.py
+  python test_native_contract_cpu.py
+  python native_fa3_sweep.py
+
+Future native gate (NOT executed; template deliberately refuses):
+  python native_fa3_sweep.py --run --contract independently_audited_contract.json --output native_01
+Optional --timing is attention-graph-only, excludes scheduler refresh, and does not establish serving gains. Review drift and controls before interpretation.
+
+Installation remains research-only: overlay/python is a reviewable source tree, fa3_split_policy.diff is the emitted patch. A caller would set model_runner._research_fa3_split_policy before NEW backend construction, only after explicit all-rank agreement and native audit. No current model/runner is patched or mutated here. Python guards run during capture/preparation, not inside CUDA replay; external graph invalidation and immutable execution ownership remain required.
+
+Holds: actual H200 precision/binary audit, public initializer with real model context, full-worker all-rank setup, native scheduler/key/numerical replay execution, real serving validation, total-worker memory accounting, and timing. No achieved speedup claimed.
+
+Final qualification additions: public initializer26 mocked checks; native admission/source identity16 CPU checks; policy/lifecycle34 CPU checks (76 total assertions grouped as checks, not independent native experiments). SWA2047 native boundary probes and FP64 masked-window references are prepared. Same-policy bitwise differences are diagnostic under organizer stock nondeterminism. Numerical quality remains unqualified without a supplied acceptance criterion. Shared FullCudaGraphBackend default-off nondecode callers remain unchanged; enabled nondecode/prefill graph lifecycle is rejected. Pinned primary native source type evidence is saved, but does not attest the installed binary.
+
+Independent final review: ../expert_partition/HOPPER_FA3_FINAL_CPU_REVIEW.json finds no new decisive source blocker within held component scope; no native or full ModelRunner approval. Post-review change only tightens fixture cap to2,000,000,000 bytes as conservative decimal2GB. Organizer excerpt does not resolve enforcement units. This tensor-allocation guard does not establish inclusive full-device/serving overhead. Prior CPU-native contract suite16 checks passed before this constant-only correction; attempted WSL repeat did not complete and was interrupted, exit1. Windows compile-only syntax and exact inverse-byte-change SHA comparison to reviewed source pass. Prior policy34 and initializer26 unchanged. Historical pre-cap receipts retained; no post-fix native execution. Lane frozen again.

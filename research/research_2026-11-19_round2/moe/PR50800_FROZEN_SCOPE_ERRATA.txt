@@ -1,0 +1,22 @@
+Frozen raw-scale source scope clarification (read-only independent review)
+
+The raw-scale sourcef98a3080 retains inherited upstream header comments near
+lines61-64 saying the global scales are folded at pack time, and describing
+normalized scale codes. These comments are STALE for the separate raw-scale
+research variant. Its research banner, original_scale_bf16/sc_bf16 implementation,
+PR50800_H200_PLAN and coefficient/layout receipts define the intended contract:
+original raw E4M3 bytes and untouched FP4codes, full-value coefficients, independent
+scored-parent globals, no generic up/gate ratio fold. No host loader is supplied.
+Do not use the inherited comments as implementation guidance. Frozen bytes and
+hashes remain unchanged; a future implementation must clean the comments in a
+new source revision and rebind its proofs.
+
+The layout proof's 'no numerical claim for negative scales' describes that BYTE
+roundtrip test only. The separate coefficient_proof.json establishes CPU equality
+for all4064finite pairs, including negative finite scales, signedzero and subnormals.
+Neither proves actual Hopper BF16-subnormal arithmetic, NaN payload semantics,
+full-FFN parity or serving behavior. NaN numerical admission remains disallowed
+until a separately reviewed owner/fallback contract exists.
+
+Decode's independent read found no omitted shared-scale call site: all three
+retain low-two-byte selection0x4140. The source is uncompiled and disabled.

@@ -1,0 +1,15 @@
+Fresh author negative evidence, separate from earlier source exclusions.
+https://github.com/sgl-project/sglang/pull/51386 is MERGED, not closed-unmerged.
+Merged Nov19 as981becd7afebb330891492bdff0ca8cd59f8b616.
+
+The author reports a PD bootstrap failure when prefill context parallelism rejects
+the MHA draft ring but decode enables it: the two roles register incompatible
+state entries. Heterogeneous TP can cause the same mismatch. The patch makes the
+ring defaultOFF and an unsupported explicit opt-in a launch error. Kimi cookbook
+commands opt in on compatible roles; Muse remains off by default.
+
+This is deployment/ownership evidence, not evidence that ring attention is
+numerically wrong or slower in an eligible homogeneous deployment. Our separate
+FA3 exclusion and cached-prefix/floor context difference still require their own
+proof; the new author report does not replace them. No ring is enabled here.
+Pinned merge patch and hash are in ring_default_off/.

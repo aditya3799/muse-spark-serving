@@ -1,0 +1,11 @@
+﻿{
+    "board":  "serving",
+    "metric":  "throughput at stock SGLang\u0027s interactivity, vs stock on the same node",
+    "rows":  [
+
+             ],
+    "stock":  {
+
+              },
+    "hidden":  true
+}

@@ -1,0 +1,195 @@
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_humming_split.py b/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
+--- a/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
++++ b/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
+@@ -79,7 +79,7 @@
+                          *, retain=False, defer_downscale=False):
+     from humming.layer import HummingMethod
+     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+-    from sglang.kernels.ops.activation.activation import silu_and_mul
++    from sglang.kernels.ops.moe.route_activation import scaled_prefill_activation
+     from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
+     def fallback():
+         return original_helper(layer,x,local_ids,torch,retain=retain,
+@@ -120,9 +120,8 @@
+             tuning_config=config,sorted_ids=sorted_ids,expert_ids=expert_ids,num_tokens_padded=padded,
+             valid_shape_m=valid,compute_config={'gemm_type':'indexed','use_f16_accum':False})
+     # Both up partitions are complete before scaling/activation or down-buffer reuse.
+-    scale_active_rows(cache1,local_ids,layer.w13_post_scale)
+     cache2 = torch.empty((m*topk,intermediate),device=x.device,dtype=x.dtype)
+-    silu_and_mul(cache1,cache2,expert_ids=local_ids.flatten(),expert_step=1)
++    scaled_prefill_activation(cache1, cache2, local_ids, layer.w13_post_scale)
+     cache3 = cache13[:m*topk*k].view(m*topk,k)
+     for name,ids in partitions:
+         config = plan[name]['w2']
+@@ -197,7 +196,7 @@
+                          *, retain=False, defer_downscale=False):
+     from humming.layer import HummingMethod
+     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+-    from sglang.kernels.ops.activation.activation import silu_and_mul
++    from sglang.kernels.ops.moe.route_activation import scaled_prefill_activation
+     from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
+     def fallback():
+         return original_helper(layer,x,local_ids,torch,retain=retain,
+@@ -238,9 +237,8 @@
+             tuning_config=config,sorted_ids=sorted_ids,expert_ids=expert_ids,num_tokens_padded=padded,
+             valid_shape_m=valid,compute_config={'gemm_type':'indexed','use_f16_accum':False})
+     # Both up partitions are complete before scaling/activation or down-buffer reuse.
+-    scale_active_rows(cache1,local_ids,layer.w13_post_scale)
+     cache2 = torch.empty((m*topk,intermediate),device=x.device,dtype=x.dtype)
+-    silu_and_mul(cache1,cache2,expert_ids=local_ids.flatten(),expert_step=1)
++    scaled_prefill_activation(cache1, cache2, local_ids, layer.w13_post_scale)
+     cache3 = cache13[:m*topk*k].view(m*topk,k)
+     for name,ids in partitions:
+         config = plan[name]['w2']
+diff --git a/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py b/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
+--- a/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
++++ b/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
+@@ -282,7 +282,7 @@
+ The caller applies the original per-expert norm and weighted finalization."""
+     from humming.layer import HummingMethod
+     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+-    from sglang.kernels.ops.activation.activation import silu_and_mul
++    from sglang.kernels.ops.moe.route_activation import scaled_prefill_activation
+     from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
+     configs = layer.fp32_configs
+     valid = local_ids.numel()
+@@ -299,9 +299,8 @@
+     HummingMethod.forward_layer(layer, inputs=x, outputs=cache1, top_k=topk, sublayer_name='w13', tuning_config=selected['w13'], **common)
+     # GEMM output has already rounded to BF16. Apply the BF16 global scale
+     # in a separate BF16 operation, preserving Marlin's second rounding.
+-    scale_active_rows(cache1, local_ids, layer.w13_post_scale)
+     cache2 = torch.empty((m * topk, i), device=x.device, dtype=x.dtype)
+-    silu_and_mul(cache1, cache2, expert_ids=local_ids.flatten(), expert_step=1)
++    scaled_prefill_activation(cache1, cache2, local_ids, layer.w13_post_scale)
+     cache3 = cache13[:m * topk * k].view(m * topk, k)
+     if selected['w2']['block_shape'][0] != block:
+         second = moe_align_block_size(local_ids, selected['w2']['block_shape'][0], layer.w2_post_scale.numel(), ignore_invalid_expert=True)
+diff --git a/python/sglang/kernels/jit/csrc/elementwise/route_activation.cuh b/python/sglang/kernels/jit/csrc/elementwise/route_activation.cuh
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/kernels/jit/csrc/elementwise/route_activation.cuh
+@@ -0,0 +1,83 @@
++#include "elementwise/activation.cuh"
++
++namespace sglang {
++struct RouteActivationParams {
++  const void* input;
++  void* output;
++  const void* scales;
++  const int32_t* ids;
++  uint32_t rows;
++  uint32_t experts;
++};
++
++// Match the scored Triton BF16 scaling boundary even with fast-math activation.
++SGL_DEVICE float route_scale_product(float value, float scale) {
++  float result;
++  asm("mul.rn.f32 %0, %1, %2;" : "=f"(result) : "f"(value), "f"(scale));
++  return result;
++}
++
++template <typename T, bool kUsePDL, uint32_t kGroup>
++__global__ void route_scaled_activation(const __grid_constant__ RouteActivationParams p) {
++  using namespace device;
++  constexpr uint32_t kValues = kMaxVecBytes / sizeof(T);
++  constexpr uint32_t kVectors = 4096 / kValues;
++  constexpr uint32_t kThreads = 256;
++  using vec_t = AlignedVector<T, kValues>;
++  const uint32_t base_row = blockIdx.x * kGroup;
++  const uint32_t lane = threadIdx.x % 32;
++  PDLWaitPrimary<kUsePDL>();
++  const int expert = lane < kGroup && base_row + lane < p.rows ? p.ids[base_row + lane] : -1;
++  uint32_t active = __ballot_sync(0xffffffffu, expert >= 0 && uint32_t(expert) < p.experts);
++  // Each warp visits the same live rows. No CTA synchronization or CPU count read.
++  while (active) {
++    const int slot = __ffs(active) - 1;
++    const int selected = __shfl_sync(0xffffffffu, expert, slot);
++    const float scale = device::cast<fp32_t>(static_cast<const T*>(p.scales)[selected]);
++    const uint32_t row = base_row + slot;
++#pragma unroll
++    for (uint32_t vector = threadIdx.x; vector < kVectors; vector += kThreads) {
++      const uint32_t offset = row * (2 * kVectors) + vector;
++      const vec_t gate = device::load_as<vec_t>(p.input, offset);
++      const vec_t up = device::load_as<vec_t>(p.input, offset + kVectors);
++      vec_t result;
++#pragma unroll
++      for (uint32_t i=0; i<kValues; ++i) {
++        const T rounded_gate = device::cast<T>(route_scale_product(device::cast<fp32_t>(gate[i]), scale));
++        const T rounded_up = device::cast<T>(route_scale_product(device::cast<fp32_t>(up[i]), scale));
++        const float activation = apply_activation_f32<ActivationKind::kSiLU>(device::cast<fp32_t>(rounded_gate));
++        result[i] = device::cast<T>(activation * device::cast<fp32_t>(rounded_up));
++      }
++      device::store_as<vec_t>(p.output, result, row * kVectors + vector);
++    }
++    active &= active - 1;
++  }
++  PDLTriggerSecondary<kUsePDL>();
++}
++
++template <typename T, bool kUsePDL, uint32_t kGroup>
++struct RouteActivationKernel {
++  static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output,
++                  tvm::ffi::TensorView ids, tvm::ffi::TensorView scales) {
++    using namespace host;
++    static_assert(kGroup > 0 && kGroup <= 32);
++    auto rows = SymbolicSize{"rows"};
++    auto experts = SymbolicSize{"experts"};
++    auto device_ = SymbolicDevice{};
++    device_.set_options<kDLCUDA>();
++    TensorMatcher({rows, 8192}).with_dtype<T>().with_device(device_).verify(input);
++    TensorMatcher({rows, 4096}).with_dtype<T>().with_device(device_).verify(output);
++    TensorMatcher({rows}).with_dtype<int32_t>().with_device(device_).verify(ids);
++    TensorMatcher({experts}).with_dtype<T>().with_device(device_).verify(scales);
++    constexpr uint32_t kVectors = 4096 / (device::kMaxVecBytes / sizeof(T));
++    RuntimeCheck(rows.unwrap() <= std::numeric_limits<uint32_t>::max() / (2 * kVectors), "row offsets overflow");
++    RuntimeCheck(experts.unwrap() > 0, "invalid expert count");
++    if (rows.unwrap() == 0) return;
++    const RouteActivationParams params{input.data_ptr(), output.data_ptr(), scales.data_ptr(),
++      static_cast<const int32_t*>(ids.data_ptr()), static_cast<uint32_t>(rows.unwrap()),
++      static_cast<uint32_t>(experts.unwrap())};
++    LaunchKernel(div_ceil(params.rows, kGroup), 256u, device_.unwrap())
++      .enable_pdl(kUsePDL)(route_scaled_activation<T, kUsePDL, kGroup>, params);
++  }
++};
++}  // namespace sglang
+diff --git a/python/sglang/kernels/ops/moe/route_activation.py b/python/sglang/kernels/ops/moe/route_activation.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/route_activation.py
+@@ -0,0 +1,36 @@
++from pathlib import Path
++
++import torch
++
++from sglang.kernels.jit.utils import cache_once, get_activation_cuda_cflags, is_arch_support_pdl, load_jit, make_cpp_args
++from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
++
++
++@cache_once
++def route_activation_module():
++    args = make_cpp_args(torch.bfloat16, is_arch_support_pdl())
++    return load_jit(
++        "muse_route_scaled_activation", *args,
++        cuda_files=["elementwise/route_activation.cuh"],
++        extra_cuda_cflags=get_activation_cuda_cflags(),
++        extra_include_paths=[str(KERNEL_PATH / "csrc")],
++        cuda_wrappers=[("run", f"RouteActivationKernel<{args}, 8>::run")],
++    )
++
++
++def scaled_prefill_activation(x, out, ids, scales):
++    if (
++        ids.ndim == 2 and ids.shape[0] >= 512 and ids.shape[1] == 8
++        and x.ndim == 2 and out.ndim == 2 and x.shape == (ids.numel(), 8192)
++        and out.shape == (ids.numel(), 4096) and scales.ndim == 1 and scales.numel() > 0
++        and x.is_cuda and x.device == out.device == ids.device == scales.device
++        and x.dtype == out.dtype == scales.dtype == torch.bfloat16 and ids.dtype == torch.int32
++        and x.is_contiguous() and out.is_contiguous() and ids.is_contiguous() and scales.is_contiguous()
++        and ids.numel() <= 2**32 // 1024 - 1
++    ):
++        route_activation_module().run(x, out, ids.view(-1), scales)
++    else:
++        from sglang.kernels.ops.activation.activation import silu_and_mul
++        from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
++        scale_active_rows(x, ids, scales)
++        silu_and_mul(x, out, expert_ids=ids.flatten(), expert_step=1)

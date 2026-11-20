@@ -1,0 +1,9 @@
+Upload 14_kaggle_cache_replication.ipynb to Kaggle.
+Select GPU T4, keep all defaults and Run All. Only GPU 0 is used.
+No Internet, package installations, datasets or weights required.
+Download v4_cache_choice_*.zip into D:\OpenKernelChallenge\serving\profiling_kaggle\notebook14_results.
+The original ZIP prefix is intentional: this repeats the exact Notebook 11 executable cells on Kaggle.
+Export even if a gate fails and return the whole ZIP. Stop the GPU session afterward.
+
+Expected: 48 benchmark cases, 288 timing rows, 3,168 raw samples, 2,592 changed-input output checks and 288 comparisons.
+Prior timing results were Colab T4; this run measures matched baseline/candidate performance on the current Kaggle stack. Compare within-run ratios, not raw cross-provider latency. Active V4 remains unchanged; no full-serving/H200 claim.

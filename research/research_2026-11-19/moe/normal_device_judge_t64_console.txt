@@ -1,0 +1,25 @@
+{'optimization': 'O2 frontend/O3 ptxas', 'returncode': 0, 'seconds': 42.04887850599998, 'peak_rss_kib': 4167760, 'headers_commit': 'f3fde58372d33e9a5650ba7b80fc48b3b49d40c8', 'bytes': 254976, 'sha256': '15fb735c4651b819e818bd8c0a3ced09294fe54626c341e680d8b94d1f6199a0'}
+
+	Command being timed: "timeout 180 /home/aditya/.venvs/okc-marlin-tiles/bin/python -u research_2026-11-19/moe/build_device_normal.py"
+	User time (seconds): 35.14
+	System time (seconds): 3.49
+	Percent of CPU this job got: 84%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:45.62
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 4167760
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 10160
+	Minor (reclaiming a frame) page faults: 587625
+	Voluntary context switches: 32255
+	Involuntary context switches: 102
+	Swaps: 0
+	File system inputs: 387440
+	File system outputs: 258928
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

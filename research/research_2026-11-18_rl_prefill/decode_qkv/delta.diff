@@ -1,0 +1,210 @@
+diff --git a/python/sglang/srt/models/muse_spark.py b/python/sglang/srt/models/muse_spark.py
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -429,7 +429,21 @@
+             and (self.rotary_emb is None or fuse_rope)
+             else None
+         )
+-        if fuse_rope:
++        fa3_store = None
++        if (kv_store is None and self._fused_qk_norm is not None
++                and not get_memory().enable_unified_memory
++                and (forward_batch.forward_mode.is_decode() or forward_batch.forward_mode.is_target_verify())):
++            get_write = getattr(get_attn_backend(), "muse_fp8_write_buffers", None)
++            if get_write is not None:
++                rope_pos = positions if fuse_rope else None
++                rope_cache = self.rotary_emb.cos_sin_cache if fuse_rope else None
++                if self._fused_qk_norm.can_fuse_fa3(qkv, rope_pos, rope_cache):
++                    fa3_store = get_write(self.attn, forward_batch)
++                    if fa3_store is not None and fa3_store[2].numel() != qkv.shape[0]:
++                        fa3_store = None
++        if fa3_store is not None:
++            q, k = self._fused_qk_norm._forward_triton(qkv, rope_pos, rope_cache, fa3_store)
++        elif fuse_rope:
+             q, k = self._fused_qk_norm(
+                 qkv, positions, self.rotary_emb.cos_sin_cache, kv_store=kv_store
+             )
+@@ -437,7 +451,7 @@
+             q, k = self._fused_qk_norm(qkv, kv_store=kv_store)
+         if self.rotary_emb is not None and not fuse_rope:
+             q, k = self.rotary_emb(positions, q, k)
+-        output = self.attn(q, k, v, forward_batch, save_kv_cache=kv_store is None)
++        output = self.attn(q, k, v, forward_batch, save_kv_cache=kv_store is None and fa3_store is None)
+         output = self._fused_o_norm_gate(output, o_gate)
+         output, _ = self.o_proj(output)
+         return output
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -209,6 +209,17 @@
+         # only; draft-side instances must not allocate it.
+         self.is_draft_runner = model_runner.is_draft_worker
+ 
++        self._muse_cast_map = None
++        if (fa_impl_ver == 3 and not self.is_draft_runner
++                and self.kv_cache_dtype == torch.float8_e4m3fn
++                and self.kv_cache_dtype_str != "auto"
++                and getattr(model_runner.model_config.hf_config, "model_type", None)
++                    in ("muse_spark", "muse_spark_text")):
++            # Construct before graph capture with the same running device and
++            # torch conversion as the normal FA3 cache writer, including NaNs.
++            bits = torch.arange(65536, device=self.device, dtype=torch.int32).to(torch.int16)
++            self._muse_cast_map = bits.view(torch.bfloat16).to(self.kv_cache_dtype).view(torch.uint8)
++
+         self.use_sliding_window_kv_pool = (
+             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
+             and model_runner.token_to_kv_pool.swa_layer_nums > 0
+@@ -1475,10 +1486,29 @@
+             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+         return q, q_rope, k_rope, k_descale, v_descale
+ 
++    def muse_fp8_write_buffers(self, layer, forward_batch):
++        if (self._muse_cast_map is None or self.topk > 1
++                or layer.k_scale is not None or layer.v_scale is not None
++                or layer.head_dim > 256 or self.kv_cache_is_mxfp8):
++            return None
++        result = self._mha_fused_write_buffers(layer, forward_batch)
++        if result is None:
++            return None
++        k, v, loc = result
++        if (k.dtype != self.kv_cache_dtype or v.dtype != k.dtype
++                or not k.is_contiguous() or not v.is_contiguous()
++                or loc.ndim != 1 or not loc.is_contiguous()):
++            return None
++        return (k.view(k.shape[0], -1), v.view(v.shape[0], -1), loc, self._muse_cast_map)
++
+     def get_fused_kv_write_buffers(self, layer, forward_batch):
++        if self.kv_cache_dtype != torch.bfloat16:
++            return None
++        return self._mha_fused_write_buffers(layer, forward_batch)
++
++    def _mha_fused_write_buffers(self, layer, forward_batch):
+         if (
+-            self.kv_cache_dtype != torch.bfloat16
+-            or self.use_mla
++            self.use_mla
+             or layer.is_cross_attention
+             or self.kv_index_translator.is_translating
+             or self._kv_shard_pool is not None
+diff --git a/python/sglang/kernels/ops/attention/muse_spark_qk_norm_rope_store.py b/python/sglang/kernels/ops/attention/muse_spark_qk_norm_rope_store.py
+--- a/python/sglang/kernels/ops/attention/muse_spark_qk_norm_rope_store.py
++++ b/python/sglang/kernels/ops/attention/muse_spark_qk_norm_rope_store.py
+@@ -37,6 +37,7 @@
+     K_CACHE,  # [N, NUM_KV_HEADS * D] BF16/FP8 pool; written when HAS_KV_STORE
+     V_CACHE,  # [N, NUM_KV_HEADS * D]
+     CACHE_LOC,  # [T] pool row per token
++    CAST_MAP,  # [65536] device Torch BF16 -> E4M3FN byte map for FA3
+     eps,
+     stride_qkv,  # row stride of QKV, in elements
+     n_rows,  # T * (NUM_Q_HEADS + NUM_KV_HEADS [+ NUM_KV_HEADS for V])
+@@ -49,6 +50,7 @@
+     HAS_ROPE: tl.constexpr,
+     HAS_KV_STORE: tl.constexpr,
+     FP8_KV_STORE: tl.constexpr,
++    FA3_BYTE_STORE: tl.constexpr = False,
+     USE_PDL: tl.constexpr = False,
+     FP8_MAX: tl.constexpr = FP8_E4M3_MAX,
+ ):
+@@ -106,23 +108,41 @@
+         x = x.to(QKV.dtype.element_ty).to(tl.float32)
+     if HAS_KV_STORE:
+         x = tl.where(is_v[:, None], raw.to(tl.float32), x)
+-        if FP8_KV_STORE:
++        if FA3_BYTE_STORE:
++            bf = tl.where(is_v[:, None], raw, x.to(tl.bfloat16))
++            pattern = bf.to(tl.uint16, bitcast=True).to(tl.int32)
++            encoded = tl.load(CAST_MAP + pattern)
++        elif FP8_KV_STORE:
+             x = tl.minimum(tl.maximum(x, -FP8_MAX), FP8_MAX)
+         loc = tl.load(CACHE_LOC + token, mask=row_mask, other=0).to(tl.int64)
++        if FA3_BYTE_STORE:
++            # Match store_cache's invalid physical slot failure and skip slot zero.
++            bad = (row_mask & ((loc < 0) | (loc >= kv_capacity))).to(tl.int32)
++            tl.inline_asm_elementwise(
++                "{ .reg .pred p; setp.ne.s32 p, $1, 0; @p trap; mov.b32 $0, $1; }",
++                constraints="=r,r", args=[bad], dtype=tl.int32, is_pure=False, pack=1,
++            )
+         # Slot zero is reserved for CUDA-graph padding.
+         kv_mask = mask & (loc != 0)[:, None]
+         kv_head = tl.where(is_v, head - NUM_Q_HEADS - NUM_KV_HEADS, head - NUM_Q_HEADS)
+         kv_dst = loc * (NUM_KV_HEADS * D) + kv_head * D
++        if FA3_BYTE_STORE:
++            cache_x = encoded
++        else:
++            cache_x = x
+         tl.store(
+-            K_CACHE + kv_dst[:, None] + cols[None, :], x, mask=kv_mask & is_k[:, None]
++            K_CACHE + kv_dst[:, None] + cols[None, :], cache_x, mask=kv_mask & is_k[:, None]
+         )
+         tl.store(
+-            V_CACHE + kv_dst[:, None] + cols[None, :], x, mask=kv_mask & is_v[:, None]
++            V_CACHE + kv_dst[:, None] + cols[None, :], cache_x, mask=kv_mask & is_v[:, None]
+         )
+ 
+     q_dst = tl.where(is_q, (token * NUM_Q_HEADS + head) * D, 0)
+     k_dst = tl.where(is_k, (token * NUM_KV_HEADS + head - NUM_Q_HEADS) * D, 0)
+-    tl.store(Q_OUT + q_dst[:, None] + cols[None, :], x, mask=mask & is_q[:, None])
++    if FA3_BYTE_STORE:
++        tl.store(Q_OUT + q_dst[:, None] + cols[None, :], encoded, mask=mask & is_q[:, None])
++    else:
++        tl.store(Q_OUT + q_dst[:, None] + cols[None, :], x, mask=mask & is_q[:, None])
+     tl.store(K_OUT + k_dst[:, None] + cols[None, :], x, mask=mask & is_k[:, None])
+ 
+ 
+@@ -300,6 +320,16 @@
+             and self._head_dim % 2 == 0
+         )
+ 
++    def can_fuse_fa3(self, qkv, positions, cos_sin_cache):
++        from sglang.kernels.fused_op import get_fused_op_backend
++        return (
++            not self.is_torch_compile and qkv.dtype == torch.bfloat16
++            and qkv.is_cuda and not torch.version.hip
++            and get_fused_op_backend() in (None, KernelBackend.TRITON)
++            and self.auto_selected_backend() == KernelBackend.TRITON
++            and self.backend_eligible(KernelBackend.TRITON, qkv, positions, cos_sin_cache)
++        )
++
+     def forward_triton(
+         self,
+         qkv: torch.Tensor,
+@@ -330,6 +360,7 @@
+         k_out = torch.empty(
+             tokens, self._num_kv_heads * d, dtype=qkv.dtype, device=qkv.device
+         )
++        fa3_bytes = kv_store is not None and len(kv_store) == 4
+         has_kv = kv_store is not None
+         heads = self._num_q_heads + self._num_kv_heads * (2 if has_kv else 1)
+         n_rows = tokens * heads
+@@ -339,18 +370,19 @@
+         if has_rope:
+             assert cos_sin_cache.is_contiguous() and positions.is_contiguous()
+         if has_kv:
+-            k_cache, v_cache, cache_loc = kv_store
++            k_cache, v_cache, cache_loc = kv_store[:3]
+             assert k_cache.is_contiguous() and v_cache.is_contiguous()
+             cache_loc = cache_loc.contiguous()
+         _qk_rms_norm_fwd_kernel[(triton.cdiv(n_rows, block_m),)](
+             qkv,
+-            q_out,
++            q_out.view(torch.uint8) if fa3_bytes else q_out,
+             k_out,
+             positions if has_rope else qkv,
+             cos_sin_cache if has_rope else qkv,
+-            k_cache if has_kv else qkv,
+-            v_cache if has_kv else qkv,
++            k_cache.view(torch.uint8) if fa3_bytes else (k_cache if has_kv else qkv),
++            v_cache.view(torch.uint8) if fa3_bytes else (v_cache if has_kv else qkv),
+             cache_loc if has_kv else qkv,
++            kv_store[3] if fa3_bytes else qkv,
+             self._eps,
+             qkv.stride(0),
+             n_rows,
+@@ -363,6 +395,7 @@
+             HAS_ROPE=has_rope,
+             HAS_KV_STORE=has_kv,
+             FP8_KV_STORE=fp8_kv,
++            FA3_BYTE_STORE=fa3_bytes,
+             num_warps=num_warps,
+             **pdl,
+         )

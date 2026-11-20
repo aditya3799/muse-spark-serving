@@ -1,0 +1,27 @@
+--- a/python/sglang/srt/speculative/dflash_projection_row.py
++++ b/python/sglang/srt/speculative/dflash_projection_row.py
+@@ -82,7 +82,12 @@
+     m,k=x.shape;n=w.shape[0]
+     handle=lib.make_row_plan(m,m//world,n,k,1,bytes_,16)
+     if not handle:return None,{'reason':'no legal parent/local plan'}
+-    plan=RowPlan(lib,handle,world,x,w,bytes_)
++    try:
++        plan=RowPlan(lib,handle,world,x,w,bytes_)
++    except Exception:
++        # Ownership transfers only after the Python constructor completes.
++        lib.row_plan_destroy(handle)
++        raise
+     props=torch.cuda.get_device_properties(x.device)
+     metadata=dict(backend=backend,workspace_bytes=bytes_,shape=[m,n,k],world=world,tried=[],
+                   torch=str(torch.__version__),cuda_runtime=torch.version.cuda,device=props.name,
+@@ -150,8 +155,8 @@
+         if any(error is not None for error in failures):
+             if plan is not None:plan.close()
+             raise RuntimeError('DFlash row qualification aborted: '+repr(failures))
+-        # Even an unexpected local discovery failure joins this CPU collective.
+-        # Peers therefore fall back together instead of entering a GPU gather.
++        # Fatal discovery errors were voted above and abort every rank.
++        # Recoverable allocation/plan rejection reaches coherent acceptance.
+         accepted=torch.tensor(int(plan is not None),dtype=torch.int32)
+         dist.all_reduce(accepted,op=dist.ReduceOp.MIN,group=self.group.cpu_group)
+         if not int(accepted):

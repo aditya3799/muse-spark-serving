@@ -1,0 +1,49 @@
+--- a/python/sglang/kernels/ops/moe/moe_wna16_marlin.py
++++ b/python/sglang/kernels/ops/moe/moe_wna16_marlin.py
+@@ -82,6 +82,7 @@
+     expert_ids_are_sorted: bool = False,
+     zero_inactive_output: bool = False,
+     has_inactive_prefix_count: bool = False,
++    allow_sorted_ep: bool = False,
+ ) -> torch.Tensor:
+     """Project routes, preserving inactive rows in a caller-provided output.
+ 
+@@ -91,11 +92,16 @@
+     ``expert_ids_are_sorted`` certifies ascending block expert IDs within the
+     padded token count, with any -1 blocks first. Unused tail entries are ignored.
+     Leave it false after remapping that can produce scattered inactive blocks.
+-    The sorted specialization is only used without expert parallelism.
++    The sorted specialization is used without EP by default. With EP,
++    allow_sorted_ep additionally certifies already-local ascending IDs,
++    inactive blocks first, and no subsequent expert remapping.
++    Uncertified EP callers keep the generic path.
+     ``has_inactive_prefix_count`` additionally certifies that a supporting
+     producer wrote an aligned int32 pair ``[padded_tokens, inactive_blocks]``
+     for these tables and this block size. It is ignored outside sorted non-EP.
+     """
++    if allow_sorted_ep and not (is_ep and expert_ids_are_sorted):
++        raise ValueError('Sorted EP requires explicit EP and sorted-local-ID contracts')
+     device = a.device
+ 
+     # Allocate output if not provided
+@@ -168,7 +174,7 @@
+         a.dtype,
+         is_ep,
+         has_bias,
+-        expert_ids_are_sorted and not is_ep,
++        expert_ids_are_sorted and (not is_ep or allow_sorted_ep),
+         zero_inactive_output,
+         has_inactive_prefix_count and expert_ids_are_sorted and not is_ep,
+     )
+--- a/python/sglang/kernels/jit/csrc/gemm/marlin_moe/moe_wna16_marlin.cuh
++++ b/python/sglang/kernels/jit/csrc/gemm/marlin_moe/moe_wna16_marlin.cuh
+@@ -922,7 +922,8 @@
+     bool is_zp_float) {
+   using namespace host;
+ 
+-  static_assert(!kIsEP || !kExpertIdsAreSorted, "Sorted block IDs are specialized only without EP");
++  // Sorted EP is valid for caller-certified local IDs with no later remapping.
++  // Preserve kIsEP=true and the runtime specialization consistency check below.
+   static_assert(!kHasInactivePrefixCount || (kExpertIdsAreSorted && !kIsEP));
+   RuntimeCheck(is_ep == kIsEP, "is_ep does not match the compiled Marlin MoE specialization");
+   RuntimeCheck(has_bias == kHasBias, "has_bias does not match the compiled Marlin MoE specialization");

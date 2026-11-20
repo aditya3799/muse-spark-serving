@@ -1,0 +1,11 @@
+Round2 Hopper/MoE lane complete; hardware/compiler released.
+
+No submission, remote check, paid resources or active/scored patch edits. The2.5x serving target is unachieved; no H200 execution occurred.
+
+Best local result: selectiveM2 at actualSM86 M32 heavy policy, legal unique-top8 routes. W13-stage skew improves1.62-1.78x; uniform~1.00x. Aux full-helper composition passes135checks and yields1.36-1.43x on hot fixtures, uniform~0.998x, but empty-rank adds4.2-6.1us. These are synthetic localSM86 component results, not serving/H200 speedups.
+
+Corrected native virtual/M2 and wait1 candidates compile without spills. Wait1 source+actualSASS have independent lifetime/CFG audits, but no hardware runtime proof. NativeWM48 is a different-opcode falsification candidate. HeavyBM128 cap compiles243regs/no spills; BM144 still spills. Matched controls establishBM160/176 spills pre-exist in canonical kernels, not a fusion-specific regression.
+
+Old virtual H200 gate remainsHOLD_WRITER_OWNERSHIP_BUG. New h200_corrected_gate.py prepares11pinned source/cubin pairs and refuses other devices; CPU290contract+770tensor metadata checks pass. It has never been executed onH200. ReadH200_CORRECTED_GATE_CPU_AUDIT.json for exact future commands.
+
+ReadROUND2_CHECKPOINT.json for evidence tiers, artifact hashes, limits and next steps. All receipts preserved.

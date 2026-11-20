@@ -1,0 +1,48 @@
+--- active_v4/muse_spark.py
++++ candidate/muse_spark.py
+@@ -53,6 +53,8 @@
+ from sglang.srt.layers.communication.muse_spark_gemm_ag import (
+     gemm_ag,
+     gemm_local,
++    prefill_row_projection,
++    prefill_row_projection_supported,
+     reserve_projection_workspace,
+ )
+ from sglang.srt.layers.cp.utils import is_cp_active
+@@ -737,8 +739,23 @@
+                 if self._defers_unpool_gather(comm, output.shape[0]):
+                     return gemm_local(comm, output, self.post_expert_proj.weight)
+                 return gemm_ag(comm, output, self.post_expert_proj.weight)
++            if self._can_shard_prefill_row_projection(output, self.post_expert_proj.weight):
++                return prefill_row_projection(
++                    get_parallel().tp_group, output, self.post_expert_proj.weight
++                )
+             output = bf16_gemm_dispatch(output, self.post_expert_proj.weight, None)
+         return output
++
++    def _can_shard_prefill_row_projection(self, x, weight) -> bool:
++        parallel = get_parallel()
++        return (
++            getattr(self.experts, "use_marlin", False)
++            and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
++            and not getattr(get_forward(), "sp_active", False)
++            and parallel.attn_dp_size == 1
++            and parallel.attn_cp_size == 1
++            and prefill_row_projection_supported(parallel.tp_group, x, weight)
++        )
+ 
+     def _defers_unpool_gather(self, comm, num_tokens: int) -> bool:
+         boundary = self.unpool_gather_boundary
+@@ -817,6 +834,12 @@
+                 and gemm_ag_supported(comm, hidden_states, self.pre_expert_proj.weight)
+             ):
+                 expert_input = gemm_ag(comm, hidden_states, self.pre_expert_proj.weight)
++            elif self._can_shard_prefill_row_projection(
++                hidden_states, self.pre_expert_proj.weight
++            ):
++                expert_input = prefill_row_projection(
++                    get_parallel().tp_group, hidden_states, self.pre_expert_proj.weight
++                )
+             else:
+                 expert_input = bf16_gemm_dispatch(
+                     hidden_states, self.pre_expert_proj.weight, None

@@ -1,0 +1,274 @@
+diff --git a/python/sglang/srt/arg_groups/layernorm_sp_hook.py b/python/sglang/srt/arg_groups/layernorm_sp_hook.py
+--- a/python/sglang/srt/arg_groups/layernorm_sp_hook.py
++++ b/python/sglang/srt/arg_groups/layernorm_sp_hook.py
+@@ -98,6 +98,9 @@
+             )
+             return
+ 
++        if cfg.moe_runner_backend == "humming":
++            return
++
+         if envs.SGLANG_MOE_NVFP4_DISPATCH.get():
+             raise ValueError(
+                 "Muse Spark --enable-layernorm-sp requires "
+@@ -159,12 +162,16 @@
+                     "Muse MegaMoE prefill requires --moe-a2a-backend none or flashinfer; "
+                     "MegaMoE performs its own dispatch/combine and decode uses all-reduce."
+                 )
++        elif moe_runner_backend == "humming":
++            if moe_a2a_backend != "none":
++                raise ValueError("Muse Humming SP uses replicated packed experts and requires --moe-a2a-backend none.")
+         elif moe_a2a_backend != "flashinfer":
+             raise ValueError(
+                 "Muse Spark --enable-layernorm-sp requires "
+                 "--moe-a2a-backend flashinfer."
+             )
+-        if moe_runner_backend != "flashinfer_trtllm":
++        if (moe_runner_backend != "flashinfer_trtllm"
++                and (enable_megamoe_for_layernorm_sp or moe_runner_backend != "humming")):
+             raise ValueError(
+                 "Muse Spark --enable-layernorm-sp requires "
+                 "--moe-runner-backend flashinfer_trtllm."
+diff --git a/python/sglang/srt/runtime_context.py b/python/sglang/srt/runtime_context.py
+--- a/python/sglang/srt/runtime_context.py
++++ b/python/sglang/srt/runtime_context.py
+@@ -616,6 +616,7 @@
+     config). See ``layers.layernorm_sp``."""
+ 
+     enabled: bool = False
++    replicated_muse_experts: bool = False
+ 
+ 
+ class Flags(_FlagGroupBase):
+diff --git a/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py b/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
+--- a/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
++++ b/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
+@@ -103,12 +103,12 @@
+     """
+     m_local = x.shape[0] // group.world_size
+     start = group.rank_in_group * m_local
+-    local_fp32 = torch.mm(
+-        x[start : start + m_local], weight.t(), out_dtype=torch.float32
+-    )
+-    local = local_fp32.to(x.dtype)
+-    del local_fp32
+-    return group.all_gather(local, dim=0)
++    return group.all_gather(local_prefill_projection(x[start : start + m_local], weight), dim=0)
++
++
++def local_prefill_projection(rows, weight):
++    """One complete row shard with the parent full-K accumulation and BF16 boundary."""
++    return torch.mm(rows, weight.t(), out_dtype=torch.float32).to(rows.dtype)
+ 
+ 
+ def small_projection_supported(group, x, weight) -> bool:
+diff --git a/python/sglang/srt/layers/layernorm_sp.py b/python/sglang/srt/layers/layernorm_sp.py
+--- a/python/sglang/srt/layers/layernorm_sp.py
++++ b/python/sglang/srt/layers/layernorm_sp.py
+@@ -68,12 +68,34 @@
+         and architectures[0] in SP_SUPPORTED_ARCHITECTURES
+     )
+ 
++    from sglang.srt.environ import envs
++    from sglang.srt.runtime_context import get_exec
++
++    # The scheduler has published the config here. initialize_moe_config() seeds
++    # the backend object later, so consult the resolved execution setting.
++    humming = (get_flags().sp.enabled and is_muse_spark_architecture(architectures[0])
++               and get_exec().moe.moe_runner_backend == "humming")
++    get_flags().sp.replicated_muse_experts = False
++    if not humming:
++        return
++    text_config = getattr(model_config, "hf_text_config", None)
++    widths = (getattr(text_config, "hidden_size", 0), getattr(text_config, "moe_hidden_size", 0))
++    get_flags().sp.replicated_muse_experts = bool(
++        all(w and w >= 1024 and w % 128 == 0 for w in widths)
++        and torch.cuda.is_available()
++        and torch.cuda.get_device_capability() == (9, 0)
++        and get_parallel().attn_cp_size == 1 and get_parallel().moe_dp_size == 1
++        and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
++    )
++    if not get_flags().sp.replicated_muse_experts:
++        get_flags().sp.enabled = False
++
+ 
+ def layernorm_sp_enabled() -> bool:
+     return get_flags().sp.enabled
+ 
+ 
+-def runs_sp(forward_mode) -> bool:
++def runs_sp(forward_mode, num_tokens=None, *, returned_rows=None) -> bool:
+     """Whether this forward runs SP: an enabled model, prefill only.
+ 
+     Code outside the CUDA-graph-captured region must use this and not
+@@ -82,7 +104,19 @@
+     """
+     from sglang.srt.model_executor.forward_batch_info import ForwardMode
+ 
+-    return layernorm_sp_enabled() and forward_mode == ForwardMode.EXTEND
++    if not layernorm_sp_enabled() or forward_mode != ForwardMode.EXTEND:
++        return False
++    if get_flags().sp.replicated_muse_experts:
++        # Match the existing Humming prefill-row projection eligibility.
++        world = get_parallel().tp_group.world_size
++        if returned_rows is not None:
++            # Full graphs invoke the eager tail with the raw count after running
++            # a padded body. The runner caps padding at 2x and Humming TP is 4/8.
++            if num_tokens is None or returned_rows >= num_tokens:
++                return False
++            num_tokens = returned_rows * world
++        return num_tokens is not None and num_tokens >= 512 and num_tokens % world == 0
++    return True
+ 
+ 
+ class _SPForwardState:
+@@ -156,7 +190,7 @@
+     and the predicate from ``runs_sp``, so this stays correct on CUDA graph
+     replay, where the writes made inside the captured region do not re-execute.
+     """
+-    if not runs_sp(forward_mode) or input_ids is None:
++    if input_ids is None or not runs_sp(forward_mode, input_ids.shape[0], returned_rows=hidden_states.shape[0]):
+         return hidden_states, hidden_states_before_norm
+     num_tokens = input_ids.shape[0]
+     hidden_states = sp_exit_gather(hidden_states, num_tokens=num_tokens)
+@@ -192,7 +226,8 @@
+     depends only on static layer properties and is identical across TP ranks.
+     """
+     if (
+-        not (_HAS_TORCH_SYMM_MEM_FUSED or getattr(linear, "_sp_use_cutlass", False))
++        getattr(linear, "_sp_use_native_linear", False)
++        or not (_HAS_TORCH_SYMM_MEM_FUSED or getattr(linear, "_sp_use_cutlass", False))
+         or linear.bias is not None
+     ):
+         return False
+diff --git a/python/sglang/srt/models/muse_spark.py b/python/sglang/srt/models/muse_spark.py
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -53,6 +53,7 @@
+ from sglang.srt.layers.communication.muse_spark_gemm_ag import (
+     gemm_ag,
+     gemm_local,
++    local_prefill_projection,
+     prefill_row_projection,
+     prefill_row_projection_supported,
+     reserve_projection_workspace,
+@@ -757,6 +758,8 @@
+                 if self._defers_unpool_gather(comm, output.shape[0]):
+                     return gemm_local(comm, output, self.post_expert_proj.weight)
+                 return gemm_ag(comm, output, self.post_expert_proj.weight)
++            if getattr(get_forward(), "sp_active", False) and getattr(self.experts, "use_humming", False):
++                return local_prefill_projection(output, self.post_expert_proj.weight)
+             if self._can_shard_prefill_row_projection(output, self.post_expert_proj.weight):
+                 return prefill_row_projection(
+                     get_parallel().tp_group, output, self.post_expert_proj.weight
+@@ -867,6 +870,8 @@
+                 and gemm_ag_supported(comm, hidden_states, self.pre_expert_proj.weight)
+             ):
+                 expert_input = gemm_ag(comm, hidden_states, self.pre_expert_proj.weight)
++            elif sp_active and getattr(self.experts, "use_humming", False):
++                expert_input = local_prefill_projection(hidden_states, self.pre_expert_proj.weight)
+             elif self._can_shard_prefill_row_projection(
+                 hidden_states, self.pre_expert_proj.weight
+             ):
+@@ -892,8 +897,12 @@
+             if use_side_stream
+             else contextlib.nullcontext()
+         ):
++            router_hidden = hidden_states
++            if sp_active and getattr(self.experts, "use_humming", False):
++                # Use exactly the scored M,K,N, weight layout and FP32 partials for routing.
++                router_hidden = get_parallel().tp_group.all_gather(hidden_states.contiguous(), dim=0)
+             router_logits = (
+-                self.gate.forward_split2(hidden_states)
++                self.gate.forward_split2(router_hidden)
+                 if use_split2
+                 else self.gate(router_input)
+             )
+@@ -916,7 +925,7 @@
+             # Capture on main after the router join, in full unpadded token order.
+             # SP experts below still consume the local ids.
+             capture_topk_ids = topk_ids
+-            if sp_active:
++            if sp_active and not getattr(self.experts, "use_humming", False):
+                 capture_topk_ids = layernorm_sp.sp_exit_gather(
+                     topk_ids, num_tokens=layernorm_sp.sp_num_tokens()
+                 )
+@@ -957,6 +966,16 @@
+         router_logits: torch.Tensor,
+     ) -> torch.Tensor:
+         """Return combined source-token shards, before the nonlinear FFN tail."""
++        if getattr(self.experts, "use_humming", False):
++            group = get_parallel().tp_group
++            global_input = group.all_gather(expert_input.contiguous(), dim=0)
++            partial = self.experts(
++                global_input, topk_scores, topk_ids, self.experts.post_expert_norm,
++                pre_expert_norm=self.pre_expert_norm,
++            )
++            local = torch.empty_like(expert_input)
++            group.reduce_scatter_tensor(local, partial.contiguous())
++            return local
+         if self.pre_expert_norm is not None:
+             expert_input = self.pre_expert_norm(expert_input)
+         if self.use_megamoe:
+@@ -1222,6 +1241,9 @@
+                     )
+                 for moe_layer in moe_layers:
+                     moe_layer.set_finalize_ar_workspace(self._finalize_ar_workspace)
++        replicated_experts = any(
++            getattr(layer.mlp.experts, "use_humming", False) for layer in self.layers if layer.is_moe_layer
++        )
+         if layernorm_sp.layernorm_sp_enabled():
+             # Scope CUTLASS collectives to Muse; leave the generic Qwen SP
+             # path unchanged. Decode never calls the SP participant hooks.
+@@ -1230,9 +1252,13 @@
+                 if not layer.is_moe_layer:
+                     linears.extend([layer.mlp.gate_up_proj, layer.mlp.down_proj])
+                 for linear in linears:
+-                    linear._sp_use_cutlass = True
++                    if replicated_experts:
++                        # Keep the same linear method on Hopper. The CUTLASS SP path requires SM100.
++                        linear._sp_use_native_linear = True
++                    else:
++                        linear._sp_use_cutlass = True
+             moe_layers = [layer.mlp for layer in self.layers if layer.is_moe_layer]
+-            if moe_layers and not getattr(
++            if moe_layers and not replicated_experts and not getattr(
+                 get_parallel(), "enable_megamoe_for_layernorm_sp", False
+             ):
+                 from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+@@ -1274,7 +1300,7 @@
+         )
+         if input_embeds is None and self.embed_norm is not None:
+             hidden_states = self.embed_norm(hidden_states)
+-        sp_active = layernorm_sp.runs_sp(forward_batch.forward_mode)
++        sp_active = layernorm_sp.runs_sp(forward_batch.forward_mode, hidden_states.shape[0])
+         get_forward().set("sp_active", sp_active)
+         if sp_active:
+             hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
+@@ -1364,15 +1390,13 @@
+         aux_hidden_states = None
+         if self.capture_aux_hidden_states:
+             hidden_states, aux_hidden_states = hidden_states
++        num_tokens = input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
+         if aux_hidden_states is not None and layernorm_sp.runs_sp(
+-            forward_batch.forward_mode
++            forward_batch.forward_mode, num_tokens, returned_rows=hidden_states.shape[0]
+         ):
+             # DFLASH consumes every prompt token in replicated token order.
+             # Gather the taps before logits pruning applies full-token indices;
+             # FULL capture also needs the entry-scatter padding removed.
+-            num_tokens = (
+-                input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
+-            )
+             # Pack while sequence-sharded so the logits processor does not
+             # duplicate the full replicated draft context with torch.cat.
+             # Release the tap list before allocating the gathered output.
+@@ -1387,7 +1411,7 @@
+         if (
+             input_ids is None
+             and input_embeds is not None
+-            and layernorm_sp.runs_sp(forward_batch.forward_mode)
++            and layernorm_sp.runs_sp(forward_batch.forward_mode, num_tokens, returned_rows=hidden_states.shape[0])
+         ):
+             hidden_states = layernorm_sp.sp_exit_gather(
+                 hidden_states, num_tokens=input_embeds.shape[0]

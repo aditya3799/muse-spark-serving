@@ -1,0 +1,242 @@
+diff --git a/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py b/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
+index be859b407bcee512bab1c8b21efe6a3f76079612..fd09430510c593e5e07de8a3ab10c25e58c3a759 100644
+--- a/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
++++ b/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
+@@ -69,3 +69,99 @@ def gemm_ag(
+     if out is None:
+         out = torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
+     return all_gather(comm, local, out, b, c)
++
++
++def prefill_row_projection_supported(group, x, weight) -> bool:
++    """A large replicated projection with equal contiguous token-row shards."""
++    if group is None or group.world_size not in (2, 4, 8):
++        return False
++    if not x.is_cuda or x.ndim != 2 or weight.ndim != 2:
++        return False
++    if x.dtype != torch.bfloat16 or weight.dtype != x.dtype:
++        return False
++    if weight.device != x.device or not weight.is_contiguous():
++        return False
++    m, k = x.shape
++    n = weight.shape[0]
++    return (
++        torch.cuda.get_device_capability(x.device) == (9, 0)
++        and m >= 512
++        and m % group.world_size == 0
++        and min(k, n) >= 1024
++        and k == weight.shape[1]
++        and k % 128 == 0
++        and n % 128 == 0
++    )
++
++
++def prefill_row_projection(group, x, weight):
++    """Compute full output rows once, then gather in original token order.
++
++    Input and weights must be replicated on the TP group. The complete K
++    reduction and full output dimension remain local, with FP32 output before
++    the single BF16 rounding. No persistent repacked weight or padding exists.
++    """
++    m_local = x.shape[0] // group.world_size
++    start = group.rank_in_group * m_local
++    local_fp32 = torch.mm(
++        x[start : start + m_local], weight.t(), out_dtype=torch.float32
++    )
++    local = local_fp32.to(x.dtype)
++    del local_fp32
++    return group.all_gather(local, dim=0)
++
++
++def small_projection_supported(group, x, weight) -> bool:
++    """Hopper column shards through an already-reserved multicast workspace."""
++    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
++        CustomAllReduceV2,
++    )
++
++    if group is None or group.world_size not in (2, 4, 8):
++        return False
++    comm = group.ca_comm
++    if (
++        not isinstance(comm, CustomAllReduceV2)
++        or comm.disabled
++        or not comm.has_multicast
++        or comm.world_size != group.world_size
++    ):
++        return False
++    if not x.is_cuda or x.ndim != 2 or weight.ndim != 2:
++        return False
++    if x.dtype != torch.bfloat16 or weight.dtype != x.dtype:
++        return False
++    if weight.device != x.device or not weight.is_contiguous():
++        return False
++    m, k = x.shape
++    n = weight.shape[0]
++    return (
++        torch.cuda.get_device_capability(x.device) == (9, 0)
++        and 1 <= m < 512
++        and min(k, n) >= 1024
++        and k == weight.shape[1]
++        and k % 128 == 0
++        and n % (128 * group.world_size) == 0
++        and m * n * 2 <= comm.max_push_size
++        and comm.config.num_push_blocks >= 2
++    )
++
++
++def small_projection_local(comm, x, weight):
++    """Complete K reductions for this rank's contiguous output columns."""
++    n_local = weight.shape[0] // comm.world_size
++    start = comm.rank * n_local
++    local_fp32 = torch.mm(
++        x, weight[start : start + n_local].t(), out_dtype=torch.float32
++    )
++    return local_fp32.to(x.dtype)
++
++
++def small_projection(group, x, weight):
++    """Gather complete BF16 columns without an intermediate layout copy."""
++    comm = group.ca_comm
++    local = small_projection_local(comm, x, weight)
++    output = torch.empty(
++        x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device
++    )
++    return all_gather(comm, local, output)
+diff --git a/python/sglang/srt/models/muse_spark.py b/python/sglang/srt/models/muse_spark.py
+index 6b638e9f5ebd3b74271fe4c5eb7fa81c13bdcba1..2e6a7570e23ba46cd2f0e35d5ec8e0423904f60c 100644
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -53,7 +53,11 @@ from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
+ from sglang.srt.layers.communication.muse_spark_gemm_ag import (
+     gemm_ag,
+     gemm_local,
++    prefill_row_projection,
++    prefill_row_projection_supported,
+     reserve_projection_workspace,
++    small_projection,
++    small_projection_supported,
+ )
+ from sglang.srt.layers.cp.utils import is_cp_active
+ from sglang.srt.layers.dp_attention import (
+@@ -221,28 +225,30 @@ class MuseSpark1xRouter(nn.Module):
+         self.register_buffer(
+             "e_score_correction_bias", torch.zeros(num_experts, dtype=torch.float32)
+         )
+-        self._split2_hi = None
+-        self._split2_lo = None
++        self._split2_weight = None
+         self._split2_key = None
+ 
+     @torch.no_grad()
+     def _build_split2(self) -> None:
+-        w = self.weight.data
+-        key = (w.data_ptr(), w.shape, w._version)
++        w = self.weight
++        # Keep the parameter's version counter: .data hides in-place weight
++        # updates and could leave the packed router stale after a reload.
++        key = (w.data_ptr(), w.shape, w.dtype, w.device, w._version)
+         if self._split2_key == key:
+             return
+         hi = w.to(torch.bfloat16)
+         lo = (w - hi.to(torch.float32)).to(torch.bfloat16)
+-        self._split2_hi = hi.t().contiguous()
+-        self._split2_lo = lo.t().contiguous()
++        # Share the input read and GEMM launch while retaining separate FP32
++        # accumulators for the high and low BF16 components.
++        self._split2_weight = torch.cat((hi, lo)).t().contiguous()
+         self._split2_key = key
+ 
+     def forward_split2(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         self._build_split2()
+         x = hidden_states.to(torch.bfloat16)
+-        acc = torch.mm(x, self._split2_hi, out_dtype=torch.float32)
+-        acc += torch.mm(x, self._split2_lo, out_dtype=torch.float32)
+-        return acc
++        acc = torch.mm(x, self._split2_weight, out_dtype=torch.float32)
++        hi, lo = acc.chunk(2, dim=-1)
++        return hi + lo
+ 
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         # Decode-sized FP32 logits: one CuTe GEMV instead of cuBLAS split-K + reduce.
+@@ -609,6 +615,22 @@ class MuseSpark1xMoE(nn.Module):
+             )
+         self.experts.post_expert_norm = post_expert_norm
+         self.experts.use_megamoe = self.use_megamoe
++        if (
++            self.pre_expert_proj is not None
++            and self.tp_size in (4, 8)
++            and getattr(self.experts, "use_marlin", False)
++            and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
++            and parallel.attn_dp_size == 1
++            and parallel.attn_cp_size == 1
++            and torch.cuda.is_available()
++            and torch.cuda.get_device_capability() == (9, 0)
++        ):
++            # This shared group workspace grows only on the first layer.
++            # Reserve before any forward, workspace binding or graph capture.
++            reserve_projection_workspace(
++                parallel.tp_group.ca_comm,
++                max(self.expert_hidden_size, self.hidden_size),
++            )
+         self.sp_dispatcher = None
+         self.finalize_ar_workspace = None
+         self.unpool_gather_boundary: Optional[FusedPostNormResidualPreNorm] = None
+@@ -735,9 +757,39 @@ class MuseSpark1xMoE(nn.Module):
+                 if self._defers_unpool_gather(comm, output.shape[0]):
+                     return gemm_local(comm, output, self.post_expert_proj.weight)
+                 return gemm_ag(comm, output, self.post_expert_proj.weight)
++            if self._can_shard_prefill_row_projection(output, self.post_expert_proj.weight):
++                return prefill_row_projection(
++                    get_parallel().tp_group, output, self.post_expert_proj.weight
++                )
++            if self._can_shard_small_projection(output, self.post_expert_proj.weight):
++                return small_projection(
++                    get_parallel().tp_group, output, self.post_expert_proj.weight
++                )
+             output = bf16_gemm_dispatch(output, self.post_expert_proj.weight, None)
+         return output
+ 
++    def _can_shard_prefill_row_projection(self, x, weight) -> bool:
++        parallel = get_parallel()
++        return (
++            getattr(self.experts, "use_marlin", False)
++            and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
++            and not getattr(get_forward(), "sp_active", False)
++            and parallel.attn_dp_size == 1
++            and parallel.attn_cp_size == 1
++            and prefill_row_projection_supported(parallel.tp_group, x, weight)
++        )
++
++    def _can_shard_small_projection(self, x, weight) -> bool:
++        parallel = get_parallel()
++        return (
++            getattr(self.experts, "use_marlin", False)
++            and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
++            and not getattr(get_forward(), "sp_active", False)
++            and parallel.attn_dp_size == 1
++            and parallel.attn_cp_size == 1
++            and small_projection_supported(parallel.tp_group, x, weight)
++        )
++
+     def _defers_unpool_gather(self, comm, num_tokens: int) -> bool:
+         boundary = self.unpool_gather_boundary
+         return (
+@@ -815,6 +867,18 @@ class MuseSpark1xMoE(nn.Module):
+                 and gemm_ag_supported(comm, hidden_states, self.pre_expert_proj.weight)
+             ):
+                 expert_input = gemm_ag(comm, hidden_states, self.pre_expert_proj.weight)
++            elif self._can_shard_prefill_row_projection(
++                hidden_states, self.pre_expert_proj.weight
++            ):
++                expert_input = prefill_row_projection(
++                    get_parallel().tp_group, hidden_states, self.pre_expert_proj.weight
++                )
++            elif self._can_shard_small_projection(
++                hidden_states, self.pre_expert_proj.weight
++            ):
++                expert_input = small_projection(
++                    get_parallel().tp_group, hidden_states, self.pre_expert_proj.weight
++                )
+             else:
+                 expert_input = bf16_gemm_dispatch(
+                     hidden_states, self.pre_expert_proj.weight, None

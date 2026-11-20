@@ -1,0 +1,13 @@
+Cache allocation diagnostic, 2026-11-19 (UNSCORED ONLY)
+
+Hypothesis: a smaller SWA/full token-capacity ratio can reduce full-cache pressure and later-turn host restoration at high concurrency without increasing the static GPU memory budget. This is a cache-policy experiment, not a claimed2x speedup.
+
+Concrete candidate: unchanged frozen release_2026-11-18/candidate.diff (SHA2568c7547213fb993a318321a26f84e2872db8c87b358ee3d3ea638695702b0dc2b), moe-runner-backend=humming, swa-full-tokens-ratio=0.35. Keep mem-fraction-static0.85 and all fixed judge flags unchanged. Check load32 probes pressure; policy itself is constant across loads and has no challenge-specific branch.
+
+Evidence: original default ratio0.8, full1893608 and SWA1514886 tokens. Original observed per-token costs full4096, SWA11776, private draft2560 bytes. Constant-budget algebra gives approximately2824000full and988000SWA tokens at0.35. Exact page-aligned allocation must be read from returned startup log. This exceeds even32 live sliding windows plus chunk and speculation headroom by a wide margin, but the cached-prefix working set remains a runtime uncertainty.
+
+Source audit: pinned HybridSWAPoolConfigurator._recompute_cell_size includes full, ratio-weighted SWA and draft bytes; _solve_pool_sizes page-aligns and validates SWA minimum. No altered precision, skipped arithmetic, different draft model or output count. flags lists no prohibition on swa-full-tokens-ratio. mem_fraction increase is forbidden and is not part of this experiment. Existing policy controls eviction and cache misses, so a smaller cache can regress hit rate; this is what the check must measure.
+
+Acceptance: exact judge correctness gates, peak memory allowance and per-load TTFT limit; inspect actual full/SWA/draft pools, cache hit, TTFT, accepted tokens, per-user rate and normalized score. Compare with scored parent cautiously because node and workload sampling can differ. No automatic score submission, no multiplication with kernel gains. One load cannot establish four-load2x.
+
+Do not describe capacity algebra as measured throughput. Original calculation is research_2026-11-18_prefill_route_windows/cache_capacity.py/json. This follow-up tests a previously unmeasured hypothesis.

@@ -1,0 +1,40 @@
+MOE MAPPING: PHASE CLOSEOUT
+Status: closed after Notebook 14; no further notebook scheduled.
+
+DECISION
+Retain the unchanged two-buffer draft as the preferred research candidate for static/sufficiently reused maps. Keep active V4 unchanged. This is selection for possible integration, not a claim of deployment readiness.
+Selected diff: notebook12_support/selected_two_buffer_v4.diff
+Diff SHA256: 8215c21b7c18a99a7826ea61eb0fe00f4cf5676467f19445dc1096e7b2f7cead
+Selected full source: notebook12_support/selected_two_buffer_source.py
+Source SHA256: 18438f083871ec322bdc409690f8b2674cef5381e1e786176eae685dddea2c0f
+
+WHAT WAS MEASURED
+The pre-alignment portion of MuseSpark1xFp4Experts: expert-ID conversion, global-to-local mapping and score conversion. Tests execute AST-selected constructor/prefix code with synthetic inputs, not the full class or model.
+Original map lookup is compared with a cached lookup containing a leading drop sentinel. Two-buffer retains the original registered map; single-owner makes the map a property view into lookup storage.
+For native int32 IDs/float32 scores, baseline uses six kernels per measured prefix and both caches use four in the traced cases. These counts concern this prefix, not entire MoE or model layers.
+
+PERFORMANCE EVIDENCE
+Latest Colab repeat: two-buffer median event latency reduction 30.08% eager and 25.73% graph, 48/48 wins in each. Earlier equivalent Colab run: 30.06% and 24.91%. Matched within-run comparisons support repeatability of this narrow result.
+Single-owner has no measured advantage worth preferring for this static workload: latest eager latency is 11.80% higher than two-buffer, graph median 0.55% higher. Small graph differences should not be overinterpreted.
+Earlier int64/float16 harnesses included conversions absent from inspected router-default int32/float32 outputs. Notebook 10 isolated that effect; percentages across input contracts are not additional code optimizations.
+Frequent eager refresh can erase or reverse cached-mapping gains. There is no unconditional 25-30% serving improvement and no universal refresh crossover established.
+
+CORRECTNESS EVIDENCE
+Notebook 12 on Kaggle: 1,296 configurations; 2,208 output-value checks plus 384 metadata-only small fused-branch checks; 128 graph-update outputs; 48 device-move/recapture outputs; 25 invalid updates rejected.
+Notebook 13 on Kaggle: 768 explicitly event-ordered cross-stream handoffs, 1,536 outputs, 768 stable-pointer checks and eight recaptures after moves passed. Host validation waits each cycle; not concurrent-request throughput.
+Notebook 14 on Colab: all lifecycle, input, preservation, benchmark and trace checks pass. These experiments do not execute the omitted small fused aligner or expert GEMMs.
+
+PLATFORM PROVENANCE
+User confirmed earlier timing experiments and Notebook 14 ran on Colab T4. Notebooks 12 and 13 ran on Kaggle T4 after Colab limits were exhausted.
+Recent Colab: PyTorch 2.14.1+cu130 / Triton 3.8.0. Kaggle correctness runs: PyTorch 2.11.0+cu130 / Triton 3.6.0. Notebook filenames do not establish provider.
+Kaggle performance replication was intended for Notebook 14 but was not performed there. This is an explicit evidence gap, not a reason to extend the agreed notebook loop.
+
+INTEGRATION REQUIREMENTS
+Every direct map edit must refresh lookup before consumers, or use the checked update API. Two-buffer stale output was deliberately demonstrated and fixed with refresh.
+Updates on a different CUDA stream need a ready-event dependency before consumer replay and completion ordering before reuse. The harness demonstrates a correct schedule; production call sites still require audit.
+Moving/replacing buffers requires fresh graph capture. Real model loading, generic buffer manipulation and checkpoint integrations must preserve the map/lookup relation.
+Actual small fused alignment and GEMMs need supported-hardware testing. H200/full-serving latency remains unknown; T4 prefix timing is not an end-to-end estimate.
+
+OUTSIDE THIS PHASE
+Scheduler initialization and tokenizer initialization were not profiled. They require a separately scoped plan if the user chooses that work. Do not automatically start another profiling phase or generate Notebook 15.
+No new submissions, model deployments or active V4 source edits were made in closing this phase.

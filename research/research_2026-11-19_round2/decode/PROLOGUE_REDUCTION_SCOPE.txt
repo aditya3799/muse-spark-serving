@@ -1,0 +1,41 @@
+Supplement to frozen prologue evidence -- 2026-11-19 12:27UTC
+
+No frozen source or receipt was changed. This note supersedes any broad reading
+of "same native RMS reduction" beyond the validated compiler/shape scope.
+
+Prefill lane found a deterministic BF16 input row whose sum is near a rounding
+boundary. At BLOCK32, the native compiler layout assigns8 columns per lane and
+reduces with shuffle offsets4/2/1, whereas the fused FP8-write kernel assigns16
+columns per lane and reduces with offsets2/1. Native variance8.282231330871582
+versus fused8.282230377197266 crosses a BF16 midpoint, then an FP8 tie. Required
+BF16 casts remain in IR: this is reduction reassociation, not a dropped cast or
+scatter corruption. Instrumented final outputs matched their original kernels.
+Evidence: sibling prefill/prologue_rounding_debug/reproducer.json, original and
+debug TTGIR/PTX; preserved initial failure prefill/prefill_prologue_diagnostic.json.
+
+Saved-row followup at M8/32/56/128/256/512 passed native/fused Q/K comparison and
+variance/rstd comparison. Evidence: sibling
+prefill/prologue_rounding_debug/decode_extension.json. This is finite-case
+evidence; no universal equality claim follows from successful calibration.
+
+Actual source dispatch, for native no-store18 heads and candidate18 heads:
+M1..56 BLOCK4; M57..455 BLOCK8; M456..3640 BLOCK16; M>=3641 BLOCK32.
+Frozen adapter's16MiB calibration budget estimates8192*M+262144 bytes and thus
+admits at most M2016. Demonstrated BLOCK32 failures are ALREADY OUTSIDE this
+default runtime qualification. Official tested M8/32/128/256 use BLOCK4/8.
+Do not enlarge the calibration budget or extend to long prefill based on the
+existing small-M receipts. The failed large-M direct-kernel experiments bypassed
+this guard; they do not show an accepted default decode bucket failing.
+
+Separate bounded offline SM90 compilation: compile_reduction_layouts.py,
+reduction_layout_sm90/receipt.json,24 variant TTGIR/PTX artifacts. Aligned pointer
+and stride specialization attributes match native launches; small decode n_rows
+alignment is represented. Full/RoPE paths and native/software FP8 encoders agree
+with the native variance layout at BLOCK4/8/16. Both encoders diverge at BLOCK32
+on SM90 as well. Compilation used CUDA_VISIBLE_DEVICES empty and2GiB address-space
+cap, with no CUDA context or execution. Equal layouts are necessary static
+evidence, not a complete proof of all generated arithmetic or hardware parity.
+
+The previous four-block local gain remains approximately1.00208x, not material
+serving evidence. The prologue integration remains unapplied/defaultOFF; no
+new candidate, remote check or scored-submission recommendation was produced.

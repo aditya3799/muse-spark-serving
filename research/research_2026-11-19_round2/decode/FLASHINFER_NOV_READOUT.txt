@@ -1,0 +1,31 @@
+Released-source audit, FlashInfer0.7.4 (Nov10/11) and0.7.5 (Nov18).
+Primary release index: https://flashinfer.ai/releases/
+Pinned full source snapshots and hashes: flashinfer_nov/manifest.json.
+
+Small-query dispatch, PR5188, head0bb4278501085a09054df3156400ea25ed28fec9:
+https://github.com/flashinfer-ai/flashinfer/pull/5188
+Actual _determine_auto_backend selects FA2 for <=64querytokens only when the
+query is NOT FP8. It reuses CPU planning metadata; it does not add a GPU max/item
+sync. FP8 Q remainsFA3, including the Muse nativeFP8-query route. The old broad
+description of short-query gains therefore cannot be copied to this task.
+Captured backend selection also remains pinned after a successful plan, because
+FA2/FA3 integer-workspace layouts are incompatible. This is useful lifecycle
+evidence; it is not a new nativeSGLangFA3 optimization.
+
+Cluster rejection sampling, PR5617, head2cb3521e52d0452a2524bad7d2c4d43a273a2aba:
+https://github.com/flashinfer-ai/flashinfer/pull/5617
+The direct operator is stochastic top-k/top-p rejection sampling, not our
+unchanged greedy path. No sampler replacement follows from its speed claims.
+Its actual SM90 cooperative-groups cluster/DSM publication and lifetime protocol
+is a useful donor for a separate source-only target-softcap plan. The donor
+checks architecture/resources and uses 2/4/8CTA clusters via the CUDA launch
+attribute; cluster synchronization precedes shared-memory lifetime end.
+See cluster_softcap/PLAN.txt and CPU protocol proof. No H200 execution is claimed.
+
+The Nov18 batch-invariant attention extension targets BF16 on Blackwell/Rubin,
+not this Hopper FP8 attention path. Changing the mathematical reference to a
+new batch-invariant backend would not preserve our frozen output contract.
+The new W8A16 FP8-weight GEMM also does not replace native BF16 draft weights or
+NVFP4 target expert weights without a separate representation/precision proof.
+No packages were installed, no weight precision changed, and no GPU was used
+for this released-source applicability audit.

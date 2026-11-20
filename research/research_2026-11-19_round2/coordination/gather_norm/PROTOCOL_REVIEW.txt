@@ -1,0 +1,49 @@
+Hopper C1 all-gather/norm research review
+
+Parent: frozen1.2363 release8c7547213fb993a318321a26f84e2872db8c87b358ee3d3ea638695702b0dc2b.
+Existing all_gather_norm_residual header and dispatch match pinnedSGLang297e54fd.
+Our isolated cumulative candidate670856a631fd23994a72c3f872e1c6cab1f7cc8c9525bc51bc8445c2d534c489
+adds only Hopper C1 dispatch and deferral of the existing small_projection_local.
+No CUDA arithmetic source change, no new persistent GPU buffer, no GEMM change.
+
+Native Hopper norm chooses C1,T256,prefetch forM<192 and C1,T512,no-prefetch above.
+Simply enabling the existing Blackwell cluster policy would change reduction
+order and request unsupported/nonportable16-CTA clusters; this candidate forces
+Hopper's existing C1 norm policy and preserves the old Blackwell policy.
+The kernel has one persistent block per row, capped to push counter capacity.
+A further Hopper eligibility guard requires min(rows,counters)<=physical SMcount.
+SM90a production compilation of four true-PDL variants passes, no spills:
+T256 std217regs/scale202regs;T512 std92regs/scale75regs. Each fits at least one
+CTA perH200 SM. The candidate deliberately disablesPDL onHopper for ordinary
+stream completion ordering. False-PDL production compilation also passes all four variants,8.52s/586636KiBRSS, same registers andzero spills (build_production_stream_sm90a.json).
+
+Memory ownership/protocol:
+- Push plane is borrowed from the already-reserved projection communicator.
+- Dense phase payload layout is [rank,M,H/world], identical to native gather.
+- Every16Bvector belongs to one producer rank and one destination(row,col).
+- Width is divisible by world*8, so no vector crosses a rank's slice.
+- Both original gather and fused receiver rewrite each +0 BF16 to-0. This differs
+  from the separate all-reduce's32bitpair marker; do NOT mix their marker tests.
+- Receive checks every16bitlane and clears exactly the vector it consumed.
+- ForC1, blocks0..grid-1 own counters;block0 flips countersgrid..capacity-1.
+  Native gather reserves its lastblock for the matching tail update. A CPU index
+  model passed768 alternating native/fused transitions and varyingrowcounts.
+- Every operation advances ALLcounters, includingunusedones, to the same phase.
+- Two phase halves are safe under common collective order and dependency-ordered
+  streams: a rank cannot publish phaseN+2 until consuming N+1 from everypeer;
+  eachpeer publishesN+1 onlyafterits prior operation has clearedN locally.
+- This is source reasoning, not an observed NVLink/multicast liveness proof.
+
+PDL reference: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-griddepcontrol
+The official .wait semantics requires all prerequisite grids tocomplete and
+make theirmemoryops visible. launch_dependents byitself onlyallows scheduling.
+The conservative Hopper port uses normal stream ordering, avoiding a new PDL
+runtime assumption. Existing Blackwell behavior is preserved.
+
+Local arithmetic fixture: exactnativeC1norm plusoriginalreceive/clear arithmetic,
+explicitlyprefilled singleGPUvirtualpeers; no multicast/counter execution.
+All14shape/postnormcases exact forBF16output andFP32residual over8changed inputs,
+packing/signedzero/canaries/clear checks and ungatedcases.193MBpeakallocated.
+Native-plus-gather vsfused localmemorycost1.0355-1.2948x inpilot, but oneM1control
+is0.9727 outside2percent. Do not call this a qualifiedHopper orserving speedup.
+No independentholdoutyet; no scored or unscored submission of this candidate.

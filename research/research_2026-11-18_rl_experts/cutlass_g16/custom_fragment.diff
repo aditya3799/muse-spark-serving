@@ -1,0 +1,25 @@
+--- a/include/cutlass/detail/collective/mixed_input_utils.hpp
++++ b/include/cutlass/detail/collective/mixed_input_utils.hpp
+@@ -923,7 +923,21 @@ public:
+       CUTE_STATIC_ASSERT_V(size(src) == size(scales));
+       Tensor scales_vm = cute::group_modes<1,-1>(cute::zipped_divide(scales, Int<NumValPerSrcReg>{}));
+ 
+-      if constexpr (is_same_v<DstType, ElementScale>) {
++      if constexpr (is_same_v<ElementScale, uint32_t> && is_same_v<DstType, cutlass::bfloat16_t>) {
++        CUTLASS_PRAGMA_UNROLL
++        for (int i = 0; i < size<1>(dst_vm); ++i) {
++          LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
++          CUTLASS_PRAGMA_UNROLL
++          for (int j = 0; j < size<0>(dst_vm); ++j) {
++            const uint32_t word = scales_vm(j, i);
++            const uint8_t byte = uint8_t(word >> (8 * k_block));
++            const auto scale = cutlass::float_e4m3_t::bitcast(byte);
++            const auto normalized_scale = cutlass::bfloat16_t(float(scale) * 0.25f);
++            dst_vm(j, i) *= normalized_scale;
++          }
++        }
++      }
++      else if constexpr (is_same_v<DstType, ElementScale>) {
+         CUTLASS_PRAGMA_UNROLL
+         for (int i = 0; i < size<1>(dst_vm); ++i) {
+           LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));

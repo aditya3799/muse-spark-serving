@@ -1,0 +1,70 @@
+FOLLOW-UP: the1.703GB row qualification bound requires the separate no_grad amendment. Frozen530e factory lacks it; actual Torch CPU proof shows reference may retain x, raising conservative16K transport bound to1.9717GB. See ../row_no_grad_unapplied and autograd_lifetime.json. Earlier relocation alone does not repair this.
+
+Early draft projection qualification: source-only proposal
+
+Problem: joint530e registers draft row/N projection after target/draft graph capture.
+A normal80db Arena can qualify during BCG's eager warmup and persist through capture.
+The new row16K synthetic input/reference/local output plus workspaces/margin is
+1,703,280,640 B incremental, explicitly excluding the baseline FC weight. With the
+round2 proposed normal/WGS resident1,383,229,952 B this exceeds3.086GB, before KV.
+Independent queued checks remain valid independent candidates; combining unchanged
+patches is not justified.
+
+Amendment (UNAPPLIED, SHA74d63805ca009a9cb43be97e587f57e1a2309a8f976ed977ea1ef7df40e980d2):
+After initial pools and attention backends, before init_all_cuda_graphs, create the
+single existing schedule_stream earlier and select exactly the scheduler's eventual
+forward stream. Call the optional draft initializer, synchronize, then capture.
+The later prewarm_sampling call is idempotent. This neither qualifies inside capture
+nor adds CPU votes to replay. Existing full-M plan, real-weight calibration, TP
+transport, all-rank latency gate and original projection tail remain unchanged.
+No frozen joint/normal file or working-tree source was modified.
+
+Source prerequisites:
+- ModelRunner.forward_stream is created before loading weights (model_runner.py469).
+- Arg resolution creates prefill.bs (memory_hook.py265); graph setup subsequently
+  removes capacity-incompatible buckets. Early qualification may do unnecessary
+  work for a removed bucket, but cannot activate an unqualified bucket. Live FC
+  remains guarded by the exact registered shape.
+- Non-overlap scheduling previously created schedule_stream only after capture;
+  the amendment creates it once earlier and reuses the same object. Overlap keeps
+  model_runner.forward_stream. This avoids stream-specific plans silently falling
+  back at serving time.
+- StartupWeightLoadManager rejects draft workers, draft_model_idx and ANY
+  speculative algorithm (startup_weight_load.py353-360). Therefore DFlash cannot
+  calibrate sentinel weights under the existing overlap loader. A future loosening
+  of this upstream contract requires an explicit real-weight readiness fence.
+- Normal prepare_build compiles only; normal Arena construction is first eligible
+  noncaptured model forward. The amendment is before those graph warmup forwards.
+- NCCL/symmetric transport is initialized with the model TP group before this hook;
+  actual H200 first-use transport allocation/latency remains unmeasured locally.
+
+Controls: early_projection_order_cpu.py executes actual before/after scheduler AST
+prefixes with instrumented allocations and streams:8 combinations of overlap,
+draft presence, and post-capture resize. Before has Arena resident at registration;
+after does not. Exactly one stream creation and one registration, with later
+sampling on the identical stream, passed. Source AST and git apply --check pass.
+These are host-control proofs, not execution of a complete distributed server.
+
+Phase ledger using local workspace8,519,680 B (H200 must query its own):
+- Row qualification before normal/KV:1,703,280,640 B conservative source bound.
+- Row/N retained workspaces:17,039,360 B (one stream each).
+- Normal80db qualification conservative cap1,749,451,072 +17,039,360 =1,766,490,432 B.
+  This assumes round2 WGS tiles and optional KV arena have NOT yet been allocated.
+  Adding WGS61,865,984 B would raise this to1,828,356,416 B, above the1.8GB planning
+  budget though below literal2GB. Adding KV would reduce headroom further.
+- Normal/WGS +KV +row/N resident total1,534,487,040 B, excluding non-Torch handles,
+  allocator reservation, collective registration and any graph-private overhead.
+- Runtime fast row projection at16K adds33,554,432 B local output; native assembled
+  full output replaces the baseline output. A recoverable native fallback may
+  retain another full268,435,456 B while gather completes. The local row view is
+  contiguous and can alias native storage, but ledger conservatively also charges
+  the33,554,432 B. With all residents this gives1,836,476,928 B, not a generous
+  whole-serving bound. KV remains disabled and native FP8 qualification unresolved.
+
+Decision: this source ordering can remove the definite >3GB calibration overlap;
+it is not a license to combine candidates or declare the2GB rule satisfied.
+Need coordinated ownership/phase reservations, actual allocated+reserved/native
+memory deltas, bounded stream count, original graph lifetime proof and H200 model
+output/latency gate. The alternative is generic global-budget admission before
+qualification, retaining only configured TP-divisible shapes whose full bound fits.
+Never qualify a smaller shape then activate an unqualified larger shape.

@@ -1,0 +1,42 @@
+﻿Projection/communication branch, 2026-11-16
+
+Candidate: partition replicated prefill projection token rows across TP ranks,
+compute full-N/full-K local row GEMMs with FP32 output and a single BF16 cast,
+then gather along dim 0. No permanent weight repacking. Unlike yesterday's
+column-sharded projection, dim-0 gather needs no rearrangement/copy.
+
+Source evidence: active MuseSpark1xMoE._forward_experts and
+_reduce_and_unpool call full bf16_gemm_dispatch on Hopper outside small
+existing multicast paths. Replicated row inputs are guaranteed only without
+SP, attention DP/CP; candidate checks these and deterministic-inference mode.
+M>=512 divisible by TP2/4/8 and aligned BF16 geometry required. All other cases
+keep stock behavior. Model delta from active V4 contains exactly two imports,
+two dispatch call sites and the shared eligibility method.
+
+Canonical package: package_row/candidate.diff
+SHA256 6d851cce04e37be0bacde78421fd4a3ecf6915f555b9b881da0f60be54a7b788
+6,391 bytes; two EXISTING files; exact Git roundtrip, AST and whitespace pass.
+This package includes V4 model/router changes but excludes separate MoE V4 /
+compact32 files. Coordinator should merge exports onto selected baseline.
+
+CPU validation: real Gloo world2/4/8; six cases per world on every rank,
+changed seeds and noncontiguous input. Bitwise layout equality versus serial
+local FP32 compute; independent numerical comparison against BF16 baseline.
+Original over-strict CPU bitwise-to-BF16 failure is preserved in
+cpu_initial_screen.txt. GPU thresholds remain rel-L2<=.003, maxabs<=.03125,
+and error vs FP32 reference <= baseline error +1e-5.
+57 metadata eligibility/fallback checks passed.
+
+GPU validation/timing and repeated-layer graph memory audit are in progress
+under coordinator's exclusive GPU slot. No H200 validation or serving claim.
+
+Next mechanism, NOT implemented: fuse reduction partition into post-projection
+by reduce-scatter(rows) -> local unpool GEMM -> all-gather. Potentially removes
+the replication phase of expert output all-reduce. Requires independent BF16
+reduction-order/precision proof and multi-GPU graph test; do not stack blindly.
+
+Completed local GPU evidence
+48 changed-input graph replay arithmetic checks passed, max relative L2 0.0021513791 and maxabs 0.03125.
+Row compute+layout is faster than prior column compute+layout in7/8 tested shapes; pooler M512 is45% slower. No NCCL included.
+64-layer shared-weight CUDA graph chain adds32MiB over full projection at M16384 (1MiB at512), same delta as one layer.
+No H200 result, full model memory or network workspace evidence. GPU slot released.

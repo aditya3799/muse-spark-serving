@@ -1,0 +1,15 @@
+﻿K-PARTITION RESEARCH, 2026-11-17
+
+Hypothesis: changing block-K/warp-K changes the FP32 reduction tree, even when arithmetic dtype remains FP32. Source: pinned humming/include/humming/epilogue/pipeline.cuh:50 invokes EpilogueSmemReducer iff BlockShape::K > WarpShape::K. smem_reducer.cuh:40 derives group_num_warps from their ratio and lines 84-100 implement a cross-warp tree. MainloopArithmetic kNumKSlabs depends on warp-K. Preserve both, not only FP32 accumulation flag.
+
+Primary-source context (consulted 2026-11-17):
+https://docs.nvidia.com/cuda/floating-point/index.html
+NVIDIA explains different valid dot-product reduction orders can yield different floating-point results. This supports investigating reduction-tree changes; it does not prove any specific kernel equivalent.
+https://github.com/vllm-project/humming
+Humming exposes configurable GEMM geometry and mixed numeric types. Pinned local 0.1.12 sources remain the execution reference; current upstream is background only.
+
+First intervention: For routes > 4096, clone the original light policy and restore heavy policy's block-K and warp-K; keep original M/N policy, postscales, BF16 boundaries, FP32 accumulation, no Stream-K, and no route host reads. Routes <=4096 are unchanged. All baseline sources are hashed and unchanged.
+
+M1024 controlled positive: k_preserve_m1024_01 exited0. All 14 numerical comparisons (including raw-down, final and changed-input graph replay) are bitwise identical. 216 metadata checks pass. Component speedup uniform1.821x, hot1.494x, allremote0.953x. A/A and B/B controls pass. This does not qualify H200 or complete serving and does not erase the previous failure.
+
+Next: reproduce old policy under same session, test policy boundaries and skew/duplicate/local-only routes, then isolate whether retaining baseline K also allows smaller tiles not selected by expected-local heuristic. Larger shapes require memory-aware test sizes.

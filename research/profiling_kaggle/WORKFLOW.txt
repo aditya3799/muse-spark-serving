@@ -1,0 +1,18 @@
+CURRENT STOPPING POINT - November 15, 2026
+
+The MoE mapping T4 notebook phase is CLOSED after Notebook 14, following the communicated stopping point. Notebook 14 passed and the user explicitly confirmed it ran on Colab. Do not generate Notebook 15 or force another Kaggle repeat to finish this phase. The historical preference below for automatically supplying a next notebook is superseded for this closed phase.
+
+Selected unchanged two-buffer draft remains unapplied. Active V4 is unchanged. See MOE_MAPPING_FINAL_REVIEW.txt and MOE_MAPPING_DECISION.json for evidence, frozen hashes and remaining integration gaps. Kaggle latency replication and full-serving/H200 behavior remain unmeasured. Scheduler/tokenizer startup requires a separately scoped user-requested phase; do not start it automatically.
+
+HISTORICAL WORKFLOW PREFERENCES
+
+KAGGLE PROFILING WORKFLOW
+
+User preference established November 14, 2026:
+After each results ZIP, provide BOTH the results review and the next runnable experiment notebook in the same response. Do not wait for a separate request to create the next experiment.
+
+Verify artifact integrity, correctness and measurement scope before choosing the next experiment. Save the review and reproducible analysis. Create a self-contained Kaggle T4 notebook, validate it locally, and include its upload link and results-folder name in the response.
+
+Use results to choose the next step; do not predeclare a performance win. Retain the active V4 baseline and distinguish isolated experiments from actual serving-code integration and H200 validation.
+
+Environment correction (user, November 15, 2026): earlier runs were Colab T4; after exhausting Colab limits the user switched to Kaggle T4, including Notebook 12. See ENVIRONMENT_HISTORY.txt. Do not infer execution provider from notebook/directory names. Attribute providers to user evidence and keep performance comparisons within a matched run.

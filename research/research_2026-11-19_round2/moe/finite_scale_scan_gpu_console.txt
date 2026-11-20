@@ -1,0 +1,1 @@
+{"complete": true, "cases": 99, "scratch_bytes": 4, "scope": "Actual scale-byte finite scan; no fast-kernel activation or H200 execution"}

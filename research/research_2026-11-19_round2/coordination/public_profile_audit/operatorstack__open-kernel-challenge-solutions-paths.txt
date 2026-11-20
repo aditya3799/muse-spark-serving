@@ -1,0 +1,17 @@
+LICENSE
+NOTICE
+README.md
+SHA256SUMS
+muse_attention_decode/README.md
+muse_attention_decode/RESULT.json
+muse_attention_decode/submission.py
+muse_bf16_proj/README.md
+muse_bf16_proj/RESULT.json
+muse_bf16_proj/submission.py
+muse_decode_layer/README.md
+muse_decode_layer/RESULT.json
+muse_decode_layer/submission.py
+muse_moe_w4a16/README.md
+muse_moe_w4a16/RESULT.json
+muse_moe_w4a16/submission.py
+verify/check_equivalence.py

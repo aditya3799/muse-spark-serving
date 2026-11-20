@@ -1,0 +1,117 @@
+LATEST UPDATE: revised FP32-output projection candidate
+
+H200 check 32bcbb190b204dd6 is queued; no new serving result yet.
+Current candidate: projection_fp32_candidate/candidate.diff, 23881 bytes.
+SHA256: 8b22315e0d4d6e71001cd7a85510a7abb35e228c1a98a93cf8e30399d8cbb791.
+Confirmed serving score remains1.0111x. The1.5x objective is not achieved.
+
+The first projection candidate (check82482c8c07c2422a) was superseded after
+an extra GPU replay test with default BF16 reduction failed the predeclared
+0.003 relative-L2 screen. It had already been submitted; do not promote it.
+The failed screen and follow-up measurements are preserved, not relabeled.
+
+Diagnosis: narrower BF16 GEMMs can select less accurate cuBLAS reductions.
+FP32-reference tests isolated the dependence on PyTorch's reduction flag.
+The revised helper requests torch.mm(...,out_dtype=torch.float32), converts
+once to BF16 and gathers. It does not mutate global precision flags.
+BF16 inputs, complete K reductions, original weights and final BF16 output
+are retained. No donor kernel source was incorporated.
+
+Revised validation:60 checks of the exact exported helper in CUDA graphs,
+both projection geometries, M512/513/777/4096/16384, three changed-input seeds,
+noncontiguous inputs and both BF16-reduction settings. All passed the SAME
+0.003 relative-L2 /0.03125 max-absolute thresholds, plus a new requirement
+that error against FP32 reference not exceed baseline error by more than1e-5.
+Max relative L2 to baseline0.00215036; max absolute0.03125; max error relative
+to FP32 reference0.00166283. Serial rank computations substitute for network
+in these GPU checks. Earlier real2/4/8-process Gloo tests validate the unchanged
+column gathering layout, not the revised CUDA math or an NCCL graph.
+
+Revised timing:8 shape pairs, eight AB/BA samples, CUDA graphs; full projection,
+identical full control, FP32-output local shard+BF16 cast, and layout conversion.
+The saved compute exceeds local layout costs at every tested shape. Network
+is absent, so these figures are NOT H200 or full-model speedup predictions.
+Real H200 numerical, memory, NCCL/capture and throughput gates remain pending.
+The 288MiB extra-live-storage projection estimate excludes workspaces/graph
+retention. The local FP32 temporary is freed before gathering; measure full
+deployment peak remotely rather than treating this estimate as a quota proof.
+
+After the two checks, one check slot remains today; no scored slots remain.
+Next:inspect32bcbb190b204dd6, reject if communication/memory erases benefit,
+or use the remaining check at another load before considering scored promotion.
+The active checkout/root patch remain V4 cached mapping. All new patches are
+isolated exported candidates. No GPU process is intentionally left running.
+
+Earlier research and experiment evidence follows:
+------------------------------------------------
+RESEARCH ITERATION - 2026-11-15
+
+Outcome so far
+The scored compact32 candidate passed at 1.0111x stock, not the requested 1.5x.
+Per-load ratios: 1.0227, 1.0049, 1.0084, 1.0084. Correctness, later-turn
+rescoring and memory checks passed. Full JSON and startup log are preserved here.
+There is no per-kernel H200 profiler trace in the returned result. Startup logs
+do not prove which conditional kernel branch executed on measured requests.
+
+Iteration 1: larger-batch MoE tile experiment - REJECTED
+Executed actual SGLang NVFP4 Marlin GEMMs, alignment, SiLU and finalization on
+the RTX 3050, H=I=4096, 32 local/256 global experts, topk8, M=1024/2048/4096.
+Paired AB/BA eager and CUDA graph timings; uniform and hot-rank routing; six
+samples each. Correctness/replay screens passed. A/A graph controls 0.9997-1.0035x.
+Fixed32 graph ratios 0.601-0.795x. Fixed48 ratios 0.770-1.118x; its isolated
+M1024 uniform win regresses on concentrated routes and larger batches.
+Keep existing tile behavior. These are component timings, not H200 estimates.
+
+Iteration 2: shard replicated large projections - FIRST VERSION SUPERSEDED
+Pinned Muse code computes large pooler/unpooler BF16 projections redundantly
+on all TP ranks on H200. The candidate computes complete output-column slices
+on each rank and uses existing GroupCoordinator.all_gather to reconstruct the
+full tensor. It does not split the K reduction, repack weights, lower precision,
+or remove tokens. It retains stock paths for small M, non-Hopper GPUs, SP,
+attention DP/CP, deterministic inference and unsupported layouts.
+Eligibility is generic geometry (M>=512, aligned BF16 dense weights), not prompt
+contents or contest load labels. This is a performance hypothesis, not a claim.
+
+Built cumulative candidate on the exact scored compact32 artifact, with one
+new helper and two projection call sites. Patch is 23,714 bytes, six files,
+applies exactly to pinned base and matches exported source hashes. Active
+checkout and root patch.diff remain the earlier V4 cached-mapping baseline.
+
+Validation:
+- Actual Gloo collectives at 2, 4 and 8 processes, six cases per world on every
+  rank: bitwise output equality. Exact exported helper/source-extracted SGLang
+  gather, with F.linear dispatcher binding. This is NOT an NCCL graph test.
+- Twelve local GPU projection cases, M511 through16384, both8192->4096 and
+  4096->8192: max relative L2 about0.000205, maxabs0.015625. Single-GPU compute
+  and layout timings separately recorded; no communication speedup inferred.
+- Additional default-reduction graph checks FAILED for the first version; see
+  projection_candidate/gpu_replay_checks.json for status and exact results.
+- Extra live tensor storage bound at M16384,N8192,TP8 is288MiB per projection,
+  excluding cuBLAS/NCCL workspaces and graph pool retention. Full-model peak
+  memory and launch/collective behavior require the judge.
+
+Check job: 82482c8c07c2422a, 16 users, judge-default flags. Queued at submission.
+No new scored run: today's single scored slot was already consumed. Two daily
+check slots remain after this submission (subject to live status).
+
+Iteration 3: persistent MoE port feasibility - NOT READY
+The protected v139 donor is214000bytes (SHA A24B8374AAD49FBAA5E0CDEFFB7F1FA64960D8321F343CF8B88BD97DFDD20C09),
+so file size alone is not the blocker. Its prepare() retains base/fat/unit/WGS
+layouts for each of tiny/larger formats. With E32,H=I4096, codes+FP8 scales are
+0.84375GiB per layout, eight layouts total6.75GiB per layer before scratch.
+Stock Marlin codes+BF16 scales are roughly0.9375GiB. A direct whole-model port
+would violate the2GB/GPU allowance by far. It also fixes local expert offset0,
+needs global-scale/norm adaptation and M>384 handling. Do not import prepare()
+or claim the standalone2.39x as a serving gain. A credible port must use one
+canonical weight layout across decode/prefill and prove all-rank semantics.
+
+Next decision
+Fetch corrected job32bcbb190b204dd6. Earlier job82482c8c07c2422a is diagnostic only. Require correctness, later-turn validation where
+available, <=2GB additional memory, TTFT limit and a convincing serving gain.
+If projection communication erases compute savings, reject this branch rather
+than stack speculative changes on it. If it wins, run another load check before
+using a scored slot after reset. A full H200 profile or validated single-layout
+MoE port is still needed to make a credible1.5x proposal.
+
+Research URLs and applicability decisions: public_research_sources.json.
+Public donor files were read for research only; none were copied into this patch.

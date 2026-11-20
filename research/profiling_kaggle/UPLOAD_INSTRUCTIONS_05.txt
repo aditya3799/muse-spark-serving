@@ -1,0 +1,11 @@
+Upload only 05_kaggle_source_candidate.ipynb to Kaggle. Select GPU T4 and Run All with defaults. Internet can remain off; no installs or model files are needed.
+
+This notebook compares AST-selected baseline/draft source prefixes and directly times mapping updates followed by 1, 8 or 64 prefix calls. It does not execute actual alignment or GEMMs.
+
+Expected: environment, source_checks, benchmark and update_cadence passed. Profiler can be partial if GPU tracing is unavailable. Totals: 66 benchmark/cadence cases, 264 timing rows, 2,904 raw samples.
+
+Small fused-branch cases check only branch/shape/dtype and score values; local-ID values await an omitted kernel. Those cases are not timed.
+
+Run the final export cell even on a failed/skipped section. Download v4_source_candidate_*.zip into profiling_kaggle/notebook05_results, then stop the interactive GPU session.
+
+The local cached_mapping_v4_draft.diff is V4-relative and NOT applied. Keep it for review, not automatic submission. Active serving code remains V4.

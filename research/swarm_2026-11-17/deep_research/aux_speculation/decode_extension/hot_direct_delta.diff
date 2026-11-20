@@ -1,0 +1,107 @@
+--- a/python/sglang/srt/layers/decode_aux_output.py
++++ b/python/sglang/srt/layers/decode_aux_output.py
+@@ -16,6 +16,7 @@
+         # The runner/global input-buffer pool remains the allocation owner.
+         # This object retains and leases that exact storage; it allocates none.
+         self.buffer = buffer
++        self._binding = (buffer.data_ptr(), tuple(buffer.shape), buffer.stride(), buffer.dtype, buffer.device)
+         self.hidden_size = hidden_size
+         self.capture_ids = ids
+         self._state = "idle"
+@@ -24,7 +25,22 @@
+         self._consumer_stream = torch.cuda.current_stream(buffer.device)
+         self._recorded_streams = {self._consumer_stream}
+ 
++    def owns(self, output):
++        if not torch.is_tensor(output) or output.ndim != 2:
++            return False
++        pointer, shape, stride, dtype, device = self._binding
++        return (
++            output.data_ptr() == pointer
++            and 0 < output.shape[0] <= shape[0]
++            and output.shape[1] == shape[1]
++            and output.stride() == stride
++            and output.dtype == dtype
++            and output.device == device
++        )
++
+     def validate_binding(self, buffer, spec):
++        # Immutable capture-time fingerprint detects even in-place storage/view
++        # mutation of the canonical Tensor, not only replacement of its object.
+         if (spec != (self.hidden_size, self.capture_ids)
+-            or not self.owns(buffer) or buffer.shape != self.buffer.shape):
++            or not self.owns(buffer) or tuple(buffer.shape) != self._binding[1]):
+             raise RuntimeError("decode auxiliary binding changed; rebuild captured runner")
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -1821,30 +1821,28 @@
+ 
+     def _aux_output_owners(self):
+         model_runner = self.target_worker.model_runner
+-        owners = []
+-        for runner_name, owner_name in (
+-            ("prefill_cuda_graph_runner", "prefill_aux_output_owner"),
+-            ("decode_cuda_graph_runner", "decode_aux_output_lease"),
+-        ):
+-            runner = getattr(model_runner, runner_name, None)
+-            owner = getattr(runner, owner_name, None)
+-            if owner is not None:
+-                owners.append(owner)
+-        return owners
++        prefill_runner = getattr(model_runner, "prefill_cuda_graph_runner", None)
++        decode_runner = getattr(model_runner, "decode_cuda_graph_runner", None)
++        prefill = getattr(prefill_runner, "prefill_aux_output_owner", None)
++        decode = getattr(decode_runner, "decode_aux_output_lease", None)
++        cached = self.__dict__.get("_cached_aux_output_owners")
++        if cached is None or cached[0] is not prefill or cached[1] is not decode:
++            cached = (prefill, decode)
++            self._cached_aux_output_owners = cached
++        return cached
+ 
+     def _append_target_hidden_to_draft_kv_by_loc(self, **kwargs) -> None:
+-        owner = next(
+-            (owner for owner in self._aux_output_owners()
+-             if owner.owns(kwargs["target_hidden"])), None
+-        )
+-        lease = (
+-            owner.consume(kwargs["target_hidden"])
+-            if owner is not None
+-            else nullcontext()
+-        )
+-        # Release follows enqueue of the context projection and every KV write.
+-        # A later producer stream waits for these reads before overwriting.
+-        with lease:
++        prefill, decode = self._aux_output_owners()
++        output = kwargs["target_hidden"]
++        pointer = output.data_ptr() if torch.is_tensor(output) else None
++        owner = None
++        if decode is not None and pointer == decode._binding[0]:
++            owner = decode
++        elif prefill is not None and pointer == prefill.buffer.data_ptr():
++            owner = prefill
++        # consume performs the complete metadata/state check once. The pointer
++        # selection above merely avoids repeating it for each candidate owner.
++        with owner.consume(output) if owner is not None else nullcontext():
+             self._append_target_hidden_to_draft_kv_by_loc_impl(**kwargs)
+ 
+     def _append_target_hidden_to_draft_kv_by_loc_impl(
+@@ -2363,12 +2361,16 @@
+         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
+ 
+     def forward_batch_generation(self, *args, **kwargs):
+-        generations = [(owner, owner.generation) for owner in self._aux_output_owners()]
++        prefill, decode = self._aux_output_owners()
++        prefill_generation = prefill.generation if prefill is not None else None
++        decode_generation = decode.generation if decode is not None else None
+         try:
+             return self._forward_batch_generation_with_aux_output(*args, **kwargs)
+         except Exception:
+-            for owner, generation in generations:
+-                owner.discard_ready(generation + 1)
++            if prefill is not None:
++                prefill.discard_ready(prefill_generation + 1)
++            if decode is not None:
++                decode.discard_ready(decode_generation + 1)
+             raise
+ 
+     def _forward_batch_generation_with_aux_output(

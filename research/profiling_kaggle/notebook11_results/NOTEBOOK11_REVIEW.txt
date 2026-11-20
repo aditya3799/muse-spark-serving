@@ -1,0 +1,30 @@
+NOTEBOOK 11: VERIFIED CACHE-CHOICE REVIEW
+Run: 20261114T183520Z_9b0849
+
+VALIDATION
+All 10 member checksums and source provenance match. Recomputed all metrics for 288 rows from 3,168 samples and verified 288 comparisons. All 48 cases, 2,592 changed-input output checks and lifecycle/input/preservation gates passed.
+Trace: 672 kernels, no copies, no unattributed operations. Eight-stage baseline uses 48 kernels; both candidates use 32, in eager and graph schedules.
+
+MATCHED RESULTS
+Candidate / Reference | Event reduction (wins/48) | Wall reduction | Saved event us per stage
+single_owner_eager / baseline_eager | 22.29% (48/48) | 21.88% | 22.749
+single_owner_eager / two_buffer_eager | -10.91% (1/48) | -10.68% | -8.111
+single_owner_graph / baseline_graph | 24.51% (48/48) | 21.82% | 6.707
+single_owner_graph / two_buffer_graph | -0.56% (10/48) | -0.48% | -0.107
+two_buffer_eager / baseline_eager | 30.06% (48/48) | 29.26% | 30.951
+two_buffer_graph / baseline_graph | 24.91% (48/48) | 22.46% | 6.973
+Negative reduction means slower. Values are descriptive matched medians, not confidence intervals or proof of statistical equivalence.
+
+DECISION
+Prefer the existing two-buffer draft for the static-map path: 30.06% median lower event latency in eager execution and 24.91% in graph replay versus baseline, winning all 48 comparisons in each mode.
+The single-owner design is 10.91% slower than two-buffer in eager execution (median 8.111 us more per stage). This is consistent with property/view host overhead. Their device operation counts match.
+Single-owner graph latency is 0.56% higher at the median, about 0.107 us per stage; it wins 10/48 comparisons. This small difference does not establish equivalence or a universal ranking, but provides no performance reason here to accept its changed registered-buffer contract.
+Two-buffer retains the original named _expert_map buffer at storage offset zero. Single-owner changes it to a property at offset one. Both remain unvalidated in the complete serving framework and real fused kernels.
+The preservation gate explicitly observed stale output after directly changing only the two-buffer map; refreshing lookup restored correct captured-graph output. Its checked update method also restored correctness. This lifecycle obligation is real, not waived by static timing wins.
+Notebooks 06-08 showed frequent eager updates can be expensive. The selection is conditional on static or sufficiently reused maps and correct refresh ordering. Never add a refresh to every forward by default.
+
+NEXT: 12_kaggle_two_buffer_gate.ipynb
+Freeze the exact existing V4-relative two-buffer draft; no new algorithm or active source edits. Stress all eight contiguous expert partitions, empty/small/boundary/large inputs, two ID dtypes, strided IDs and negative sentinels.
+Test explicit refresh and checked updates against an independent reference, graph visibility with stable pointers, rejected malformed updates, and moving modules followed by fresh capture. The notebook is a correctness gate, not another latency claim.
+Small fused branches are checked only for dispatch and metadata. Actual alignment/GEMMs, offset-free map use in real fused kernels, full checkpoint/model loading, framework integrations, startup and H200/full-serving performance remain untested.
+The selected draft is copied into notebook12_support for reproducibility and checked against the frozen V4 source in an isolated temporary tree. It is NOT applied to active V4.

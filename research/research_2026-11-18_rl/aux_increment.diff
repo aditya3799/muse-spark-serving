@@ -1,0 +1,36 @@
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -1281,13 +1281,32 @@
+         stream = hidden_states.to(self.residual_dtype)
+         attn_input = self.layers[0].self_attn_input_norm(stream)
+         aux_hidden_states = []
++        packed_aux = None
++        write_packed = (
++            len(self.layers_to_capture) > 1
++            and self.residual_dtype != self.operator_dtype
++            and len(set(self.layers_to_capture)) == len(self.layers_to_capture)
++        )
++        tap_offset = 0
+         for layer_idx, layer in enumerate(self.layers):
+             stream, attn_input = layer(positions, stream, attn_input, forward_batch)
+             if layer_idx in self.layers_to_capture:
+                 # Draft context projection reads operator dtype, not residual_dtype.
+-                aux_hidden_states.append(stream.to(self.operator_dtype))
++                if write_packed:
++                    width = stream.shape[-1]
++                    if packed_aux is None:
++                        packed_aux = stream.new_empty(
++                            (*stream.shape[:-1], width * len(self.layers_to_capture)),
++                            dtype=self.operator_dtype,
++                        )
++                    packed_aux[..., tap_offset : tap_offset + width].copy_(stream)
++                    tap_offset += width
++                else:
++                    aux_hidden_states.append(stream.to(self.operator_dtype))
+         norm_input = stream.to(self.operator_dtype)
+         hidden_states = self.norm(norm_input).to(self.operator_dtype)
++        if packed_aux is not None:
++            return hidden_states, packed_aux
+         if aux_hidden_states:
+             return hidden_states, aux_hidden_states
+         return hidden_states

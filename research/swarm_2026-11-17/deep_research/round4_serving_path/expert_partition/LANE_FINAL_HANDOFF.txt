@@ -1,0 +1,22 @@
+ROUND4 EXPERT PARTITION LANE - FINAL HANDOFF
+
+Outcome
+The confirmed serving score remains 1.2237x. No new serving run or projected combined gain is claimed. Work stayed inside this isolated lane; active/scored/root patches were not edited, and no submission, remote check, paid compute, GPU/compiler job, or TTS operation was performed by this lane. No owned processes or hardware lease remain.
+
+Benchmark evidence
+METRIC_AND_WORKLOAD_AUDIT.json distinguishes raw rung throughput from paired frontier ratios and reproduces the score. Saved aggregate logs cannot recover actual draft/target/prefill/communication/CPU fractions. Ideal cache token accounting is conditional, not recovered per-request data or timing. Mean acceptance includes the bonus token.
+
+Concrete prototypes
+TARGET_ARGMAX_QUALIFICATION.json links exact-bucket V1 and padded-prefix V2 default-off overlays. Root-owned real CUDA component tests passed actual backend/capture lifecycle, native local argmax and poisoned B9-to10 padding. TP8 gather is emulated; real NCCL/selected communicator, graph-pool borrowing, full model and performance remain held. V1 receipts and V2 generation receipt are preserved. TARGET_ARGMAX_PADDED_V2_MANIFEST.json reflects the passed native component gate, not stale CPU-only status.
+
+DEVICE_TIMER_DFLASH_OVERLAY_RESULT.json records a narrow existing-flag wiring fix. Both workers retain target_verify category; worker-scoped observation is still needed to distinguish phases. PHASE_RECORDER_FINAL_REVIEW.json closes source review with same-thread/stream, prime fail-stop and overhead limitations. ACCEPTANCE_OBSERVER_INDEPENDENT_REVIEW.json confirms the existing CPU callback supplies joint batch/survivor counts without extra D2H; serialize its live snapshot only while quiescent.
+
+Rejected/held directions
+SCHEDULER_POLICY_FEASIBILITY.json gives a deterministic rank-divergence counterexample for a local wall-clock age guard. Synthetic scheduler replay does not establish a serving gain.
+SEGMENTED_VERIFY_INDEPENDENT_SOURCE_REVIEW.json identifies singleton accept_len buffer overwrite under naive compact-tail reuse. Retain first-stage decisions separately, full8 auxiliary FC/append cost, original request/KV owners and one final publication. Target attention/full-model arithmetic and survivor dispatch cost remain unqualified.
+
+Cross-lane review
+ATTENTION_HANDOFF_GUARD_FINAL_REVIEW.json pins the current 58-case mocked guard and future H200 gate; foreign communicator ownership/replay invalidation/native eight-H200 remain held. FINAL_HANDOFF_INDEPENDENT_REVIEW.json records the root handoff review and the terminology correction: width8 is an anchor plus seven draft proposals. Do not claim uninterrupted TTS uptime; we left it untouched.
+
+Preservation
+OVERLAY_BASELINE_INPUT_HASHES.json records active input hashes and available initial comparisons. All six current source pins rechecked at 18:25:44 UTC. ROUND4_CHECKPOINT.json contains the requested 18:25 checkpoint and key artifact pins. No further experiments are required in this lane for this pass.

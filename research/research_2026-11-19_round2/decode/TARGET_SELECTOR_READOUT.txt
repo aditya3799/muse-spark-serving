@@ -1,0 +1,37 @@
+Isolated native target post-gather selector integration; default OFF and unapplied.
+
+The only changed native method is LogitsProcessor.deferred_argmax: after its
+unchanged native softcap_row_argmax and unchanged float32 all-gather, an optional
+helper replaces argmax(rank), gather(float ID), and conversion to int64. The
+original two-line postprocessing remains the default and helper fallback.
+Flag: SGLANG_EXPERIMENTAL_DFLASH_TARGET_SELECT=1.
+
+The copied helper is byte-identical to root's corrected device-scope version:
+bbb25013e68da53b5449646c81ac01367d0647919febde248e60cff50f30023f.
+Cumulative scored-parent patch:
+7d31f72e0499f48878a40f44b50075a61b01b198de70ced9d22432bbcc74f4d6.
+Private-index apply-check at pin297e54f passes; checkout was not changed.
+
+Validation:
+- Actual original/patched method AST: 250 CPU cases across TP1/2/8/16/17,
+  N0/1/7/32/257, random/first ties/NaN/signed-zero/all-negative-infinity, flag0/1.
+  Each uses the same CPU softcap surrogate and virtual peer gather. Exactly one
+  producer and collective invocation remains; outputs equal. These test dispatch
+  and real CPU fallback, NOT optimized GPU execution or NCCL.
+- Five direct helper fallback controls: noncontiguous, FP16, BF16, N0, TP17.
+- Root's separately bound GPU proof: 539 payload cases plus24 native softcap
+  producer cases exact. Root's device-guard holdout: captured postops4.00–4.76x,
+  about4us saved, valid strict duplicate controls. Eager controls fail all cells;
+  there is no general eager performance KEEP.
+
+Muse model source explicitly forces FP32 LM-head output and inherits this method.
+The generic enable_fp32_lm_head=False server flag does not override that model
+implementation. Actual checkpoint vocab/softcap and server activation still need
+measurement. See MUSE_LOGITS_ACTIVATION.txt and pinned source receipt.
+
+Remaining gates: real H200 execution/compile, actual inherited server method
+activation, graph and stream lifecycle in the server, TP8/NCCL integration,
+whole decode and all serving scenarios with unchanged outputs and memory.
+No softcap kernel, LM head, speculative length, acceptance, precision, or transport
+has been changed. This package is separate from all other experimental packages.
+No submission or serving performance claim follows from local component results.

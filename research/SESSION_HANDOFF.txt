@@ -1,0 +1,132 @@
+LATEST CHECKPOINT - PAUSED 2026-11-19
+User confirmed resume November 19 at 12:00 PM IST (06:30 UTC).
+Read research_2026-11-18_rl/RESUME_2026-11-19.txt first.
+Brief research pass, then prepare submissions. Obtain final approval for a concrete scored submission.
+Best official score1.2363x;1.8x/2x unestablished. Latest local results and unfinished process cleanup are in the checkpoint.
+Goal paused. No automatic wake-up configured.
+
+Historical handoff follows. Its active-status and older-score statements are superseded by the checkpoint above.
+
+
+ACTIVE BENCHMARK AGREEMENT THROUGH 2026-11-19
+The official reference is release_2026-11-18/candidate.diff, scored 1.2363x on eight H200s in job 317c88a5fd474cd2. SHA256 8c7547213fb993a318321a26f84e2872db8c87b358ee3d3ea638695702b0dc2b. The release_2026-11-18/proven subdirectory refers to the older 1.2237x build.
+Run every new candidate against the frozen reference on the local RTX 3050 before assigning a gain. Record measured scope, output agreement, active dispatch, matched timing pairs, unchanged control and independent confirmation. Track signed rewards and keep failed trials in the ledger.
+Use research_2026-11-18_rl/PROTOCOL.md and its reusable run_pair.py driver. See research_2026-11-18_rl/RESULTS.md and ledger.json for current measurements. Seek the user's permission before any scored submission. The desired serving target is 2x, with 1.8x as the minimum credible projection for a proposal.
+
+The optimization goal remains active after a benchmarking batch. Use its rewards to implement another candidate, then measure it against the exact release. Current structural branches are whole-expert placement and replicas, expert-major Humming GEMMs, sequence-parallel target prefill, and safe omission of obsolete draft-cache work. Prioritize according to the measured serving phases in research_2026-11-18_rl/frontier_budget.json. A proxy or isolated gain does not establish a serving score.
+
+Earlier session records follow.
+LATEST CHECKPOINT - resumed local2.5x research
+2026-11-17T11:42:57.994713+00:00
+Read swarm_2026-11-17/deep_research/round2_25x/coordination/RESEARCH_HANDOFF.txt and RESEARCH_INDEX.json first.
+Best confirmed whole-serving score remains1.2237x;2.5x not established. No new submissions/checks or serving-source changes. Root/scored patch hashes verified unchanged.
+Old virtual-K H200 gate is HELD for writer-ownership bug; new corrected gate is under round2_25x/hopper_moe and remains unexecuted.
+All local workers/keeper stopped; GPU0MiB/0%.
+
+Previous handoff follows; do not mistake older research assumptions for current qualification.
+
+LATEST RESEARCH CHECKPOINT - 2026-11-17
+
+Read swarm_2026-11-17/deep_research/coordination/RESEARCH_HANDOFF.txt first.
+Evidence: swarm_2026-11-17/deep_research/coordination/EXPERIMENT_INDEX.json
+Four-agent research duration: 2.009 hours.
+Confirmed serving score remains 1.2237x; screenshot target 3.813x not reached.
+No new submissions or remote checks. Scored candidate and root patch unchanged.
+Previous handoff is preserved verbatim below and in the research backup.
+
+--- PREVIOUS HANDOFF ---
+
+SERVING SWARM - ONE-HOUR RESEARCH HANDOFF
+
+LATEST USER DIRECTION
+Progress saved. Resume iterative swarm research when the user returns tomorrow.
+Find further enhancements and validate them before making a submission.
+Do not treat the existing local component win as the finished candidate.
+Next-session plan: swarm_2026-11-17/coordination/hour_session/NEXT_SESSION_PLAN.json
+No submission now and no automatic resume scheduled.
+
+Workspace: D:\OpenKernelChallenge\serving
+Research session: 2026-11-16 18:32:18 to 19:32:18 UTC
+Local time: November 17, 00:02 to 01:02 IST
+Experiments stopped before 19:27:18 UTC; final review follows.
+
+The confirmed serving score is still 1.2237x, job e399c79bb1994630.
+3x remains the target, not a demonstrated result or reliable projection.
+No new remote submissions. No candidate promoted. The scored patch and root
+patch.diff hashes were verified unchanged. All work is isolated research.
+
+START HERE TOMORROW
+swarm_2026-11-17/coordination/hour_session/RESEARCH_REPORT.json
+swarm_2026-11-17/coordination/hour_session/EVIDENCE_INDEX.json
+swarm_2026-11-17/coordination/hour_session/NEXT_EXPERIMENT_K_PARTITION.json
+The evidence index retains successful and failed run receipts and hashes.
+
+MOST USEFUL NEW RESULT
+The adaptive expert partition currently stops at 4096 route slots. A scalable
+histogram prototype extends it to larger prefills without host route reads.
+At 753 tokens, the 50 W RTX3050 run measured 2.82x uniform and 2.28x hot-expert
+speedup for the isolated expert chain, with bitwise numerical agreement and
+stable A/A controls. The all-remote case regressed to 0.954x.
+At 513 tokens, a partial boundary run passed numerical checks and measured
+1.71x uniform / 1.44x hot / 0.915x all-remote.
+BUT 1024 tokens failed the unchanged raw-down numerical gate. Broad eligibility
+is not qualified. No end-to-end or H200 speedup follows from these figures.
+
+The next concrete experiment is to preserve the baseline K partition while
+using smaller row tiles. Passing local 513/753 cases retained blockK64; failing
+1024 changed light blockK64 to128 with warpK64. This is a source hypothesis,
+not a proven fix. Keep FP32 accumulation, BF16 boundaries, and original gates.
+Hopper configurations differ and require their own actual execution tests.
+Evidence: projection_communication/phase4_hour/HOUR_HANDOFF.json under the
+swarm_2026-11-16 directory; normal_power_scalable_run_01 and boundary_normal_power_run_01.
+
+OTHER RESEARCH LANES
+Hopper producer-only TMA: 88/88 configurations compiled offline, plus 10 matched
+baseline builds. Canonical weights remain shared. Register reductions did not
+increase representative CTA occupancy; large-tile spills also exist in baseline.
+No Hopper descriptor, barrier, graph, numerical or timing execution yet.
+B-only and B-plus-scales have no universal resource winner. Default-off export
+is not ready for submission. Naive multicast is incorrect across expert borders.
+Evidence: moe/phase4_hour/HANDOFF.json and producer_export/manifest.json.
+
+Speculation: reducing native query width failed 12/64 cases. Preserving full8
+attention shape passed 128 exact comparisons. Naive expert suffix masking
+changed light/heavy arithmetic; retaining the same-input histogram fixed one
+layer but failed changed-tail adversaries that model later-layer divergence.
+A route-independent unsplit reference passed 40 strict mask-invariance checks,
+but separately failed the baseline raw tolerance. That rejection remains; the
+isolation diagnostic is not promotion and has no timing claim. Full output,
+acceptance, EOS, KV and auxiliary-state qualification remains necessary.
+
+Auxiliary packing: direct FP32-to-BF16 writes into a shared prefill buffer passed
+CPU ownership/order checks and 10 changed-input CUDA graph comparisons. Actual
+model/BCG integration and asynchronous consumer ordering remain pending. A
+1.25 GiB illustrative auxiliary payload is not measured peak-memory savings.
+Evidence: attention_speculation/phase4_hour/HOUR_RESEARCH_REPORT.json and
+NEXT_DAY_AUX_INTEGRATION.json.
+
+Profiling: GEMMs dominate the isolated local expert chain. Fixed-policy controls
+confirm that spreading equal route counts across more experts raises runtime.
+This does not establish the full serving critical-path fraction. Root topology,
+scheduling and attention-page audits record supported paths and false shortcuts.
+
+HARDWARE AND MEASUREMENT
+Earlier tests ran with a 10 W ceiling, P8/210 MHz SM/405 MHz memory and software
+power/thermal limiting. Around 19:24 UTC the observed ceiling returned to 50 W
+without assistant setting changes. The fresh loaded run recorded P0, roughly
+1710-1807 MHz SM, 5411 MHz memory and 47-48 W. Keep these regimes separate.
+Neither set is an H200 serving forecast. Hardware diagnostics are saved.
+
+REMOTE STATUS AND NEXT STEPS
+At 19:18 UTC, checks fa0d2a0fcf584339 and 6570fbd9e1b64ce4 were still queued,
+with no results. Do not duplicate them. Last verified quota was exhausted;
+reset is November 17 00:00 UTC / 05:30 IST. Recheck live status before any run.
+Official deadline last verified: November 20 08:00 UTC / 13:30 IST.
+First resolve the K-partition numerical issue, then seek actual H200 profiling
+and qualification of the strongest coherent change. Do not spend the one scored
+run on an unsupported small-gain package or these unqualified prototypes.
+
+The supplied Slack image link could not be read: web fetch inaccessible and
+browser host unavailable. No Slack installation. Its 3-3.5x claim is unverified.
+No automatic research, polling or next-day resume is scheduled.
+Earlier checkpoint: hour_session/previous_SESSION_HANDOFF.txt.

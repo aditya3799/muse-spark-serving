@@ -1,0 +1,70 @@
+Research continuation: 2026-11-20 IST
+Recorded UTC: 2026-11-19T19:00:27.363181+00:00
+
+Decision: preserve the scored 1.2363x release. No scored submission requested or made.
+No new end-to-end speedup or 2x projection is established.
+
+Official unscored jobs (authenticated direct API, avoiding hung WSL):
+f464d5f09f534363: queued
+f43fa02892254879: queued
+f038a667401a4d0a: queued
+
+MoE: new GPU raw-scale converter
+Implemented standalone CUDA conversion from the previously studied WGS packed layout to the raw-scale PR50800 layout.
+Two implementations: generic dimensions and compile-time N=4096/8192 specialization. Three block sizes (128/256/512) tested.
+Each implementation passed eight cases: two seeds, E=1/2, W2/W13 geometry. All 16 nibble values and all 256 scale byte values are included.
+Compared GPU output against an independent NumPy forward packer, inverted it back to original codes/scales, checked unchanged source bytes and guard regions, and replayed CUDA graphs after changing source contents.
+Peak PyTorch allocation was 150,996,992 bytes for each suite; this is the test allocation, not a production model residency measurement.
+Paired confirmation: 18 alternating-order rounds, generic baseline and duplicate control, specialized candidate, exact equality each round.
+E=1 N=4096: conversion-only 1.2434x; worst pair 1.2181x; control ratios 0.9848..1.0223
+E=1 N=8192: conversion-only 1.3112x; worst pair 1.2955x; control ratios 0.9944..1.0059
+E=2 N=4096: conversion-only 1.2521x; worst pair 1.2207x; control ratios 0.9975..1.0070
+E=2 N=8192: conversion-only 1.3147x; worst pair 1.3078x; control ratios 0.9959..1.0019
+This baseline is the new generic converter, NOT stock serving or scored Humming. No MoE GEMM, full FFN, model loader, H200 execution or serving throughput was measured.
+One E32 layer of the two packed matrices totals 905,969,664 bytes (864 MiB). Retaining an additional converted copy across many layers would violate the memory budget. Production ownership/freeing and a viable exact fallback remain unsolved; do not integrate this as a serving speedup.
+
+Decode/prefill validation harness repair
+The previous exported-adapter probe captured its row router on a different stream than registration. That can exercise the full native FC plus gather fallback and still report graph output correctness.
+The repaired isolated probe creates a dedicated stream before registration and captures on that same stream. It also asserts fallback equality instead of merely recording a boolean.
+The repair parses but has not run on the Linux candidate runtime. Do not claim exported-adapter fast-path graph validation yet.
+
+Public source audit
+sgl-muse-mega commit 0775fc62f768a781b74114afb6b4f075d31f73f5:
+https://github.com/facebookresearch/sgl-muse-mega/tree/0775fc62f768a781b74114afb6b4f075d31f73f5
+Its draft FC uses output sharding, corroborating the structural direction of our existing decode candidate. This is not new measurement of our code.
+Its spec admits sm_103, batch-1 decode, BF16 KV, and tolerance-based numerics. The draft head uses an E4M3 pre-score copy and BF16 rescoring of survivors. Its 2.1x GB300 claim does not transfer to the challenge H200/lossless configuration.
+Kinetic commit 57ec84a19e1fb046f39753799156312cdc1ffd24:
+https://github.com/Veloresearch/kinetic/tree/57ec84a19e1fb046f39753799156312cdc1ffd24
+Shortlist is restricted to CPU Q6_K/Q8_0 heads, with a Q4_K auxiliary copy and explicit bounds tied to their kernel rounding. It does not provide a BF16 cuBLAS/Hopper rounding proof. Direct transplantation is rejected; no shortlist modification was added.
+
+Environment and next work
+Linux WSL was unresponsive. User authorized restart; wsl --shutdown hung and Windows denied Restart-Service WslService. User was asked to run the restart in Administrator PowerShell.
+Windows PyTorch 2.6.0+cu124 on RTX3050 SM86 worked for the converter. This differs from the Linux CUDA13 runtime and the judge.
+After WSL recovery: run the repaired projection probe on the original runtime, reduce row-chain shapes to 512/768/3072, isolate shapes into processes to avoid cumulative memory pressure, collect holdout paired controls, then inspect any official completed results.
+The scored release and user working tree were not modified by this continuation. New files reside under research_2026-11-20.
+
+LOCAL VALIDATION CONTINUATION -- 2026-11-19T20:59:07.171481+00:00
+This section supersedes the earlier pending Linux-validation and WSL-recovery status.
+
+WSL was recovered and the repaired exported-adapter probe ran on Linux torch 2.14.1+cu130.
+The main GPU matrix finished: 14 exported-adapter cases, 8 decode-chain cases and 8 prefill-chain cases passed. Two initial 16384-row prefill cases timed out; both then passed separate four-round completion runs including changed-input graph replay. The original timeout records are preserved.
+Four additional composed model/worker projection-to-KV fixtures passed at rows 8, 256, 512 and 3072 using real checkpoint data. These execute extracted production methods, not a complete SGLang server.
+Both actual CUDA factory suites passed lifetime, stream, fallback and memory checks. One row-factory fixture measured incremental peak allocated memory of 1,686,504,960 bytes; this is a scoped local fixture, not a full-server memory guarantee.
+CPU Gloo, scheduler ordering, unregistered-live-shape fallback and child-process timeout checks passed. GPU peers remain serialized/mocked; no physical TP8 NCCL measurement was made.
+Compute Sanitizer results and explicit log/fixture verification are recorded in local_validation/LOCAL_REPORT.json. Only completed zero-error runs with active optimized paths count as passes. Sanitizer tests use synthetic 1024x1024 weights, supplementing the real-weight tests rather than replacing them.
+
+Coverage finding: live/raw token rows must match a registered shape. Prefill graph padding and worker alignment padding are trimmed before the FC. Graph bucket coverage therefore does not establish optimized-path frequency in serving; unsupported shapes correctly use native fallback.
+
+All busy telemetry samples remain P8 at 210 MHz core / 405 MHz memory, approximately 10 W. Timing promotion is unsupported. No direct DRAM-bandwidth utilization measurement was collected. Dividing one GPU into virtual peers does not emulate H200 or its interconnect.
+
+Three current unscored jobs remain queued as of the most recent API poll. An older fourth job, 0afdc0b191dd4b42, completed: the retired Hopper routed-expert patch passed correctness but regressed to 0.529x stock throughput and exceeded TTFT limits. That is not a result for the current projection candidates. Queued submissions also predate the current frozen candidate revisions.
+
+No new production optimization was integrated during this validation continuation. The scored 1.2363x baseline and all four frozen candidate hashes are unchanged. MoE converter work remains standalone and is not included in these candidates. No new submission was made, and no 2x or H200 speedup is established.
+
+Detailed evidence: local_validation/LOCAL_REPORT.json and local_validation/LOCAL_REPORT.txt.
+
+Final validation: all five sanitizer jobs passed with zero reported errors/hazards and active-path exact graph fixtures. All GPU test processes finished. Owned telemetry stopped; all six paused SigNoz containers restored and observed running (health checks still starting). See local_validation/cleanup_receipt.json.
+
+USER-AUTHORIZED SCORED SUBMISSION: joint candidate e52f7fd43ec38e96b13940c24a69222de0bccb8351255d8f44eff28dc0fef21d submitted as mode=run, --moe-runner-backend humming. Job 2b583e18aad84d09. Initial status: queued. Submitted UTC: 2026-11-19T21:05:29.3335137Z. Receipt: scored_joint_submission/response.json. This supersedes the earlier no-submission status; performance remains unknown until results.
+
+SCORED RESULT 2b583e18aad84d09: done, score 1.2239x versus prior best 1.2363x (1.003% lower score). Correctness and later-turn checks passed; no frontier loads excluded; reported memory delta -1.0 GB/GPU, limit 2.0 GB. Keep prior release as best measured candidate. Earlier speculative 1.5-1.6x projection was not realized. Root cause and statistical significance are not established by this comparison. Evidence: scored_joint_submission/status.json and result_summary.json.

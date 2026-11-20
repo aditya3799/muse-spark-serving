@@ -1,0 +1,70 @@
+--- a/python/sglang/kernels/ops/layernorm/muse_spark_norm_residual_jit.py
++++ b/python/sglang/kernels/ops/layernorm/muse_spark_norm_residual_jit.py
+@@ -84,10 +84,12 @@
+ 
+ 
+ def norm_residual_launch_config(
+-    hidden_size: int, num_tokens: int
++    hidden_size: int, num_tokens: int, *, use_clusters: bool = True
+ ) -> tuple[int, int, bool]:
+-    """Return (cluster size, threads, prefetch) for the automatic shape policy."""
+-    cluster_size = _cluster_size_for_shape(hidden_size, num_tokens)
++    """Return (cluster size, threads, prefetch), optionally using one CTA per row."""
++    cluster_size = (
++        _cluster_size_for_shape(hidden_size, num_tokens) if use_clusters else 1
++    )
+     threads, prefetch = _cluster_launch_config(hidden_size, num_tokens, cluster_size)
+     return cluster_size, threads, prefetch
+ 
+--- a/python/sglang/kernels/ops/communication/muse_spark_all_gather_norm_residual.py
++++ b/python/sglang/kernels/ops/communication/muse_spark_all_gather_norm_residual.py
+@@ -78,11 +78,13 @@
+         or num_tokens * hidden_size * 2 > comm.max_push_size
+     ):
+         return False
+-    if not _supports_clusters():
++    if torch.cuda.get_device_capability()[0] < 9:
+         return False
+     try:
+         cluster_size, _, _ = norm_residual_launch_config(
+-            hidden_size=hidden_size, num_tokens=num_tokens
++            hidden_size=hidden_size,
++            num_tokens=num_tokens,
++            use_clusters=_supports_clusters(),
+         )
+     except RuntimeError:
+         return False
+@@ -106,7 +108,11 @@
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     """Return BF16 normalized output and FP32 residual for the gathered branch."""
+     num_tokens, hidden_size = stream.shape
+-    config = norm_residual_launch_config(hidden_size=hidden_size, num_tokens=num_tokens)
++    config = norm_residual_launch_config(
++        hidden_size=hidden_size,
++        num_tokens=num_tokens,
++        use_clusters=_supports_clusters(),
++    )
+     output = torch.empty(
+         num_tokens, hidden_size, dtype=torch.bfloat16, device=stream.device
+     )
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -57,6 +57,7 @@
+     prefill_row_projection_supported,
+     reserve_projection_workspace,
+     small_projection,
++    small_projection_local,
+     small_projection_supported,
+ )
+ from sglang.srt.layers.cp.utils import is_cp_active
+@@ -762,6 +763,10 @@
+                     get_parallel().tp_group, output, self.post_expert_proj.weight
+                 )
+             if self._can_shard_small_projection(output, self.post_expert_proj.weight):
++                if self._defers_unpool_gather(comm, output.shape[0]):
++                    return small_projection_local(
++                        comm, output, self.post_expert_proj.weight
++                    )
+                 return small_projection(
+                     get_parallel().tp_group, output, self.post_expert_proj.weight
+                 )

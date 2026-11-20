@@ -1,0 +1,26 @@
+W1119 09:46:38.324000 1169 torch/utils/cpp_extension.py:183] No CUDA runtime is found, using CUDA_HOME='/home/aditya/.venvs/okc-marlin-tiles/lib/python3.12/site-packages/nvidia/cu13'
+{'ok': False, 'error': 'grouped CUDA build failed: /tmp/sglang_muse_grouped_b2987a8e92cbb0440be9/kernel.cu(114): warning #550-D: variable "args" was set but never used\n    DeviceGemm::Arguments args{};\n                          ^\n\nRemark: The warnings can be suppressed with "-diag-suppress <warning-number>"\n\n/tmp/sglang_muse_grouped_b2987a8e92cbb0440be9/kernel.cu(114): warning #550-D: variable "args" was set but never used\n    DeviceGemm::Arguments args{};\n                          ^\n\nRemark: The warnings can be suppressed with "-diag-suppress <warning-number>"\n\nLLVM ERROR: out of memory\nAborted (core dumped)\n', 'local_header_resolution_override_only': True, 'seconds': 73.13140005, 'peak_rss_kib': 4355496}
+Command exited with non-zero status 1
+	Command being timed: "timeout 180 /home/aditya/.venvs/okc-marlin-tiles/bin/python -u research_2026-11-19/moe/build_host_package.py"
+	User time (seconds): 48.84
+	System time (seconds): 8.11
+	Percent of CPU this job got: 71%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:20.22
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 4355496
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 23652
+	Minor (reclaiming a frame) page faults: 1221281
+	Voluntary context switches: 107926
+	Involuntary context switches: 304
+	Swaps: 0
+	File system inputs: 1601056
+	File system outputs: 404472
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 1

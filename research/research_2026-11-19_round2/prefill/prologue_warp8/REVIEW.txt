@@ -1,0 +1,39 @@
+﻿Eight-warp compiler-layout repair: separate, unapplied experiment
+
+The original four-warp BLOCK32 veto remains in ../prologue_rounding_debug/VERDICT.txt.
+This experiment changes only the launch policy: eight warps for BLOCK32, four
+warps for the smaller blocks. No frozen kernel or runtime file was edited.
+
+Completed narrow gate:
+- One offline SM90 full-attention native-FP8 specialization under a2GiB host cap.
+  Its per-head layout is eight columns/thread and eight lanes, with shuffles4/2/1.
+  Row distribution uses eight warps instead of native four; it does not change the
+  per-head sum sequence. PTX local pair sums and butterfly sequence were inspected.
+- Saved-row SM86 tests at real4095/pad4096 and real16383/pad16384 now match original
+  native Q and K bytes. FP32 variance and reciprocal std match; the former failing
+  pre-cast value is0.5917968153953552 and BF16 is0.58984375 on both paths.
+- All instrumented final outputs match the corresponding original kernels, so
+  added diagnostic stores did not mask the saved-row result.
+- Peak allocated239,470,592B, reserved260,046,848B. This is a tiny kernel fixture,
+  not whole-serving incremental memory or performance evidence.
+
+Completed broader gate:
+- One offline SM90 RoPE/native-FP8 specialization also restores the native
+  eight-column/eight-lane reduction and shuffle4/2/1 sequence.
+- byte_matrix.json passes42 cells: seven real/padded geometries through exact16K,
+  full and RoPE, random/integer/poisoned padding, sparse destinations, row strides,
+  changed positions and graph replay. Full Q/K/V backing and reserved slot0 match.
+- Captured old metadata pointer versus fresh eager metadata identity control passes.
+- Peak allocated210518528 bytes, reserved304087040 bytes; elapsed3.9213s.
+  This is correctness-run duration, NOT a comparative performance measurement.
+- The original four-warp failure and saved-row observer checks remain preserved.
+
+Reachability and limitations:
+The frozen production shape budget remains16MiB, admitting M<=2016, so it still
+does not activate BLOCK32. Direct large-M launches here are explicit fixture
+injection. No automatic prefill hook, calibration-budget increase, H200 execution,
+native FP8 attention equivalence or serving gain has been established.
+
+Receipts: offline_receipt.json; ../prologue_rounding_debug/warp8_reproducer.json;
+SM90 full native-FP8 IR/PTX here and SM86 original/debug IR in the sibling directory.
+

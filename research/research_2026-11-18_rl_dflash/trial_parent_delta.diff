@@ -1,0 +1,83 @@
+--- a/python/sglang/srt/models/dflash.py
++++ b/python/sglang/srt/models/dflash.py
+@@ -39,7 +39,7 @@
+     sharded_weight_loader,
+ )
+ from sglang.srt.models.utils import apply_qk_norm
+-from sglang.srt.runtime_context import get_parallel, get_spec
++from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
+ from sglang.srt.speculative.dflash_utils import (
+     can_dflash_slice_qkv_weight,
+     get_dflash_attention_sliding_window_size,
+@@ -1261,6 +1261,25 @@
+         return tokens, q_rows
+ 
+ 
++def _project_prefix_fc(hidden, weight, lengths, width):
++    """Project only live tokens. The caller consumes only their output rows.
++
++    This eager path synchronizes once to obtain the nonzero row count. A
++    capture never enters it. The full-acceptance path retains the original
++    native BF16 matmul geometry. Both arms omit the same downstream RMSNorm.
++    """
++    if hidden.is_cuda and torch.cuda.is_current_stream_capturing():
++        return torch.nn.functional.linear(hidden, weight)
++    live = (torch.arange(width, device=hidden.device) < lengths[:, None]).reshape(-1)
++    indices = live.nonzero().flatten()
++    if indices.numel() == hidden.shape[0]:
++        return torch.nn.functional.linear(hidden, weight)
++    compact = torch.index_select(hidden, 0, indices)
++    projected = torch.nn.functional.linear(compact, weight)
++    expanded = projected.new_zeros((hidden.shape[0], weight.shape[0]))
++    return expanded.index_copy_(0, indices, projected)
++
++
+ class DFlash2DraftModel(DFlashDraftModel):
+     """DFlash backbone + candidate selector. Reuses the DFLASH speculative worker."""
+ 
+@@ -1280,6 +1299,21 @@
+         # The draft has no head of its own; the worker points this at the target's
+         # before capture.
+         self.lm_head: Optional[nn.Module] = None
++
++    def project_accepted_target_hidden(self, hidden, lengths, width):
++        if (
++            self.quantizable
++            or not isinstance(self.fc, nn.Linear)
++            or hidden.dtype != torch.bfloat16
++            or self.fc.weight.dtype != hidden.dtype
++            or not hidden.is_cuda
++            or torch.cuda.is_current_stream_capturing()
++            or get_exec().deterministic.enable_deterministic_inference
++            or hidden.ndim != 2
++            or hidden.shape != (lengths.numel() * width, self.fc.in_features)
++        ):
++            return self.project_target_hidden(hidden)
++        return self.hidden_norm(_project_prefix_fc(hidden, self.fc.weight, lengths, width))
+ 
+     def _transform_unary_logits(self, logits: torch.Tensor) -> torch.Tensor:
+         logits = logits.float()
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -1926,7 +1926,20 @@
+             torch.inference_mode(),
+             draft_tp_context(self.draft_parallel_layout),
+         ):
+-            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
++            prefix_projection = getattr(
++                self.draft_model, "project_accepted_target_hidden", None
++            )
++            if (
++                prefix_projection is not None
++                and cache_loc_2d is not None
++                and commit_lens is not None
++                and self.lilicorr is None
++            ):
++                ctx_hidden = prefix_projection(
++                    target_hidden, commit_lens, int(cache_loc_2d.shape[1])
++                )
++            else:
++                ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+             if self.lilicorr is not None:
+                 self._lilicorr_anchor = publish_anchor(
+                     draft_sampler=self._draft_sampler,

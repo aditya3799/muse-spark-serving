@@ -1,0 +1,82 @@
+diff --git a/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py b/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
+index 41c463d..9e0cdc0 100644
+--- a/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
++++ b/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
+@@ -411,22 +411,26 @@ class MuseSpark1xFp4Experts(nn.Module):
+             if num_tokens * topk / self.num_local_experts / block_size_m < 0.9:
+                 break
+ 
+-        if num_tokens == 1 and topk <= 32 and expert_map is None:
++        # Mapping can merge remote routes into repeated -1 sentinels. The
++        # single-token aligner tie-breaks by slot, so these still form a valid
++        # inactive prefix while every local route keeps its original slot.
++        if num_tokens == 1 and topk <= 32:
+             from sglang.kernels.ops.moe.moe_align_single_token import (
+                 moe_align_single_token,
+             )
+ 
+             sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                 moe_align_single_token(
+-                    local_topk_ids, block_size_m, return_inactive_prefix_count=True
++                    local_topk_ids,
++                    block_size_m,
++                    return_inactive_prefix_count=expert_map is None,
+                 )
+             )
+         else:
+-            align_num_experts = (
+-                self.global_num_experts
+-                if expert_map is not None
+-                else self.num_local_experts
+-            )
++            # IDs have already been mapped to [-1, num_local_experts).
++            # Global-sized histograms waste buckets and can bypass the
++            # alignment kernel's small-batch path under expert parallelism.
++            align_num_experts = self.num_local_experts
+             sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                 local_topk_ids,
+                 block_size_m,
+diff --git a/python/sglang/srt/models/muse_spark.py b/python/sglang/srt/models/muse_spark.py
+index 6b638e9..ed1eaee 100644
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -221,28 +221,30 @@ class MuseSpark1xRouter(nn.Module):
+         self.register_buffer(
+             "e_score_correction_bias", torch.zeros(num_experts, dtype=torch.float32)
+         )
+-        self._split2_hi = None
+-        self._split2_lo = None
++        self._split2_weight = None
+         self._split2_key = None
+ 
+     @torch.no_grad()
+     def _build_split2(self) -> None:
+-        w = self.weight.data
+-        key = (w.data_ptr(), w.shape, w._version)
++        w = self.weight
++        # Keep the parameter's version counter: .data hides in-place weight
++        # updates and could leave the packed router stale after a reload.
++        key = (w.data_ptr(), w.shape, w.dtype, w.device, w._version)
+         if self._split2_key == key:
+             return
+         hi = w.to(torch.bfloat16)
+         lo = (w - hi.to(torch.float32)).to(torch.bfloat16)
+-        self._split2_hi = hi.t().contiguous()
+-        self._split2_lo = lo.t().contiguous()
++        # Share the input read and GEMM launch while retaining separate FP32
++        # accumulators for the high and low BF16 components.
++        self._split2_weight = torch.cat((hi, lo)).t().contiguous()
+         self._split2_key = key
+ 
+     def forward_split2(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         self._build_split2()
+         x = hidden_states.to(torch.bfloat16)
+-        acc = torch.mm(x, self._split2_hi, out_dtype=torch.float32)
+-        acc += torch.mm(x, self._split2_lo, out_dtype=torch.float32)
+-        return acc
++        acc = torch.mm(x, self._split2_weight, out_dtype=torch.float32)
++        hi, lo = acc.chunk(2, dim=-1)
++        return hi + lo
+ 
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         # Decode-sized FP32 logits: one CuTe GEMV instead of cuBLAS split-K + reduce.

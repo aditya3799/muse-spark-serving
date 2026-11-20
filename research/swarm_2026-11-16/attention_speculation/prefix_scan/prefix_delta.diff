@@ -1,0 +1,70 @@
+--- a/python/sglang/kernels/ops/attention/metadata.py
++++ b/python/sglang/kernels/ops/attention/metadata.py
+@@ -223,20 +223,44 @@
+     BLOCK_COLS: tl.constexpr,
+     SKIP_PAGE_TABLE: tl.constexpr,
+     ZERO_TAIL: tl.constexpr,
++    PREFIX_BLOCK: tl.constexpr,
+ ):
+     pid_b = tl.program_id(0)
+     pid_c = tl.program_id(1)
+ 
+     # One block computes the sequence lengths and prefix sum.
+     if pid_b == 0 and pid_c == 0:
+-        acc = 0
+-        for idx in range(B):
+-            seq = tl.load(seq_lens + idx * seq_lens_stride_0)
+-            val = (seq + SEQ_LEN_DELTA).to(tl.int32)
+-            tl.store(cache_seqlens_int32 + idx * cache_seqlens_int32_stride_0, val)
+-            tl.store(cu_seqlens_k + idx * cu_seqlens_k_stride_0, acc)
+-            acc += val
+-        tl.store(cu_seqlens_k + B * cu_seqlens_k_stride_0, acc)
++        if PREFIX_BLOCK > 0:
++            rows = tl.arange(0, PREFIX_BLOCK)
++            valid = rows < B
++            seq = tl.load(seq_lens + rows * seq_lens_stride_0, valid, other=0)
++            # Apply the mask after adding delta: padding lanes contribute zero.
++            values = tl.where(valid, (seq + SEQ_LEN_DELTA).to(tl.int32), 0)
++            inclusive = tl.cumsum(values, axis=0)
++            tl.store(
++                cache_seqlens_int32 + rows * cache_seqlens_int32_stride_0,
++                values,
++                valid,
++            )
++            tl.store(
++                cu_seqlens_k + rows * cu_seqlens_k_stride_0,
++                inclusive - values,
++                valid,
++            )
++            tl.store(
++                cu_seqlens_k + B * cu_seqlens_k_stride_0,
++                tl.sum(values, axis=0),
++            )
++        else:
++            # Keep the scalar path for large scans or overlapping output rows.
++            acc = 0
++            for idx in range(B):
++                seq = tl.load(seq_lens + idx * seq_lens_stride_0)
++                val = (seq + SEQ_LEN_DELTA).to(tl.int32)
++                tl.store(cache_seqlens_int32 + idx * cache_seqlens_int32_stride_0, val)
++                tl.store(cu_seqlens_k + idx * cu_seqlens_k_stride_0, acc)
++                acc += val
++            tl.store(cu_seqlens_k + B * cu_seqlens_k_stride_0, acc)
+ 
+     if SKIP_PAGE_TABLE:
+         return
+@@ -587,6 +611,14 @@
+         BLOCK_COLS=block_cols,
+         SKIP_PAGE_TABLE=skip_page_table,
+         ZERO_TAIL=zero_tail,
++        # Bound scan register use; this depends only on tensor geometry.
++        PREFIX_BLOCK=(
++            triton.next_power_of_2(max(1, batch_size))
++            if batch_size <= 1024
++            and cache_seqlens_int32.stride(0) > 0
++            and cu_seqlens_k.stride(0) > 0
++            else 0
++        ),
+         num_warps=block_cols // 32,
+         num_stages=3,
+     )

@@ -1,0 +1,286 @@
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -4,6 +4,11 @@
+ from typing import TYPE_CHECKING, List, Optional, Tuple
+ 
+ import torch
++
++from sglang.srt.speculative.dflash_prefix_verification import (
++    next_prefix_accept_buffers,
++    resolve_prefix_verification_width,
++)
+ 
+ from sglang.kernels.ops.speculative.cache_locs import (
+     assign_extend_cache_locs_func,
+@@ -2164,7 +2169,7 @@
+         self._accept_bonus_buffer_cap = new_cap
+ 
+     def _next_accept_bonus_buffers(
+-        self, bs: int
++        self, bs: int, block_size: Optional[int] = None
+     ) -> tuple[
+         torch.Tensor,
+         torch.Tensor,
+@@ -2172,6 +2177,8 @@
+         torch.Tensor,
+         torch.Tensor,
+     ]:
++        if block_size is not None and block_size != int(self.block_size):
++            return next_prefix_accept_buffers(self, bs, block_size)
+         self._ensure_accept_bonus_buffers(bs)
+         assert self._accept_len_buf is not None
+         slot = self._accept_bonus_buffer_slot
+@@ -2225,7 +2232,7 @@
+         else:
+             if target_predict is None:
+                 target_predict = torch.argmax(next_token_logits, dim=-1)
+-            target_predict = target_predict.view(bs, int(self.block_size))
++            target_predict = target_predict.view(bs, candidates.shape[1])
+             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
+             if self._use_triton_accept_bonus:
+                 try:
+@@ -2235,7 +2242,7 @@
+                         bonus,
+                         out_tokens,
+                         new_seq_lens,
+-                    ) = self._next_accept_bonus_buffers(bs)
++                    ) = self._next_accept_bonus_buffers(bs, candidates.shape[1])
+                     _compute_dflash_accept_bonus_triton_unchecked(
+                         candidates=candidates,
+                         target_top1=target_predict,
+@@ -2816,6 +2823,20 @@
+             GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
+         )
+ 
++        # Draft diffusion and proposal generation retain their original width.
++        verify_block_size = resolve_prefix_verification_width(
++            self, batch, get_parallel()
++        )
++        verify_cols = None
++        if verify_block_size != block_size:
++            draft_tokens = draft_tokens[:, :verify_block_size].contiguous()
++            positions = positions_2d[:, :verify_block_size].contiguous().view(-1)
++            verify_out_cache_loc_2d = (
++                verify_out_cache_loc_2d[:, :verify_block_size].contiguous()
++            )
++            verify_out_cache_loc = verify_out_cache_loc_2d.view(-1)
++            verify_cols = slice(0, verify_block_size)
++
+         # --- 2) Target verify.
+         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
+         custom_mask = None
+@@ -2824,10 +2845,11 @@
+         verify_input = DFlashVerifyInput(
+             draft_token=verify_input_ids,
+             positions=positions,
+-            draft_token_num=int(self.block_size),
++            draft_token_num=verify_block_size,
+             custom_mask=custom_mask,
+             capture_hidden_mode=CaptureHiddenMode.FULL,
+             kv_loc_plan=kv_loc_plan,
++            kv_loc_cols=verify_cols,
+         )
+ 
+         batch.out_cache_loc = verify_out_cache_loc
+@@ -2840,7 +2862,7 @@
+         seq_lens_sum_backup = batch.seq_lens_sum
+         if seq_lens_cpu_backup is not None:
+             # Verify host bound = committed prefix + one verify block (matches draft).
+-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
++            verify_host_seq_lens = seq_lens_cpu_backup + verify_block_size
+             batch.seq_lens_cpu = verify_host_seq_lens
+             batch.seq_lens_sum = int(verify_host_seq_lens.sum())
+         elif draft_input.nxt_kv_lens_cpu is not None:
+@@ -2911,7 +2933,7 @@
+             apply_dflash_verify_logits_adjustments(
+                 next_token_logits=logits_output.next_token_logits,
+                 sampling_info=sampling_info,
+-                draft_token_num=int(self.block_size),
++                draft_token_num=verify_block_size,
+             )
+ 
+         # Constrain every chain position before accept picks from it.
+@@ -2939,7 +2961,7 @@
+             sampling_info,
+             next_token_logits=logits_output.next_token_logits,
+             draft_input=draft_input,
+-            draft_token_num=int(self.block_size),
++            draft_token_num=verify_block_size,
+             bs=bs,
+         )
+         if sampling_mask_capture is not None:
+@@ -2953,7 +2975,7 @@
+                 batch,
+                 logits_output,
+                 out_tokens.reshape(-1),
+-                chain_stride=block_size,
++                chain_stride=verify_block_size,
+             )
+ 
+         if self._need_mamba_verify_commit:
+@@ -2978,11 +3000,13 @@
+             raise RuntimeError(
+                 "DFLASH verify requires target hidden states, but got None."
+             )
+-        hidden = hidden.view(bs, int(self.block_size), -1)
++        hidden = hidden.view(bs, verify_block_size, -1)
+ 
+         # Consume in this step: every decode graph size shares one aux output,
+         # which the next target forward overwrites (resolve_aux_hidden_states_width).
+-        cache_loc = self._draft_write_ids(kv_loc_plan)
++        cache_loc = kv_loc_plan.write_ids(
++            self.draft_model_runner.kv_index_translator, cols=verify_cols
++        )
+         self._append_target_hidden_to_draft_kv_by_loc(
+             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+             cache_loc=cache_loc,
+@@ -3006,6 +3030,9 @@
+             can_run_cuda_graph=can_run_cuda_graph,
+             next_draft_input=next_draft_input,
+             speculative_num_draft_tokens=int(self.block_size),
++            speculative_output_stride=(
++                verify_block_size if verify_block_size != block_size else None
++            ),
+             # The non-overlap (sync) scheduler path advances batch.seq_lens
+             # from the result; overlap carries it via next_draft_input instead.
+             new_seq_lens=new_seq_lens,
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -48,7 +48,11 @@
+ )
+ from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
+ from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
+-from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
++from sglang.srt.speculative.spec_info import (
++    SpecInput,
++    SpecInputType,
++    SpeculativeAlgorithm,
++)
+ from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
+ from sglang.srt.utils import get_compiler_backend
+ from sglang.srt.utils.common import get_device_capability
+@@ -1034,6 +1038,15 @@
+             # TODO: we need to test this part for llama 4 eagle case
+             self._maybe_init_local_attn_metadata(metadata, device)
+         elif forward_batch.forward_mode.is_target_verify():
++            verify_width = self.speculative_num_draft_tokens
++            if (
++                forward_batch.spec_info is not None
++                and forward_batch.spec_info.spec_input_type
++                == SpecInputType.DFLASH_VERIFY
++            ):
++                verify_width = int(forward_batch.spec_info.draft_token_num)
++                if verify_width <= 0:
++                    raise ValueError("DFLASH verification width must be positive")
+             if self.topk <= 1:
+                 ragged_layout = getattr(
+                     forward_batch.spec_info, "ragged_verify_layout", None
+@@ -1057,16 +1070,16 @@
+                     metadata.cu_seqlens_k = geometry.cu_seqlens_k
+                 else:
+                     metadata.cache_seqlens_int32 = (
+-                        forward_batch.seq_lens + self.speculative_num_draft_tokens
++                        forward_batch.seq_lens + verify_width
+                     ).to(torch.int32)
+-                    metadata.max_seq_len_q = self.speculative_num_draft_tokens
++                    metadata.max_seq_len_q = verify_width
+                     metadata.max_seq_len_k = (
+-                        eager_max_k + self.speculative_num_draft_tokens
++                        eager_max_k + verify_width
+                     )
+                     metadata.cu_seqlens_q = torch.arange(
+                         0,
+-                        batch_size * self.speculative_num_draft_tokens + 1,
+-                        self.speculative_num_draft_tokens,
++                        batch_size * verify_width + 1,
++                        verify_width,
+                         dtype=torch.int32,
+                         device=device,
+                     )
+--- /dev/null
++++ b/python/sglang/srt/speculative/dflash_prefix_verification.py
+@@ -0,0 +1,84 @@
++"""Isolated research support for fixed draft / shorter target verification.
++
++Not wired to a server flag. A fixture must explicitly configure the worker.
++This precursor uses eager target verification for non-default widths. Target
++shape-dependent numerical behavior and end-to-end serving remain unqualified.
++"""
++from dataclasses import dataclass
++
++import torch
++
++
++@dataclass(frozen=True)
++class PrefixVerificationConfig:
++    draft_width: int
++    verify_width: int
++
++    def __post_init__(self):
++        if not 1 <= self.verify_width <= self.draft_width:
++            raise ValueError("verify width must be in [1, draft width]")
++
++
++def configure_prefix_verification(worker, verify_width):
++    # Configuration is host-side and must be identical on every TP/EP rank.
++    # No adaptive policy or rank-local measurement is installed here.
++    worker._prefix_verification_config = PrefixVerificationConfig(
++        int(worker.block_size), int(verify_width)
++    )
++
++
++def resolve_prefix_verification_width(worker, batch, parallel):
++    default = int(worker.block_size)
++    config = getattr(worker, "_prefix_verification_config", None)
++    if config is None or config.verify_width == default:
++        return default
++    if config.draft_width != default:
++        raise RuntimeError("draft width changed after prefix configuration")
++    runner = worker.target_worker.model_runner
++    backend = runner.attn_backend
++    supported = (
++        type(backend).__name__ == "FlashAttentionBackend"
++        and backend.fa_impl_ver == 3
++        and backend.topk <= 1
++        and not worker._need_mamba_verify_commit
++        and not parallel.attn_dp_enabled
++        and parallel.attn_cp_size == 1
++        and parallel.attn_dcp_size == 1
++        and parallel.pp_size == 1
++        and not runner.model_config.is_encoder_decoder
++        and runner.lora_manager is None
++        and worker.lilicorr is None
++        and not worker._is_domino
++        and worker._can_skip_verify_logits(batch, batch.sampling_info)
++    )
++    return config.verify_width if supported else default
++
++
++def next_prefix_accept_buffers(worker, batch_size, width):
++    """Same dtypes and two-slot consumer lifetime as stock accept buffers."""
++    states = getattr(worker, "_prefix_accept_buffers", None)
++    if states is None:
++        states = worker._prefix_accept_buffers = {}
++    state = states.get(width)
++    if state is None or state["capacity"] < batch_size:
++        capacity = max(batch_size, 0 if state is None else 2 * state["capacity"])
++        device = worker.device
++        state = {
++            "capacity": capacity,
++            "slot": 0,
++            "accept": torch.empty(capacity, dtype=torch.int32, device=device),
++            "commit": [torch.empty(capacity, dtype=torch.int32, device=device) for _ in range(2)],
++            "bonus": [torch.empty(capacity, dtype=torch.int64, device=device) for _ in range(2)],
++            "tokens": [torch.empty((capacity, width), dtype=torch.int64, device=device) for _ in range(2)],
++            "length": [torch.empty(capacity, dtype=torch.int64, device=device) for _ in range(2)],
++        }
++        states[width] = state
++    slot = state["slot"]
++    state["slot"] = (slot + 1) % 2
++    return (
++        state["accept"][:batch_size],
++        state["commit"][slot][:batch_size],
++        state["bonus"][slot][:batch_size],
++        state["tokens"][slot][:batch_size],
++        state["length"][slot][:batch_size],
++    )

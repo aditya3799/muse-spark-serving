@@ -1,0 +1,51 @@
+Independent read-only review of root audit_vendor_cfg.py (2026-11-19).
+
+Positive: the four BRX successors are bound to NVIDIA -bbcfg -poff labels,
+vendor annotation and DOT edges must agree, all addresses must exist in SASS,
+unpredicated BRX R8 uses the exact negative next-PC offset, target union matches
+the cubin constant2 table, and upstream RS/accumulator state propagation is
+unchanged. Unknown indirect/direct targets reject. The observed report contains
+one function,512RS instructions, zero hazards and a detected injected A-write.
+
+Hardening findings sent to parent before freeze:
+1. Bind actual saved CFG bytes to nvdisasm invocation output hash. The invocation
+   receipt records cubin hash but lacks output hash; independent CFG hashing in
+   the final report does not itself reject stale disassembly. Likewise bind
+   SASS output to the same cubin/tool invocation rather than only recording it.
+2. Assert expected nonempty function and RS inventory. Otherwise a parser-skipped
+   or empty GMMA set gives vacuous all(...) success. The current observed512RS
+   receipt is not empty, so this is a guard gap rather than a reported hazard.
+3. Preserve negative empty/stale binding controls separately from the original
+   unmodified checker failure. This remains static analysis, not H200 execution
+   or proof of memory/barrier semantics beyond the checker's register model.
+
+SUPERSEDING NOTE, after the binding review:
+Root added exact output hashes and nonempty512RS inventory plus seven negative
+binding/inventory controls, closing the two findings above. Prefill then found
+a separate deeper issue: native _link drops the fallthrough of an unpredicated
+BRA.DIV while NVIDIA's CFG has two outgoing edges. Therefore the earlier zero-
+hazard/complete summary is NOT sufficient. The hash/inventory acceptance does
+not validate control-flow completeness. Four variants are under a new successor
+repair/re-audit in the prefill lane; refer only to its final superseding receipt.
+Recommended final check: compare every relevant basic-block successor set to the
+vendor CFG, not merely the fourBRX or branch target existence. No static pass is
+claimed in decode's final index while that repair is pending.
+
+FINAL SUPERSEDING REVIEW, 13:22 UTC:
+The four repaired WGS receipts now pass their artifact-bound static screen.
+Prefill's wgmma_bra_div_repair_review.json binds all four scripts/reports; every
+vendor instruction and all 512 RS sites are reachable, all raw DOT edges parse,
+and missing BRA.DIV fallthrough plus injected A-write controls reject. Native
+CALL edges remain conservative; each helper is separately proven not to create
+or retire GMMA state. This closes the specific coverage gap above.
+
+The separate PR50800 donor and boundary-restored donor audits also pass after
+decode's requested hardening: 1,993 raw/parsed edges, 493 pair plus 691 grouped
+blocks, 384 reachable RS sites, no hidden intrablock control, and only the exact
+disconnected self-BRA/NOP suffix permitted. Missing node, dropped entry edges,
+and corrupted trailing instruction negatives reject, in addition to A-write
+and old-CFG negatives. Prior script/reports have before_coverage_hardening copies.
+These results establish only the stated static register/accumulator screen.
+They do not establish numerical correctness, async memory safety, H200 execution,
+performance, or serving readiness. final_static_cross_review.json binds the
+reviewed receipts; original failures and earlier limitations remain preserved.

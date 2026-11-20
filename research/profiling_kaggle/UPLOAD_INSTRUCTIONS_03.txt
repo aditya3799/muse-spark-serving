@@ -1,0 +1,11 @@
+Upload only 03_kaggle_mapping_candidate.ipynb to Kaggle; it is self-contained.
+
+1. Select GPU T4 and keep the default configuration. Internet can stay off.
+2. Choose Run All. No packages, model files, datasets or credentials are required.
+3. Expected: correctness, benchmark and setup_cost passed. Profiler may be partial if device tracing is unavailable.
+4. Default totals: 672 correctness cases, 96 benchmark cases across three trials, 1,152 changed-input benchmark graph checks, 588 timing rows and 6,468 samples including setup measurements.
+5. Run the final export cell even if a section reports failed/partial/skipped.
+6. Download v4_mapping_candidate_*.zip and place it in profiling_kaggle/notebook03_results locally.
+7. Stop the interactive GPU session after downloading.
+
+This tests one candidate against the exact mapping helper, with cached and rebuilt lookup tables. Table construction and refresh are measured separately. It does not modify serving code or establish H200/serving speedup. LOCAL_VALIDATION_03.json is local validation, not Kaggle performance evidence.

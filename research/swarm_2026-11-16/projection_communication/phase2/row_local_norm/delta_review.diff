@@ -1,0 +1,79 @@
+--- a/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
++++ b/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
+@@ -94,7 +94,7 @@
+     )
+ 
+ 
+-def prefill_row_projection(group, x, weight):
++def prefill_row_projection(group, x, weight, *, row_norm=None):
+     """Compute full output rows once, then gather in original token order.
+ 
+     Input and weights must be replicated on the TP group. The complete K
+@@ -108,6 +108,8 @@
+     )
+     local = local_fp32.to(x.dtype)
+     del local_fp32
++    if row_norm is not None:
++        local = row_norm(local)
+     return group.all_gather(local, dim=0)
+ 
+ 
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -848,6 +848,7 @@
+             and not getattr(self.experts, "use_marlin", False)
+         )
+         prepared_input = None
++        pre_expert_norm = self.pre_expert_norm
+         use_side_stream = not _is_cpu and torch.cuda.is_available()
+         main_stream = torch.cuda.current_stream() if use_side_stream else None
+         side_stream = self._side_stream() if use_side_stream else None
+@@ -870,9 +871,19 @@
+             elif self._can_shard_prefill_row_projection(
+                 hidden_states, self.pre_expert_proj.weight
+             ):
++                row_norm = (
++                    pre_expert_norm
++                    if type(pre_expert_norm) is MuseSpark1xRMSNorm
++                    else None
++                )
+                 expert_input = prefill_row_projection(
+-                    get_parallel().tp_group, hidden_states, self.pre_expert_proj.weight
+-                )
++                    get_parallel().tp_group,
++                    hidden_states,
++                    self.pre_expert_proj.weight,
++                    row_norm=row_norm,
++                )
++                if row_norm is not None:
++                    pre_expert_norm = None
+             elif self._can_shard_small_projection(
+                 hidden_states, self.pre_expert_proj.weight
+             ):
+@@ -885,7 +896,7 @@
+                 )
+         if prepare_early:
+             prepared_input = self.experts.prepare_input(
+-                expert_input, self.pre_expert_norm
++                expert_input, pre_expert_norm
+             )
+         with (
+             torch.cuda.stream(side_stream)
+@@ -931,14 +942,14 @@
+                 topk_scores,
+                 topk_ids,
+                 self.experts.post_expert_norm,
+-                pre_expert_norm=self.pre_expert_norm,
++                pre_expert_norm=pre_expert_norm,
+                 prepared_input=prepared_input,
+                 packed_topk_ids=packed_topk_ids,
+                 ar_workspace=ar_workspace,
+             )
+         else:
+-            if self.pre_expert_norm is not None:
+-                expert_input = self.pre_expert_norm(expert_input)
++            if pre_expert_norm is not None:
++                expert_input = pre_expert_norm(expert_input)
+             output = self.experts(
+                 expert_input,
+                 topk_scores,

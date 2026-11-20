@@ -1,0 +1,39 @@
+UNSCORED DIAGNOSTIC REVIEW, 2026-11-19
+Frozen candidate: serving\research_2026-11-19\moe\normal_package\candidate.diff
+SHA256: 80db9ce3d958c58e31be4b64f06442d0ef152493221c3927ad9c43deab68319f
+Size: 123401 bytes; max added line: 226 characters.
+Frozen scored parent remains unchanged: 8c7547213fb993a318321a26f84e2872db8c87b358ee3d3ea638695702b0dc2b (1.2363x). No 2x serving claim. No scored request. Parent alone may launch the unscored check.
+
+Changed behavior:
+The original Humming packed weights/scales remain the only persistent model layout. Once per eligible layer forward, actual group16 E2M1 coefficients and E4M3 scale bytes are permuted into two transient normal CUTLASS buffers (W13 576MiB, W2 288MiB), reused by all chunks and overwritten by the next layer. No coefficient values or activation precision change. CUTLASS Hopper mixed-input RS WGMMA uses BF16 operands and FP32 accumulation. No Stream-K, FP8 activation, or low-precision intermediate probabilities. Original BF16 global scales, SiLU, canonical top8 output, and caller finalizer remain.
+
+Eligibility and qualification:
+Only SM90, H4096,I4096,E32,globalE256,top8,BF16 inputs and the exact known Humming format. Decode M<4096 remains original. Runtime eligible M4096..16384 is processed in chunks<=2048 (maximum8chunks). Metadata/layout/precision guards and exact installed header hashes apply.
+On first eligible noncaptured call, first actual layer is qualified against frozen reference at M4096 uniform, M4097 changed-input boundary, M4096 denserouting, and all-remote control. Raw live BF16 outputs and original postexpert norm/weighted finalizer are bit-compared. These finite synthetic inputs do not prove universal or every-layer bit parity. Ordinary FP32 reordering may produce small legal differences; exact gate conservatively falls back instead of inventing a tolerance.
+Native reference gold is saved to CPU before arena allocation. Native timings P, candidate timings C, and native postcontrol are separate epochs with arena destruction, synchronization, collection and empty_cache between phases. This is not paired promotion evidence. Enable only if exact, min(medianP,mediancontrol)/medianC>1.10, and parent/control drift<=5%. Uniform route timing is a startup filter, not a promise for every routing distribution or serving.
+
+Memory:
+One shared device arena, never perlayer/perstream: Torch buffers1,321,355,776B plus CABI workspace/descriptors counted by okc_owned_bytes. Allocation cap1,380,000,000B. Maximum candidate qualification phase conservative algebra1,749,451,072B including cap, M4097 input/IDs/scores, full rawoutput, finaloutput, norm and32MiB diagnostic scratch. Native phase has no arena, preventing805.5MB native temporaries overlapping the arena. CPUgold checkpoints consume host memory only. Phase logs record current allocated/reserved, historical global peaks withoutreset, and cudaMemGetInfo; these histories can include earlier model work. Actual serving canonical output has the same requested shape as parent; arena is additional persistent scratch. Existing mem_fraction_static.85 unchanged.
+
+Streams/lifecycle:
+One owner thread, noTBO/noSBO/PP1. The registered global capture stream is allowed; GroupCoordinator.graph_capture waits for warmup stream before entering. runner_utils/pool.py explicitly states prefill/decode graphs never replay concurrently and shareonecapturestream. One later eager forward stream is bound once aftersynchronize; unknown subsequent streams and ownerthreads fallback. Each CABI launch uses currentstream, not storedwarmupstream. Qualification never runs insidecapture. Captured arenas are never destroyed/replaced. Runtime device execution errors fail loudly; no unsafe fallback after a potentially damaged CUDA context.
+
+Build:
+Only python/sglang paths; readable multiline CUDA source. No external dependency mutation/download. Exact pinned DeepGEMM0.2.3.post2 CUTLASS f3fde58372d33e9a5650ba7b80fc48b3b49d40c8 headers or byteidentical FlashInfer source accepted. Private local overlay preserves headerlicense and changes only packedE4M3 group16 decode. Compiles serialized across TP workers by filelock; failures cached,600sec timeout kills compilerprocessgroup; corepayloaddisabled perchild. OriginalHumming fallback on build/headerfailure.
+
+Validation completed:
+- Isolated full git apply --check/apply and AST pass; alladdedlines<=226.
+- Exact header guard accepts judge revision and rejects differentCUTLASS revision.
+- Exhaustive4064 finiteE4M3/E2M1 normalized coefficient products exactlyBF16; range2^-12..672.
+- CPU metadata/stream guards and actual forwardcopy ownership:8 cases M4096/4097/8193/16384, changinginputs, onepackcall perforward.
+- Actual shipped preprocessing onRTX3050:4 independentMMA/WGMMA coefficientpack cases withcanaries;12 CUDAgraph replay route/gather/scatter casesM3071/3072/3073 uniform/skew/remote changedinputs, allbitexact. After the memory reduction, only affected boundaries2047/2048/2049 were rerun:12additionalchanged-inputgraphcasesallbitexact.
+- All65,282 BF16 finite/infinity patterns (including subnormals) match CUDA's SM86 __hmul2 restoration against candidate FP32x4->BF16. Parent Humming roundsaccumulatorBF16 then__hmul2x4 as confirmed in smem_writer.cuh andepilogue_arith.cuh; no prematureglobal-scale fold.
+- Exact kernel SM90a devicecompile passed:254,976B SHA15fb735c4651b819e818bd8c0a3ced09294fe54626c341e680d8b94d1f6199a0,42sec/4.17GiB RSS.
+
+Material limitations / unscored purpose:
+No Hopper execution yet. Fullhost CABI compilation passed early parsing but hit local5GiBVMcap at4.36GiB RSS/73sec; judge hasmorehostRAM, but fullcompile success remains unproven. Devicekernel168registers,8Bstack,4Bspillstores/16Bspillloads; ptxas warnsWGMMA pipeline serialization across functionboundary. Performance gate maycorrectlydisable. Sourceaudit found officialgrouped TMA placeholderdescriptors replacedbeforefirstload; nohostread ofuninitializedGPUdescriptors, but runtimeproof awaitsH200.
+The unscoredcheck should inspect build/header/version logs, qualification raw/final errors, memorysnapshots, activation/capturelogs, complete modelcorrectness and C16 serving. If build/parity/speedgate disables, reportthatcause withoutclaimingkernel speedup. Scored submission staysheld.
+
+Receipts: package.json, source_manifest.json, coefficient_memory_audit.json, cpu_contracts.json, header_guard.json, preprocessing_gpu.json, preprocessing_boundary_2048.json; parentdir normal_device_judge_t64.json/log and normal_host_package.json.
+
+Final headroom revision: M2048 arena; M4096qualification has2chunks, M4097has3includingtail1. Candidatephase conservative bound1,749,451,072B leaves250,548,928B below2GB. NoCUDAsource, precision, header, or timinggate changes.

@@ -1,0 +1,15 @@
+﻿Checkpoint 2026-11-16
+
+Small Humming smoke: all16 width512,E4 cases passed relativeL2<=.003 and maxabs<=.03125 against real stockMarlin+finalizer. Maximum observedrelL2 .000663985, maxabs .0078125. NoH200/serving speedupclaim.
+
+Pinned Humming0.1.12 audit found StreamK BF16 global partial reductions despite use_f16_accum=False. Candidate explicitly disables StreamK in ALL privatelydeepcopied tuning intervals and asserts selectedpolicy. Defaultlibrarycachedintervals untouched. Global NVFP4 scales applied afterBF16output just as stock. SharedK partialreductions FP32; maximumdefaultH200Kpartitions4.
+
+Standalone exact adapter submission_humming_fp32_v1.py and serving_humming_v1 export remain EXPERIMENTAL. Fullwidth4096 correctnessprobe2 paused at firstselectedNVRTCcompile to releaseGPU for projectiontiming. PID8987 SIGSTOP afterGPUutil0%,total683MiB. MustSIGCONT afterprojectionrelease. ChildCPUcompiler mayfinish independently. Firstprobeattempt terminated because it overcompiledallintervals; selecteddict version compilesonlyneededshape. Current exactfile includes independentstagealignment fallback and aliascache13. Fullwidthtest useschangedglobal scales and3changed graphinputreplays percase; resultpending.
+
+SM90offline source audit: sm90_tuning_audit.json,42intervals eachstage E32,H=I4096. DefaultstageblockM happenssame but implementation noassumption. M1/8 blockM8;M16blockM16;M32/33blockM24;M128blockM64;M256/257blockM96. StageKpartitions2/4 atsmallM,1/2 atM128,1/1 atM256. No StreamK. No forcebatchinvariant absentfailure.
+
+Serving export uses explicitbackendhumming, specializedMusepreparehook beforeMarlin. Retains onecanonicalHummingweightlayout only. self.use_marlin=True alsoforHumming intentionally preserves BF16input/norm path and existingprojectionguards; self.use_humming distinguishes kernel. Stockmarlinbackendunchanged. Nativeparamsdeletedafterchildlayercanonicalrepack. PerlocalE32layer weight+scale=.84375GiB sameasstock, sharedcache13 avoidsnewactivationbuffer. Wholemodelpeaknotyetmeasured.
+
+Grid cap1compiled in1307.05s, sourceSHA333586fd454db56bafa03ff07fa6a0c9ed47122478e9e3c8381984dad5870a03. Cap2stillcompiling. --caps1 selector added forindependenttest. NoGPUcorrectness/timingyet forgrid.
+
+Remote kernel track server saysCLOSED despitequota40; roottriedattentionadapterandreceivedrefusalnojobreceived. No MoEremotejobsubmitted. Servingbudget2checks+1scoredremain underrootcontrol.

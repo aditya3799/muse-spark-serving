@@ -1,0 +1,57 @@
+Analytical projection scope, 2026-11-19
+
+This is arithmetic and unique-weight-footprint accounting, not an H200 serving
+profile, measured HBM traffic, or a rigorous wall-time bound. The runnable
+projection_scope_analysis.py writes every formula/input/result to JSON.
+
+Primary architecture source:
+https://recipes.vllm.ai/meta-models/Muse-Spark-Open-816B-A42B
+Read 2026-11-19: all62 decoder layers are MoE, zero dense layers;256experts,
+top8, H8192/latent4096,128Q/16KVheads,d64,46SWA/16full. Local official
+muse_prefill_layer/reference.py independently specifies the per-rank geometry.
+The targetHF revision is75271573ed1e94a216d2e69a988c3354a4b69208; actualconfig
+resolve remains401. Thus62 is engine-primary architecture evidence, not an
+independently inspected gated checkpoint. Endpoint BF16expert status is not
+assumed: all62 are counted as packed4bit+8bitscale/16, which understates traffic
+if endpoints are BF16. There is no basis for calling these two dense layers.
+
+One replicated BF16 draft FC is8192x40960,335,544,320coefficients,671,088,640B.
+N-sharding reads83,886,080B/rank plus actual all-gather and layoutcopy. It leaves
+the original target, five draft layers, five own-head contextKV and logits.
+The prefill row adapter cuts M arithmetic but eachrank still needs fullFCweight.
+
+Per-rank FC / target-minimum matmul work (GFLOP; target assumes ideal partition
+of BOTH MoE pre/post projections and balanced experts, excludes draft/attention):
+M8:5.369 /87.376; M32:21.475 /349.503; M128:85.899 /1398.012;
+M256:171.799 /2796.024; M753:505.330 /8224.242;
+M16384:10995.116 /178945.517.
+FC is5.789% of this optimistic total, or3.556% iftarget pre/post projections
+are replicated. FP32router and BF16/FP4 math do NOT have equal execution costs;
+these percentages are NOT time fractions.
+
+Uniform independent token routes imply expected distinct experts/rank/layer
+32*(1-(1-8/256)^M):7.178,20.414,31.450,31.991 forM8/32/128/256.
+With one read of each active packed expert and ideal partitioned dense weights,
+FC accounts for3.685%,1.619%,1.103%,1.087% of unique weight bytes respectively.
+These are not observed routing probabilities or actual HBM read counts.
+Correlated same-top8 routes can touch only one expert perrank if perfectly
+balanced, or put all8 onone rank; the latter raises critical-rank expert FLOPs
+8x over balanced expectation. JSON reports both traffic cases separately.
+Caches, repeated reads, splitK, activation formatconversion, transport and
+different hardware rates prevent turning footprint fractions into runtime.
+
+Decode attention adds context-dependent QK/PV and FP8cache traffic beyond the
+above matmuls; JSON includes2048/8192/74160 prefix scenarios. Firstprefill counts
+causal full and2048window attention pairs separately. These additional costs
+and omitted draft/logit/transport work further limit scope, not prove speed.
+
+Under a uniform Amdahl model, lifting frozen1.2363xstock to2xstock with4.32003x
+component speed requires that component to consume49.6864% of parent time.
+Architecture accounting makes that a demanding hypothesis; it does not rule
+it out if FC is much less efficient than other operators. The current actual
+H200 unscored serving check must decide effectiveness. No2x claim or scored
+submission recommendation follows from this analysis.
+
+M753 and16384 illustrate rawtail/fullprefill arithmetic only. The current
+Nadapter registers configureddecode buckets, so this note does not expand its
+coverage or claim TTFT benefit on ragged753.

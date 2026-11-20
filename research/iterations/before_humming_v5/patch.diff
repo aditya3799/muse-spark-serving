@@ -1,0 +1,331 @@
+diff --git a/python/sglang/kernels/ops/moe/moe_align_small_numel.py b/python/sglang/kernels/ops/moe/moe_align_small_numel.py
+index c1a2d5f..e47baec 100644
+--- a/python/sglang/kernels/ops/moe/moe_align_small_numel.py
++++ b/python/sglang/kernels/ops/moe/moe_align_small_numel.py
+@@ -28,6 +28,9 @@ def _moe_align_small_numel_kernel(
+     num_experts,  # E + 1 (the "+1 offset" convention's bucket count)
+     block_size,
+     numel,
++    expert_map_ptr,
++    local_ids_ptr,
++    HAS_EXPERT_MAP: tl.constexpr,
+     NP: tl.constexpr,  # power-of-2 >= numel
+     NB: tl.constexpr,  # power-of-2 >= max blocks used
+     USE_GDC: tl.constexpr = False,
+@@ -60,6 +63,11 @@ def _moe_align_small_numel_kernel(
+     offs_p = tl.arange(0, NP)
+     mask_p = offs_p < numel
+     ids = tl.load(topk_ids_ptr + offs_p, mask=mask_p, other=-2)
++    if HAS_EXPERT_MAP:
++        ids = tl.load(
++            expert_map_ptr + tl.maximum(ids, 0), mask=mask_p & (ids >= 0), other=-1
++        )
++        tl.store(local_ids_ptr + offs_p, ids.to(tl.int32), mask=mask_p)
+     # Padded lanes get an out-of-range bucket and are masked out everywhere.
+     bucket = tl.where(mask_p, (ids + 1).to(tl.int32), num_experts)
+ 
+@@ -126,6 +134,8 @@ def moe_align_small_numel(
+     num_tokens_post_pad: torch.Tensor,
+     *,
+     write_inactive_prefix_count: bool = False,
++    expert_map: torch.Tensor | None = None,
++    local_topk_ids: torch.Tensor | None = None,
+ ) -> None:
+     """Align and sort expert token ids into block-padded buffers, in one launch.
+ 
+@@ -133,11 +143,19 @@ def moe_align_small_numel(
+     (minus its ``cumsum_buffer``, which a single CTA does not need):
+     ``num_experts`` is the bucket count ``E + 1`` under the "+1 offset"
+     convention, and the three output buffers are written in place.
++    With expert_map, map global IDs and publish local_topk_ids in the same
++    launch. Negative IDs remain inactive; original route slots are preserved.
+ 
+     Callers gate on ``topk_ids.numel() <= SMALL_NUMEL_LIMIT``; the kernel stays
+     correct above it, but its pairwise tensors spill and it stops being faster
+     than the two-kernel path.
+     """
++    if expert_map is not None:
++        assert topk_ids.is_contiguous() and expert_map.is_contiguous()
++        assert local_topk_ids is not None
++        assert local_topk_ids.shape == topk_ids.shape
++        assert local_topk_ids.dtype == torch.int32 and local_topk_ids.is_contiguous()
++        assert local_topk_ids.device == topk_ids.device == expert_map.device
+     if write_inactive_prefix_count:
+         assert num_tokens_post_pad.shape == (2,)
+         assert num_tokens_post_pad.dtype == torch.int32
+@@ -154,6 +172,9 @@ def moe_align_small_numel(
+         num_experts,
+         block_size,
+         numel,
++        expert_map if expert_map is not None else topk_ids,
++        local_topk_ids if local_topk_ids is not None else topk_ids,
++        HAS_EXPERT_MAP=expert_map is not None,
+         NP=triton.next_power_of_2(max(numel, 2)),
+         NB=triton.next_power_of_2(max(expert_ids.numel(), 2)),
+         WRITE_INACTIVE_PREFIX_COUNT=write_inactive_prefix_count,
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py b/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py
+index ed451fd..04b4831 100644
+--- a/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py
++++ b/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py
+@@ -64,6 +64,76 @@ def _post_expert_norm_weighted_sum_kernel(
+     tl.store(out_ptr + tok * H + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+ 
+ 
++# Two-phase work decomposition inspired by muse-okc-submissions' MoE bs1
++# redesign (github.com/gauravjain14/muse-okc-submissions) and our standalone
++# decode work: parallelize independent expert
++# reductions, then distribute the combine over output tiles. No weight repack
++# or change to the precision / ordering of the per-slot weighted sum is needed.
++@triton.jit
++def _post_expert_inv_rms_kernel(
++    x_ptr,
++    w_ptr,
++    ids_ptr,
++    inv_ptr,
++    TOPK: tl.constexpr,
++    H: tl.constexpr,
++    eps,
++    HAS_WEIGHT: tl.constexpr,
++    WEIGHT_FIRST: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++):
++    slot = tl.program_id(0)
++    live = tl.load(ids_ptr + slot) >= 0
++    inv = 0.0
++    if live:
++        offs = tl.arange(0, BLOCK_H)
++        x = tl.load(x_ptr + slot * H + offs, mask=offs < H, other=0.0).to(tl.float32)
++        if HAS_WEIGHT and WEIGHT_FIRST:
++            w = tl.load(w_ptr + offs, mask=offs < H, other=0.0).to(tl.float32)
++            x = x * w
++        var = tl.sum(x * x, axis=0) / H
++        inv = tl.rsqrt(var + eps)
++    tl.store(inv_ptr + slot, inv)
++
++
++@triton.jit
++def _post_expert_tiled_combine_kernel(
++    x_ptr,
++    w_ptr,
++    s_ptr,
++    ids_ptr,
++    inv_ptr,
++    out_ptr,
++    TOPK: tl.constexpr,
++    H: tl.constexpr,
++    HAS_WEIGHT: tl.constexpr,
++    WEIGHT_FIRST: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    tok = tl.program_id(0)
++    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    if HAS_WEIGHT:
++        w = tl.load(w_ptr + offs, mask=offs < H, other=0.0).to(tl.float32)
++    acc = tl.zeros([BLOCK], tl.float32)
++    for k in tl.static_range(TOPK):
++        slot = tok * TOPK + k
++        live = tl.load(ids_ptr + slot) >= 0
++        if live:
++            x = tl.load(x_ptr + slot * H + offs, mask=offs < H, other=0.0).to(
++                tl.float32
++            )
++            inv = tl.load(inv_ptr + slot)
++            if HAS_WEIGHT and WEIGHT_FIRST:
++                y = (x * w) * inv
++            elif HAS_WEIGHT:
++                y = (x * inv) * w
++            else:
++                y = x * inv
++            score = tl.load(s_ptr + slot).to(tl.float32)
++            acc += y * score
++    tl.store(out_ptr + tok * H + offs, acc.to(out_ptr.dtype.element_ty), mask=offs < H)
++
++
+ def fused_post_expert_norm_weighted_sum(
+     expert_output: torch.Tensor,
+     topk_scores: torch.Tensor,
+@@ -103,6 +173,50 @@ def fused_post_expert_norm_weighted_sum(
+         return y.sum(dim=1).to(x.dtype)
+ 
+     block_h = triton.next_power_of_2(hidden)
++    # The one-CTA-per-token kernel serializes TOPK full-width reductions and
++    # leaves most SMs idle for small routed batches. Keep its path for larger
++    # batches and uncommon arithmetic modes, where an extra launch may lose.
++    if (
++        x.is_cuda
++        and 2 <= tokens <= 8
++        and 2 <= topk <= 32
++        and 1024 <= hidden <= 16384
++        and slot_expert_ids is not None
++        and apply_norm
++        and not round_product
++    ):
++        ids = slot_expert_ids.contiguous()
++        weight = norm_weight.contiguous() if norm_weight is not None else x
++        inv = torch.empty((tokens * topk,), device=x.device, dtype=torch.float32)
++        _post_expert_inv_rms_kernel[(tokens * topk,)](
++            x,
++            weight,
++            ids,
++            inv,
++            TOPK=topk,
++            H=hidden,
++            eps=eps,
++            HAS_WEIGHT=norm_weight is not None,
++            WEIGHT_FIRST=weight_first,
++            BLOCK_H=block_h,
++            num_warps=8 if block_h >= 4096 else 4,
++            num_stages=2,
++        )
++        _post_expert_tiled_combine_kernel[(tokens, triton.cdiv(hidden, 256))](
++            x,
++            weight,
++            topk_scores.contiguous(),
++            ids,
++            inv,
++            out,
++            TOPK=topk,
++            H=hidden,
++            HAS_WEIGHT=norm_weight is not None,
++            WEIGHT_FIRST=weight_first,
++            BLOCK=256,
++            num_warps=4,
++        )
++        return out
+     _post_expert_norm_weighted_sum_kernel[(tokens,)](
+         x,
+         norm_weight.contiguous() if norm_weight is not None else x,
+diff --git a/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py b/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
+index 41c463d..d458d03 100644
+--- a/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
++++ b/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
+@@ -401,36 +401,73 @@ class MuseSpark1xFp4Experts(nn.Module):
+         gemm1_n = 2 * size_n
+         expert_map = self._expert_map
+ 
+-        local_topk_ids = topk_ids.to(torch.int32)
+-        if expert_map is not None:
+-            local_topk_ids = _map_topk_ids_to_local_experts(local_topk_ids, expert_map)
+-        local_topk_ids = local_topk_ids.contiguous()
++        from sglang.kernels.ops.moe.moe_align_small_numel import (
++            SMALL_NUMEL_LIMIT,
++            moe_align_small_numel,
++        )
++
++        fuse_mapping = (
++            expert_map is not None
++            and hidden_states.is_cuda
++            and topk_ids.is_contiguous()
++            and expert_map.is_contiguous()
++            and 0 < topk_ids.numel() <= SMALL_NUMEL_LIMIT
++        )
++        if fuse_mapping:
++            local_topk_ids = torch.empty_like(topk_ids, dtype=torch.int32)
++        else:
++            local_topk_ids = topk_ids.to(torch.int32)
++            if expert_map is not None:
++                local_topk_ids = _map_topk_ids_to_local_experts(
++                    local_topk_ids, expert_map
++                )
++            local_topk_ids = local_topk_ids.contiguous()
+         topk_weights = topk_scores.to(torch.float32).contiguous()
+ 
+         for block_size_m in _MARLIN_BLOCK_SIZE_M_CANDIDATES:
+             if num_tokens * topk / self.num_local_experts / block_size_m < 0.9:
+                 break
+ 
+-        if num_tokens == 1 and topk <= 32 and expert_map is None:
++        if fuse_mapping:
++            # Every route can occupy its own padded block, including sentinels.
++            # Fuse conversion, sentinel-preserving EP mapping and alignment.
++            num_routes = topk_ids.numel()
++            sorted_token_ids = torch.empty(
++                num_routes * block_size_m, device=topk_ids.device, dtype=torch.int32
++            )
++            expert_ids = torch.empty(
++                num_routes, device=topk_ids.device, dtype=torch.int32
++            )
++            num_tokens_post_padded = torch.empty(
++                1, device=topk_ids.device, dtype=torch.int32
++            )
++            moe_align_small_numel(
++                topk_ids.contiguous(),
++                self.num_local_experts + 1,
++                block_size_m,
++                sorted_token_ids,
++                expert_ids,
++                num_tokens_post_padded,
++                expert_map=expert_map,
++                local_topk_ids=local_topk_ids,
++            )
++        elif num_tokens == 1 and topk <= 32:
+             from sglang.kernels.ops.moe.moe_align_single_token import (
+                 moe_align_single_token,
+             )
+ 
+             sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                 moe_align_single_token(
+-                    local_topk_ids, block_size_m, return_inactive_prefix_count=True
++                    local_topk_ids,
++                    block_size_m,
++                    return_inactive_prefix_count=expert_map is None,
+                 )
+             )
+         else:
+-            align_num_experts = (
+-                self.global_num_experts
+-                if expert_map is not None
+-                else self.num_local_experts
+-            )
+             sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                 local_topk_ids,
+                 block_size_m,
+-                align_num_experts,
++                self.num_local_experts,
+                 return_inactive_prefix_count=expert_map is None,
+             )
+ 
+diff --git a/python/sglang/srt/models/muse_spark.py b/python/sglang/srt/models/muse_spark.py
+index 6b638e9..ed1eaee 100644
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -221,28 +221,30 @@ class MuseSpark1xRouter(nn.Module):
+         self.register_buffer(
+             "e_score_correction_bias", torch.zeros(num_experts, dtype=torch.float32)
+         )
+-        self._split2_hi = None
+-        self._split2_lo = None
++        self._split2_weight = None
+         self._split2_key = None
+ 
+     @torch.no_grad()
+     def _build_split2(self) -> None:
+-        w = self.weight.data
+-        key = (w.data_ptr(), w.shape, w._version)
++        w = self.weight
++        # Keep the parameter's version counter: .data hides in-place weight
++        # updates and could leave the packed router stale after a reload.
++        key = (w.data_ptr(), w.shape, w.dtype, w.device, w._version)
+         if self._split2_key == key:
+             return
+         hi = w.to(torch.bfloat16)
+         lo = (w - hi.to(torch.float32)).to(torch.bfloat16)
+-        self._split2_hi = hi.t().contiguous()
+-        self._split2_lo = lo.t().contiguous()
++        # Share the input read and GEMM launch while retaining separate FP32
++        # accumulators for the high and low BF16 components.
++        self._split2_weight = torch.cat((hi, lo)).t().contiguous()
+         self._split2_key = key
+ 
+     def forward_split2(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         self._build_split2()
+         x = hidden_states.to(torch.bfloat16)
+-        acc = torch.mm(x, self._split2_hi, out_dtype=torch.float32)
+-        acc += torch.mm(x, self._split2_lo, out_dtype=torch.float32)
+-        return acc
++        acc = torch.mm(x, self._split2_weight, out_dtype=torch.float32)
++        hi, lo = acc.chunk(2, dim=-1)
++        return hi + lo
+ 
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         # Decode-sized FP32 logits: one CuTe GEMV instead of cuBLAS split-K + reduce.

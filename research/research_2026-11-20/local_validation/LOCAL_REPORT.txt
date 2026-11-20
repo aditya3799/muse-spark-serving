@@ -1,0 +1,82 @@
+LOCAL GPU VALIDATION — 2026-11-19T21:00:42.152412+00:00
+Local correctness evidence only. No full serving or H200 speedup established. Preserve scored 1.2363x baseline pending target validation.
+
+Matrix complete: True; passed records: 30/32
+
+PASS: adapter_20112013_8
+PASS: adapter_20112013_32
+PASS: adapter_20112013_128
+PASS: adapter_20112013_256
+PASS: adapter_20112013_512
+PASS: adapter_20112013_768
+PASS: adapter_20112013_3072
+PASS: adapter_20112017_8
+PASS: adapter_20112017_32
+PASS: adapter_20112017_128
+PASS: adapter_20112017_256
+PASS: adapter_20112017_512
+PASS: adapter_20112017_768
+PASS: adapter_20112017_3072
+PASS: row_chain_20112023_512
+PASS: row_chain_20112023_768
+PASS: row_chain_20112023_3072
+PASS: row_chain_20112023_8192
+TIMEOUT: row_chain_20112023_16384
+PASS: decode_chain_20112023_1
+PASS: decode_chain_20112023_4
+PASS: decode_chain_20112023_16
+PASS: decode_chain_20112023_32
+PASS: row_chain_20112029_512
+PASS: row_chain_20112029_768
+PASS: row_chain_20112029_3072
+PASS: row_chain_20112029_8192
+TIMEOUT: row_chain_20112029_16384
+PASS: decode_chain_20112029_1
+PASS: decode_chain_20112029_4
+PASS: decode_chain_20112029_16
+PASS: decode_chain_20112029_32
+
+Factory state: {"scope": "Actual packaged CUDA factory, lifetime and fallback tests; virtual GPU peers, no physical TP8 transport.", "jobs": [{"name": "row_factory", "start": 1795120612.6114757, "returncode": 0, "end": 1795120728.2261066}, {"name": "output_n_factory", "start": 1795120728.2324042, "returncode": 0, "end": 1795120792.230672}], "complete": true}
+
+Limitations:
+RTX3050 6GB SM86, not H200 SM90.
+GPU observed at 210 MHz core, 405 MHz memory and approximately 10 W under load; timings unsuitable for serving projection.
+Eight GPU peers are serialized or mocked; CPU Gloo transport is real but is not GPU NCCL.
+Component chains include real FC weights and normalization/KV operations; the complete 816B model and target/draft blocks cannot run locally.
+Calibration plus held-out bit comparisons is empirical evidence, not proof of equivalence for every possible input.
+New MoE converter is standalone, excluded from all candidate patches; converter speedup is not MoE inference speedup.
+Six GPU adapter arms switch the same exported implementation on/off; they are not six full serving deployments. Candidate patch differences and startup hooks are checked separately.
+The three queued checks are immutable earlier submissions; their results will not automatically validate the later final candidates.
+
+Official checks:
+f464d5f09f534363: queued
+f43fa02892254879: queued
+f038a667401a4d0a: queued
+0afdc0b191dd4b42: done
+
+0afdc0b191dd4b42 is the retired Hopper routed-expert patch 1ce48266..., not the current projection candidates. Correctness passed, but throughput was 0.529x stock; TTFT ratios 2.14x first and 7.91x later exceeded the 2x limit. It confirms the prior regression; no promotion.
+
+Composition state: {"complete": true, "jobs": [{"rows": 8, "start": 1795120797.3095524, "returncode": 0, "end": 1795120833.4616337}, {"rows": 256, "start": 1795120833.4661095, "returncode": 0, "end": 1795120871.452412}, {"rows": 512, "start": 1795120871.4567583, "returncode": 0, "end": 1795120916.799225}, {"rows": 3072, "start": 1795120916.8051395, "returncode": 0, "end": 1795120995.9199662}]}
+
+Large-shape completion runs (four measured rounds plus graph replay):
+20112023: PASS
+20112029: PASS
+
+Post-validation state: {"complete": true, "scope": "Large-shape correctness completion and small synthetic-geometry sanitizer tests, no timing promotion.", "jobs": [{"name": "row_chain_completion_20112023_16384", "start": 1795120997.1166637, "command": ["/home/aditya/.venvs/okc-marlin-tiles/bin/python", "-u", "/mnt/d/OpenKernelChallenge/serving/research_2026-11-19/prefill/real_row_chain.py", "--seed", "20112023", "--rows", "16384", "--rounds", "4", "--out", "/mnt/d/OpenKernelChallenge/serving/research_2026-11-20/local_validation/row_chain_completion_20112023_16384.json"], "pid": 2111, "returncode": 0, "end": 1795121374.607192}, {"name": "row_chain_completion_20112029_16384", "start": 1795121374.6246357, "command": ["/home/aditya/.venvs/okc-marlin-tiles/bin/python", "-u", "/mnt/d/OpenKernelChallenge/serving/research_2026-11-19/prefill/real_row_chain.py", "--seed", "20112029", "--rows", "16384", "--rounds", "4", "--out", "/mnt/d/OpenKernelChallenge/serving/research_2026-11-20/local_validation/row_chain_completion_20112029_16384.json"], "pid": 2144, "returncode": 0, "end": 1795121771.8258202}, {"name": "sanitizer_memcheck_8", "start": 1795121771.8851478, "command": ["/mnt/d/OpenKernelChallenge/serving/research_2026-11-20/local_validation/tools/sanitizer/cuda_sanitizer_api-linux-x86_64-13.0.85-archive/bin/compute-sanitizer", "--tool", "memcheck", "--error-exitcode", "86", "--padding", "32", "--destroy-on-device-error", "context", "/home/aditya/.venvs/okc-marlin-tiles/bin/python", "-u", "/mnt/d/OpenKernelChallenge/serving/research_2026-11-20/local_validation/sanitizer_fixture.py", "--rows", "8", "--seed", "20112101"], "pid": 2174, "returncode": 0, "end": 1795121785.8315685}, {"name": "sanitizer_memcheck_512", "start": 1795121785.8370788, "command": ["/mnt/d/OpenKernelChallenge/serving/research_2026-11-20/local_validation/tools/sanitizer/cuda_sanitizer_api-linux-x86_64-13.0.85-archive/bin/compute-sanitizer", "--tool", "memcheck", "--error-exitcode", "86", "--padding", "32", "--destroy-on-device-error", "context", "/home/aditya/.venvs/okc-marlin-tiles/bin/python", "-u", "/mnt/d/OpenKernelChallenge/serving/research_2026-11-20/local_validation/sanitizer_fixture.py", "--rows", "512", "--seed", "20112102"], "pid": 2209, "returncode": 0, "end": 1795121807.495879}, {"name": "sanitizer_racecheck_512", "start": 1795121807.5017996, "command": ["/mnt/d/OpenKernelChallenge/serving/research_2026-11-20/local_validation/tools/sanitizer/cuda_sanitizer_api-linux-x86_64-13.0.85-archive/bin/compute-sanitizer", "--tool", "racecheck", "--error-exitcode", "86", "/home/aditya/.venvs/okc-marlin-tiles/bin/python", "-u", "/mnt/d/OpenKernelChallenge/serving/research_2026-11-20/local_validation/sanitizer_fixture.py", "--rows", "512", "--seed", "20112103"], "pid": 2264, "returncode": 0, "end": 1795121911.4621558}, {"name": "sanitizer_synccheck_512", "start": 1795121911.4689136, "command": ["/mnt/d/OpenKernelChallenge/serving/research_2026-11-20/local_validation/tools/sanitizer/cuda_sanitizer_api-linux-x86_64-13.0.85-archive/bin/compute-sanitizer", "--tool", "synccheck", "--error-exitcode", "86", "/home/aditya/.venvs/okc-marlin-tiles/bin/python", "-u", "/mnt/d/OpenKernelChallenge/serving/research_2026-11-20/local_validation/sanitizer_fixture.py", "--rows", "512", "--seed", "20112104"], "pid": 2337, "returncode": 0, "end": 1795121926.2134452}, {"name": "sanitizer_initcheck_8", "start": 1795121926.220087, "command": ["/mnt/d/OpenKernelChallenge/serving/research_2026-11-20/local_validation/tools/sanitizer/cuda_sanitizer_api-linux-x86_64-13.0.85-archive/bin/compute-sanitizer", "--tool", "initcheck", "--error-exitcode", "86", "/home/aditya/.venvs/okc-marlin-tiles/bin/python", "-u", "/mnt/d/OpenKernelChallenge/serving/research_2026-11-20/local_validation/sanitizer_fixture.py", "--rows", "8", "--seed", "20112105"], "pid": 2372, "returncode": 0, "end": 1795121936.4045768}]}
+
+Runtime coverage: raw/live rows must match a registered projection shape. Graph padding does not establish fast-path coverage. Actual serving dispatch frequencies remain unmeasured.
+
+Performance promotion supported: False
+Baseline unchanged: True
+Candidate hashes unchanged: True
+
+Sanitizer checks (small synthetic geometry):
+sanitizer_memcheck_8: PASS
+sanitizer_memcheck_512: PASS
+sanitizer_racecheck_512: PASS
+sanitizer_synccheck_512: PASS
+sanitizer_initcheck_8: PASS
+
+Baseline SHA256: 8c7547213fb993a318321a26f84e2872db8c87b358ee3d3ea638695702b0dc2b
+
+No scored submission made by this validation.

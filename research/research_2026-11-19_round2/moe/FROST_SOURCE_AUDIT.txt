@@ -1,0 +1,14 @@
+﻿Frost low-latency W4A16 primary-source audit — 2026-11-19
+Pinned FlashInfer: 855eece4e9b5b796a46148664a3e27da571cd98b
+Primary source URLs and every downloaded-file SHA256: sources/frost_manifest.json.
+Documentation: https://docs.flashinfer.ai/generated/flashinfer.fused_moe.FrostLowLatencyConfig.html
+
+The current Hopper path does implement NVFP4 E2M1 weights with linear E4M3 K16 scales and BF16/FP16 activations. It does not require activation quantization. This corrects a blanket exclusion of all contemporary FlashInfer FP4 APIs as Blackwell-only.
+
+However, the runner requires nvidia-cutlass-dsl >=4.8 and has a deliberately tiny T<=8 interface. The scalar-FMA body supports Hopper; the grouped tensor-core tactic helper returns candidates only for SM103/SM120 and a single T8/H2048/I512/topk10 shape. Therefore it is not an eligible dependency-only replacement for the pinned judge or the M128/256 verification geometry. Invalid expert IDs are disallowed by the public contract; Muse expert-parallel routing contains -1 slots. The backend would require an explicit adapted routing contract.
+
+Exact coefficient idea: fma/fp4_weight.py::_software_fp4_quad uses prmt with FP16 high-byte constants 0x3e3c3800 and 0x46444240, inserts low zero bytes, and independently restores sign bits (including -0). scaled_quad multiplies E2M1 and E4M3 in FP16: these finite products are representable exactly. This is software coefficient conversion, not FP16 activation quantization. Its sparse small-T route_group.py uses ballots/popcount to identify up to2/4 same-expert routes and reuse one coefficient load across them; unmatched singleton routes take the ordinary body. That is a potentially useful scheduling pattern, though the existing WGS implementation already groups routes by expert.
+
+The kernel's FC1 epilogue multiplies FP32 sums by FP32 expert global scales, then rounds to activation dtype before SiLU. The incumbent serving adaptation explicitly rounds dot to BF16 BEFORE multiplying BF16 postscale and rounding again. Consequently the source is not bitwise-equivalent as a whole FFN even though finite coefficient products agree. Importing the backend unchanged would silently alter this boundary. No source claim about speed carries over to the incumbent serving workload.
+
+Disposition: retain as a primary decoder/route-sharing reference; do not package/upgrade/import it. Our register_dequant.cuh instead preserves the original table's coefficient bits including NaN lookup fallback, WGMMA sum order, global-scale boundaries, and routing. All4096 nibble/scale combinations and mixed packed-word GPU tests passed; whole-WGS Hopper execution still unavailable locally.

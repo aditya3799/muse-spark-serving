@@ -1,0 +1,59 @@
+Glue-only integration review: frozen source 0b0d0d4288e7bab6c7c4fa3ec9c1068c75e52ddd019ff9eebf24cb3790b50b9e
+
+Delta over scored 2a720c8f: adds only glue_draft_metadata eligibility to
+FlashAttentionBackend. All 32 existing backend methods have identical ASTs.
+No prefix-scan or persistent-grid kernel belongs in this glue-only export.
+
+Eligibility and fresh input semantics:
+1. Only DFLASH draft runner, FA4, topk<=1, fixed draft token width; excludes
+   encoder-decoder, MLA, local-attention builder, SWA storage pools, KV shards,
+   translator reads/translation, host-length requirement, prefill-aware SWA,
+   attention CP and disabled scheduler-precompute configurations.
+2. The existing runner consults this opt-in only for a draft in static verify
+   mode. Its general DFlash host-fed-plan prohibition stays intact. Target
+   metadata and other draft backends retain their prior behavior.
+3. At each replay, existing build_replay_fb_view reads req indices/seq lengths/
+   positions from the runner's stable buffers. It keeps current spec_info,
+   KVLocPlan and per-step host fields from the live batch. Missing CPU mirrors
+   stay None; stale pinned host copies are not promoted into valid mirrors.
+4. _glue_draft_inputs points out_cache_loc at the stable slot already filled
+   by the registry. The narrow backend never reads the current host plan's
+   page tables: nontranslated _set_decode_page_metadata uses req_to_token,
+   device request IDs and device lengths. In-place request pool changes and
+   long-short transitions are consumed afresh on every graph replay.
+5. Python forward_metadata side effects are snapshotted and reinstalled for
+   each graph key; keys include batch bucket and actual/capture forward mode.
+   Already-captured fast replay reads those same stable addresses. No promise
+   is made for arbitrary live tensor replacement. Supported production
+   recapture creates a new runner/glue object and fresh addresses.
+
+Fallback and capture failure:
+- Padding, TBO, pdmux and LoRA cause the existing runner to construct a fresh
+  replay view and perform eager metadata preparation, without using a cached
+  graph. Its current per-step out_cache_loc is valid on this eager path.
+- Capture failure sets disabled=True, then immediately reruns eager prep;
+  recorded-but-unexecuted updates are not mistaken for real metadata writes.
+- On later steps the runner's disabled guard blocks both captured keys and
+  new captures; note_not_routed records eager fallback. MetadataGlueGraph.run
+  alone does not recheck disabled, so retaining the runner routing guard is
+  essential. This delta does not alter that guard.
+
+Evidence:
+- glue_routing_cpu.json: 28 exact runner/view/glue Python cases with simulated
+  CUDA recording, changed stable buffers, alternating buckets, fast replay,
+  padding/TBO/pdmux/LoRA fallback and injected capture failure. Verified the
+  failed capture executes eager recovery and previously successful keys are
+  not replayed afterwards. This is control-flow proof, not CUDA proof.
+- attention_interface_cpu.json: 48 exact forward_extend boundary cases with
+  symbolic tensors: fresh metadata, KV writes, bidirectional/causal masks,
+  sliding window args, BF16-scale interface. No arithmetic claim.
+- metadata_run/results.json: 224 actual SM86 metadata comparisons across eight
+  shapes; changing IDs, live lengths, host plan and persistent table contents;
+  every live page checked. Original process exit0 and source snapshots saved.
+  Three A/A timing failures are retained. Prefix variant was neutral/slower;
+  only old-kernel glue timings support this separate opt-in.
+
+Open gates: actual Hopper FA4 paged attention, acceptance/later-turn model
+correctness, incremental full-model memory and serving performance. Pinned
+FA4 explicitly rejects paged KV on SM8x, so local metadata or unpaged kernels
+cannot stand in for those gates. No source-level integration blocker found.

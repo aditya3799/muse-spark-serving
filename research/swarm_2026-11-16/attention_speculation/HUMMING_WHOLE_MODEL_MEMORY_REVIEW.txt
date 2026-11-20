@@ -1,0 +1,138 @@
+2026-11-16: independent source-only whole-model memory review
+
+Scope and verdict
+Reviewed root coordination/round3_humming_experimental/candidate_sources.
+Exact Muse FP4 source SHA256:
+426658ee8f7e5e9b226134097d84a57b6b865d51fa132ae7ca7099857c9663f4
+Exact Muse NVFP4 source SHA256:
+bc19ab1afd56f204b85c54ff4d80f22bb6c8214e75d978eff37cdef1eeeb0277
+Humming implementation inspected: moe/humming_vendor/humming (pinned 0.1.12).
+No GPU calls were made for this review. No candidate source was changed.
+
+No source evidence of a persistent second expert-weight layout or retained
+per-forward activation tensors was found. Major GEMM scratch byte counts match
+stock Marlin and alias in the same way. This is NOT proof of the <=2 GB/GPU
+whole-model peak delta requirement. Startup conversion, reserved graph-pool
+fragmentation, persistent graphs/outputs, driver allocations, and other changes
+in the combined package still require a same-configuration whole-model A/B.
+
+1. Weight conversion lifetime
+NVFP4 _process_weights_for_humming aliases six native tensors into a temporary
+SimpleNamespace, prepares one child module, then deletes the original names.
+_prepare_humming_experts registers contiguous views of packed codes and FP8
+scales before repacking. The current version validates 64-aligned N/K and calls
+transform_humming_layer(already_padded=True), so the earlier redundant padding
+copies are absent. The transform repacks FP4 codes and permutes FP8 scales; this
+path does not materialize full BF16 expert weights. Post-scales are BF16 vectors.
+
+Deletion does not immediately release the original layer weights in the real
+loader: srt/model_loader/post_load.py:109 stage_module_for_post_load snapshots
+each registered tensor AND tensor.data into original_slots/tensor_states before
+yielding. Those references survive through its finally block. New canonical
+child parameters are restored to the original module device; same-device restore
+does not make another copy. The temporary raw namespace and Humming transform
+state_dict dictionaries also keep aliases during preparation, then go out of
+scope. Thus raw originals and repacked canonical tensors coexist for one module.
+
+DefaultModelLoader.postprocess_weights (loader.py:1079) processes quantized
+modules one at a time under device_loading_context; model.load_weights has
+returned first. _modules_with_quant_method is a generator. This does not imply
+62 layers of original plus repacked data remain live. Other loaders, including
+the RL original_weights snapshot path, have different contracts and are outside
+the observed standard loader claim. Stock Marlin also repacks under this same
+post-load context, so raw-original overlap is not all a Humming regression.
+
+Illustrative E=32, H=I=4096 geometry, excluding tiny global-scale vectors:
+  packed FP4 codes: 3*E*H*I/2 = 805,306,368 bytes
+  FP8 group-16 scales: 3*E*H*I/16 = 100,663,296 bytes
+  canonical total: 905,969,664 bytes = 0.84375 GiB per layer
+Originals of that size remain until the module context exits, in addition to
+repack temporaries. Stock nvfp4_marlin_process_scales returns FP8 storage; it is
+incorrect to assume that stock persistently stores those scales in BF16 and
+credit Humming with a full-model scale-memory saving. Exact peak differences
+depend on repack allocation order, staging, allocator reserve and geometry.
+
+2. Forward scratch and retention
+Let R=M*topk, H=input width, I=local intermediate width, and BF16 bytes=2.
+Both paths allocate:
+  cache13: 2*R*max(2*I,H) bytes
+  cache2:  2*R*I bytes
+cache1 and cache3 are views into cache13, not separate storage. Humming supplies
+these outputs to forward_layer, so Humming need not allocate another GEMM output.
+Stock Marlin allocates cache2 before cache13; Humming allocates cache13 before
+GEMM1 and cache2 afterwards. Nominal live-byte sum matches, but allocator packing
+need not match. Returned cache3 remains live through the unchanged finalizer;
+all other local tensors become reclaimable on return with normal stream rules.
+
+For illustration only, M=16384, topk=8, H=I=4096 makes these two buffers total
+3 GiB (2 GiB cache13 + 1 GiB cache2) in BOTH paths. This is not a 3 GiB delta and
+must not be multiplied by layer count without evidence of overlapping lifetimes.
+
+Humming additionally materializes clamp/cast safe IDs (int64 R), gathered BF16
+global scales, and sometimes a second routing alignment when GEMM block sizes
+differ. Both first and second alignment tensors can coexist until helper return.
+moe_align_block_size.py:115 sizes sorted IDs as R*block for very small R, else
+R+(E+1)*(block-1), rounded to four, plus expert IDs and tiny counts. These are
+bounded, comparatively small buffers at normal geometry, not expert matrices.
+The retain=False argument is unused and does not retain outputs. No per-forward
+assignment into layer state or a growing Tensor list was found.
+
+Humming retains per-layer locks of max(2048,8*SMs) int32, unused by the selected
+Stream-K-disabled path. The common minimum is 8 KiB/layer (about 0.484 MiB for
+62 layers). Marlin creates a 4*SMs int32 workspace per invocation, and its stock
+preparation helper also installs a small persistent layer.workspace of that size.
+Static tuning dictionaries and metadata contain configuration, not activations.
+kernel/humming.py _str2kernel_cache caches CPU int64 launch configuration;
+jit/runtime.py _instances caches compiled modules/configuration by signature.
+These do not cache invocation input/output tensors. csrc/launcher/tensor.h:19
+allocates a nonzero tensor-map buffer only for grouped GEMM types 2/3 with TMA C;
+the selected indexed type 1 has zero buffer length. BF16 inputs take the direct
+input path rather than activation quantization. Compiled device code/module
+overhead still needs device-level accounting; source inspection cannot bound it.
+
+3. Graph capture across layers and buckets
+srt/model_executor/runner_utils/pool.py:109 provides one runtime-wide graph pool,
+and :117 a shared named capture stream. FullCudaGraphBackend uses that pool and
+stream in capture, runs two eager warmups, and stores graphs and final model
+outputs by shape key (runner_backend/full_cuda_graph_backend.py:159,200,215).
+Decode captures reversed capture_bs (:1326); prefill captures reversed token
+sizes (:1715), so largest shapes are captured first. Supported capture paths
+therefore allow sequential layer/bucket scratch reuse rather than necessarily
+allocating the maximum scratch separately for every layer and bucket.
+
+This is a reuse mechanism, not a measured bound: routing allocation order,
+shape-dependent second alignments, live final outputs, graph output-buffer reuse
+settings, different streams, allocator split/packing rules, and other model
+features affect reserved memory. GraphPoolPrecarve measures eager RESERVED peak
+growth and mints one span; its source explicitly notes live allocated-byte sums
+miss packing holes. More Humming clamp/cast/gather/multiply kernels also create
+additional graph nodes across all layers/buckets. CUDA driver graph/node and
+module allocations may not be fully represented by torch allocated statistics.
+
+4. Remaining >2 GB/GPU risks and decisive evidence
+No deterministic >2 GB regression was established from this source review.
+The important unclosed risks are:
+  - Whole-model loading peak while raw and repacked weights coexist; per-layer
+    probes starting from synthetic already-prepared weights omit this phase.
+  - Shared graph-pool RESERVED footprint/fragmentation across every real prefill
+    and verify bucket, plus persistent graph outputs and CUDA graph metadata.
+  - Loaded kernel/module and graph driver memory outside torch allocations.
+  - Combined-package additions such as projection workspace, target/draft graph
+    capture, and KV allocation policy; a Humming-only tensor sum excludes them.
+    If an implementation consumes more fixed memory and auto-sizing shrinks KV,
+    final free-memory equality does not establish the allowed peak-memory delta.
+
+The old actual serving startup log research_iteration_2026-11-15/startup.log
+reports roughly 15.80 GB prefill graph memory and 0.25 GB target-verify graph
+memory. These are whole-system footprint observations, NOT Humming deltas and
+NOT a reliable attribution to individual operators. Laptop per-layer probes
+cannot establish H200 allocator/graph/module memory or full-model acceptance.
+
+Required proof: matched stock/candidate H200 whole-model runs under identical
+flags, cache sizing inputs, capture buckets and output requirements, recording
+per-rank device free/used and torch allocated/reserved peaks through native
+load, each post-load conversion, all warmups/captures, KV sizing, and serving
+replay. Include the full combined package and driver-visible peaks. Keep both
+peak and steady-state measurements; verify no accumulated tensor/module growth
+across repeated replay and supported recapture. Until then, mark memory limit
+unverified even if exact per-layer output/graph tests pass.

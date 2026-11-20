@@ -1,0 +1,61 @@
+Round2 decode lane: no conclusive2x serving result; no scored request.
+All new integrations remain separate, defaultOFF and unapplied.
+
+REVIEWABLE PACKAGES
+1. Target native FA3 prologue fusion: component pilot2.0979x, but corrected
+   wider target-chain aggregate1.00208x, CI[1.00129,1.00286]. No material whole-chain
+   promotion and no unchanged timing rerun. The chain uses local SM86, synthetic
+   weights/virtual peers and correctedSWAorigin, not actualH200/TP8.
+   PROLOGUE_STATUS.txt; prologue_freeze_manifest.json; chain_reward.json.
+   PROLOGUE_REDUCTION_SCOPE.txt qualifies reduction equivalence: default16MiB
+   budget admitsM<=2016/BLOCK<=16. BLOCK32 large-prefill extension changes the
+   reduction layout and has a preserved rounding counterexample. Do not expand
+   calibrationbudget or prefill scope from the frozen decode result. Prefill
+   lane's separate8warp salvage is outside this package.
+2. Draft packed argmax: same native logits/max, one exact8Bpayload gather for
+   startup-proven bounded IDs (fullint64fallback otherwise), first-rank ties/NaNs.
+   CPU/Gloo and localGPU/class proofs passed. Local postops cost improves, but
+   no realNCCL or server gain was measured. SAMPLER_READOUT.txt and
+   sampler_freeze_manifest.json; cumulativeSHA4f5a3583... unchanged.
+3. Target post-gather selector: native softcap and payload/allgather unchanged;
+   root's exact helper has539payload+24producerGPUcases and captured-only
+   holdout4.00–4.76x (~4us), with no eagerKEEP. Actual-method CPU250+5 and exact
+   Muse subclass inheritance16+2 policy checks pass under their explicit mocks.
+   TARGET_SELECTOR_READOUT.txt; target_selector_freeze_manifest.json;
+   target_selector_muse_cpu.json; cumulativeSHA7d31f72e... .
+4. Deferred greedy-broadcast provenance: CPU/Gloo proof passes under its narrow
+   base-class contract, but the exact-class guard rejects actualMuse subclass.
+   It is INELIGIBLE for Muse as frozen. Host bookkeeping alone adds~4.59us
+   before realCUDAstream checks, so no netgainclaim. MUSE_LOGITS_ACTIVATION.txt
+   supersedes applicability in older generic notes; original evidence preserved.
+
+SOURCE AND NEGATIVE EVIDENCE
+- Muse's pinned model-specific LM-head override forcesFP32 output and inherits
+  deferred_argmax. Generic enable_fp32_lm_head=False does not disable it.
+  Actual checkpoint vocab/softcap are still not authenticated by source defaults.
+- PR51393 new HopperNVFP4decode: actualpolicyT<=2, C++hardmax4; unchanged
+  DFlashverify minimumT8 is excluded, SP isprefill-only. Donor math drops frozen
+  BF16 boundaries. PR51393_READOUT.txt and pr51393/audit.json.
+- ReleasedFlashInfer small-queryFA2 bypass excludesFP8queries; cluster stochastic
+  sampling is not greedy replacement. FLASHINFER_NOV_READOUT.txt.
+- Native DFlash ring/side-stream donors have backend/HiCache or context-policy
+  exclusions. RING_PREFETCH_AUDIT.txt, DFLASH_SYNC_AUDIT.txt. Nov19 merged51386
+  additionally makes ringdefaultOFF after asymmetricPD state-registration errors:
+  RING_DEFAULT_OFF_SUPPLEMENT.txt (deployment evidence, not numerical veto).
+- Target softcap cluster plan has72value cases and40320CPUarrival-order cases
+  with a final-lifetime-barrier counterexample. NativeSM90 compile passes;
+  clusteredGluon versions have preservedfrontend failures; correctedv3 remains
+  preflight-blocked. cluster_softcap/PLAN.txt and versionedreceipts. No clustered
+  SM90 numerical execution or speed claim.
+- Independently reviewed finite-weight lifetime, split-ready/dependency WGS,
+  conservative H200receipt evaluator, rootvendorCFGbinding and50800 boundary
+  restoration. Reviews do not substitute for actualSM90/full-model execution.
+  Final control-flow repair is complete for four WGS and two donor binaries:
+  exact vendor edge coverage/reachability and injected negatives pass their
+  static RS/accumulator screen. See final_static_cross_review.json; this is not
+  hardware numerical or asynchronous memory correctness evidence.
+
+No component ratios are multiplied or presented as end-to-end speedup. Frozen
+scored parent remains the reference; all H200/NCCL/whole-frontier gates remain
+root-coordinated. No remote/scored job, approximation, weight change, service
+modification or newlargeweight download was performed in this lane's round2.

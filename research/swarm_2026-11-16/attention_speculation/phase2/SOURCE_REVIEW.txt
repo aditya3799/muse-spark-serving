@@ -1,0 +1,112 @@
+Phase 2 attention/speculation review (2026-11-16)
+
+Baseline: scored job e399c79bb1994630, round5_humming_adaptive_fused patch
+8b3ed81e053e4ccb2a043afd25cb94bb49017995ece517bb35aeb6e1b79e026b.
+Measured H200 score 1.2237x; correctness/later-turn and memory gates passed.
+Reaching 1.6x still needs 1.30751x relative throughput, or approximately
+23.52% uniform execution-time reduction. Metadata changes alone have no
+evidence supporting that entire gap.
+
+Priority 1: narrowly enable existing FA4 DFlash metadata glue.
+The scored startup log says the backend declares no host-free draft prep.
+Capture durations in that log are startup costs, not inference time shares.
+Existing isolated combined_attention_optional_v1 validates device metadata
+updates and graph replay, including ordinary-MHA sliding-window metadata.
+It does NOT execute actual Hopper FA4 attention or establish acceptance parity.
+Preserve released drafter, draft block size, BF16 KV and generation policy.
+
+Priority 2: prefix-scan metadata kernel. Prior local exact integer/graph tests
+passed. Measure actual small batch/page geometry before expecting material gain.
+
+Priority 3: identify remaining device-only metadata launch/allocation overhead,
+preserving host-fed DFlash plan semantics. Never remove the global DFlash
+capture warning or assume every KVLocPlan field is graph-safe.
+
+Draft construction and precision proof:
+- sglang/python/sglang/srt/models/dflash.py: DFlash2DraftModel subclasses
+  DFlashDraftModel without overriding decoder_layer_cls. The base constructs
+  DFlashDecoderLayer, whose MLP is unconditionally DFlashMLP: dense merged
+  column-parallel gate/up and row-parallel down projections. Its fused_moe
+  import is an activation helper, not expert routing. No MoE runner is read.
+  Therefore inherited speculative_moe_runner_backend marlin->humming is inert
+  for these dense draft layers. Flag differences alone cannot establish a
+  draft runtime or speed change.
+- DFlashDraftModel supports_quantization=False; DFlash2 does not override it.
+- mem_cache/kv_cache_dtype.py:92-109 overrides DFLASH FA4 KV to model_dtype
+  if target KV precision differs, because FA4 requires Q and K dtype parity.
+  Do not switch draft backend to obtain local coverage: that could change KV
+  dtype behavior and would not test the requested branch.
+- arg_groups/fields/memory.py:78 defines enable_unified_memory=False.
+  The saved official serving launch contract enables hierarchical cache,
+  but does not enable unified memory. These are distinct settings. The actual
+  scored startup server_args line explicitly records enable_unified_memory:
+  False and enable_page_major_kv_layout: False. The excerpt is truncated later
+  in that line, so other omitted fields still need source/contract evidence.
+  Scored post-capture logs explicitly record separate draft KV BF16 allocation:
+  2,069,149 tokens, 4.94 GB per rank. This strengthens the earlier old-run audit
+  with current scored-run evidence; the UnifiedRadixCache tree log does not
+  imply a unified device allocator.
+
+Actual FA4 local capability limitation:
+- layers/attention/flashattention_backend.py selects flash_attention_v4 for
+  FA4 on non-SM120 devices, and its paged attention call supplies page_table.
+- kernels/ops/attention/flash_attn/cute/interface.py:1430-1432 selects SM8x
+  then asserts page_table is None ('paged KV not supported on SM 8.0') and
+  rejects SplitKV. Some unpaged FA4 kernels support SM86, but the actual
+  paged DFlash attention consumer does not. No GPU test was needed to establish
+  this explicit source restriction; no local GPU launch was made for it.
+- Next feasible local proof: exact scored-method metadata/input capture parity
+  with changed IDs, lengths, pages, KV values and window boundaries, plus an
+  independently specified mathematical consumer. This cannot close Hopper
+  FA4 arithmetic or full-model acceptance gates. Any eventual integration
+  must retain that limitation and await supported hardware validation.
+
+Independent MoE routing reviews:
+- Initial fused_partition_align e33d0b19: counts/prefix allocation and masked
+  scatter ownership were sound. Unspecified tails require multicast-B=1;
+  indexed scheduler rounds by block-M*multicast-B, so larger multicast can
+  fetch beyond the ordinary padded bound.
+- fused_routes_helper d800dd64 explicitly falls back if any derived config
+  multi_cast_size_b != 1, resolving that identified contract gap. Both up
+  partitions finish before scale/activation and cache13 down-buffer reuse.
+- full_chain_probe a9a7b27a pins the scored source and uses shared canonical
+  weights/finalizer, exact eager/changed-input graph comparisons and explicit
+  all-remote zero checks. No launch blocker found. Timing is local SM86
+  single-layer graph replay with A/A controls, not H200 serving performance.
+
+Independent projection reduce-scatter review:
+- Eligible only for existing large row-sharded unpool path with non-reduced
+  EP outputs, Hopper BF16 shapes and rank-uniform construction prerequisites.
+- Additional guard requires CustomAllReduceV2, bytes above its actual max_size,
+  pynccl present and no active alternate reduction backend or FlashInfer hint.
+  This retains the existing small custom FP32 reduction regime.
+- Group reduce_scatter_along_dim uses registered group dispatch; graph_capture
+  enables pynccl on its capture stream. Gather restores row order after the
+  unchanged full-K projection. No source blocker found.
+- Rank-uniform communicator/capacity assumptions and BF16 NCCL collective
+  reduction topology still require real multi-GPU numerical/capture/performance
+  validation. Scalar CPU mocks do not establish those properties.
+
+No frozen exports or scored source were changed by this review.
+
+Additional Hopper gather-norm review (projection phase2/hopper_gather_norm):
+- New small-projection deferral returns exactly the existing BF16 contiguous
+  column-local projection. _defers_unpool_gather requires a non-null bound
+  FFN boundary, JIT selection and multicast support. Last/unbound layers keep
+  the full-output path. Decoder shape dispatch consumes the deferred slice
+  once through gather+norm with the boundary's cached gate/norm parameters.
+- SM90 explicitly uses C1 launch policy, matching standalone C1 normalization;
+  SM10+ retains the previous cluster policy and SM<9 remains excluded.
+- Unchanged CUDA source and CPU ownership/arithmetic checks do not prove
+  multicast phase-counter ordering, graph bucket rotation or cross-rank
+  forward progress. These remain real multi-GPU runtime validation gates.
+- No source blocker found; no GPU/compiler calls made for this review.
+
+New source observation for future investigation, not implemented:
+normal_decode_set_metadata uses a static max-context page-table launch bound.
+Native sliding_attention may read only a recent window, but this alone does
+not prove compact draft cache is enabled. speculative_draft_window_size
+defaults to None and the public serving contract does not enable it. Never
+shrink metadata from an assumed compact-cache bound. A separate exact SWA
+suffix view would need full key-mask coverage, bottom-right query alignment,
+page alignment and mixed full/SWA layer proofs before implementation.

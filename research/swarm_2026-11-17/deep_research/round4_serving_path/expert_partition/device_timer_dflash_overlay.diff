@@ -1,0 +1,16 @@
+--- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
++++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+@@ -368,6 +368,13 @@
+         if self.scheduler.draft_worker is not None:
+             dw = getattr(self.scheduler.draft_worker, "draft_worker", None)
+             if dw is not None:
++                # DFlash uses a plain TpModelWorker, not legacy draft runners.
++                # Reuse the existing opt-in timer; do not add an event pair.
++                if (
++                    ENABLE_METRICS_DEVICE_TIMER
++                    and type(self.scheduler.draft_worker).__name__ == "DFlashWorkerV2"
++                ):
++                    dw.model_runner.device_timer = timer
+                 if hasattr(dw, "draft_runner"):
+                     dw.draft_runner.device_timer = timer
+                 for r in getattr(dw, "draft_runner_list", []):

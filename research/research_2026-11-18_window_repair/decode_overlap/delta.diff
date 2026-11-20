@@ -1,0 +1,272 @@
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -1,6 +1,7 @@
+ import logging
+ import math
+ import os
++from contextlib import contextmanager
+ from typing import TYPE_CHECKING, List, Optional, Tuple
+ 
+ import torch
+@@ -614,6 +615,52 @@
+         self._out_tokens_bufs: List[torch.Tensor] = []
+         self._new_seq_lens_bufs: List[torch.Tensor] = []
+         self._target_logits_processor = self._defer_target_verify_gather()
++        self._context_projection_stream = self._new_context_projection_stream()
++
++    def _new_context_projection_stream(self):
++        from sglang.srt.layers.layernorm import RMSNorm
++        from sglang.srt.models.dflash import DFlashDraftModel
++
++        model = self.draft_model
++        if (
++            self._target_logits_processor is None
++            or not is_cuda()
++            or type(model).project_target_hidden is not DFlashDraftModel.project_target_hidden
++            or model.quantizable
++            or type(model.fc) is not torch.nn.Linear
++            or type(model.hidden_norm) is not RMSNorm
++            or model.hidden_norm._quant_linear is not None
++            or model.fc.weight.dtype != torch.bfloat16
++            or model.fc.weight.device.type != "cuda"
++        ):
++            return None
++        return torch.cuda.Stream(device=model.fc.weight.device)
++
++    @contextmanager
++    def _project_during_verify(self, hidden, rows, active):
++        side = self._context_projection_stream
++        if (
++            not active or side is None or hidden is None
++            or hidden.ndim != 2 or hidden.shape[0] != rows or rows == 0
++            or hidden.shape[1] != self.draft_model.fc.in_features
++            or hidden.device != self.draft_model.fc.weight.device
++            or hidden.dtype != torch.bfloat16
++            or torch.cuda.is_current_stream_capturing()
++        ):
++            yield None
++            return
++        forward = torch.cuda.current_stream(hidden.device)
++        side.wait_stream(forward)
++        try:
++            with torch.cuda.stream(side), torch.inference_mode(), draft_tp_context(self.draft_parallel_layout):
++                hidden.record_stream(side)
++                projected = self.draft_model.project_target_hidden(hidden)
++            # The following prefix-KV operation consumes the side allocation on
++            # forward. The graph runner reuses the target aux buffer next round.
++            projected.record_stream(forward)
++            yield projected
++        finally:
++            forward.wait_stream(side)
+ 
+     def _defer_target_verify_gather(self) -> Optional[LogitsProcessor]:
+         processors = [
+@@ -1827,6 +1874,7 @@
+         cache_loc_2d: Optional[torch.Tensor] = None,
+         commit_lens: Optional[torch.Tensor] = None,
+         extend_lens: Optional[torch.Tensor] = None,
++        projected_context: Optional[torch.Tensor] = None,
+     ) -> None:
+         """Materialize target context features into the draft KV cache at explicit slots.
+ 
+@@ -1926,7 +1974,10 @@
+             torch.inference_mode(),
+             draft_tp_context(self.draft_parallel_layout),
+         ):
+-            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
++            ctx_hidden = (
++                self.draft_model.project_target_hidden(target_hidden)
++                if projected_context is None else projected_context
++            )
+             if self.lilicorr is not None:
+                 self._lilicorr_anchor = publish_anchor(
+                     draft_sampler=self._draft_sampler,
+@@ -2884,93 +2935,98 @@
+         can_run_cuda_graph = target_out.can_run_cuda_graph
+         target_predict = None
+         target_lp = self._target_logits_processor
+-        if target_lp is not None and target_lp.is_deferred_shard(
++        deferred = target_lp is not None and target_lp.is_deferred_shard(
+             logits_output.next_token_logits
+-        ):
+-            if self._can_skip_verify_logits(batch, sampling_info):
+-                target_predict = target_lp.deferred_argmax(
+-                    logits_output.next_token_logits
+-                )
+-                logits_output.next_token_logits = None
+-            else:
+-                logits_output.next_token_logits = target_lp.finish_deferred_gather(
+-                    logits_output.next_token_logits
+-                )
+-
+-        grammar_mask = None
+-        if batch.has_grammar:
+-            grammar_mask = build_grammar_vocab_mask(
+-                reqs=batch.reqs,
+-                tree=grammar_tree,
+-                sampling_info=batch.sampling_info,
+-                device=logits_output.next_token_logits.device,
+-                barrier=grammar_barrier,
+-            )
+-
+-        if sampling_info is not None and target_predict is None:
+-            apply_dflash_verify_logits_adjustments(
++        )
++        with self._project_during_verify(
++            logits_output.hidden_states, bs * int(self.block_size),
++            active=deferred and can_run_cuda_graph,
++        ) as projected_context:
++            if deferred:
++                if self._can_skip_verify_logits(batch, sampling_info):
++                    target_predict = target_lp.deferred_argmax(
++                        logits_output.next_token_logits
++                    )
++                    logits_output.next_token_logits = None
++                else:
++                    logits_output.next_token_logits = target_lp.finish_deferred_gather(
++                        logits_output.next_token_logits
++                    )
++
++            grammar_mask = None
++            if batch.has_grammar:
++                grammar_mask = build_grammar_vocab_mask(
++                    reqs=batch.reqs,
++                    tree=grammar_tree,
++                    sampling_info=batch.sampling_info,
++                    device=logits_output.next_token_logits.device,
++                    barrier=grammar_barrier,
++                )
++
++            if sampling_info is not None and target_predict is None:
++                apply_dflash_verify_logits_adjustments(
++                    next_token_logits=logits_output.next_token_logits,
++                    sampling_info=sampling_info,
++                    draft_token_num=int(self.block_size),
++                )
++
++            # Constrain every chain position before accept picks from it.
++            if grammar_mask is not None:
++                grammar_mask.apply(logits_output.next_token_logits)
++
++            candidates = draft_tokens
++            (
++                accept_len,
++                commit_lens,
++                bonus,
++                out_tokens,
++                new_seq_lens,
++            ) = self._accept_block(
++                candidates=candidates,
+                 next_token_logits=logits_output.next_token_logits,
+                 sampling_info=sampling_info,
++                draft_input=draft_input,
++                prefix_lens=prefix_lens,
++                bs=bs,
++                target_predict=target_predict,
++            )
++
++            sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
++                sampling_info,
++                next_token_logits=logits_output.next_token_logits,
++                draft_input=draft_input,
+                 draft_token_num=int(self.block_size),
+-            )
+-
+-        # Constrain every chain position before accept picks from it.
+-        if grammar_mask is not None:
+-            grammar_mask.apply(logits_output.next_token_logits)
+-
+-        candidates = draft_tokens
+-        (
+-            accept_len,
+-            commit_lens,
+-            bonus,
+-            out_tokens,
+-            new_seq_lens,
+-        ) = self._accept_block(
+-            candidates=candidates,
+-            next_token_logits=logits_output.next_token_logits,
+-            sampling_info=sampling_info,
+-            draft_input=draft_input,
+-            prefix_lens=prefix_lens,
+-            bs=bs,
+-            target_predict=target_predict,
+-        )
+-
+-        sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
+-            sampling_info,
+-            next_token_logits=logits_output.next_token_logits,
+-            draft_input=draft_input,
+-            draft_token_num=int(self.block_size),
+-            bs=bs,
+-        )
+-        if sampling_mask_capture is not None:
+-            logits_output.sampling_mask_output = sampling_mask_capture.build_output(
+-                out_tokens=out_tokens,
+-                commit_lens=commit_lens,
+-            )
+-
+-        if batch.return_logprob:
+-            compute_spec_logprobs(
+-                batch,
+-                logits_output,
+-                out_tokens.reshape(-1),
+-                chain_stride=block_size,
+-            )
+-
+-        if self._need_mamba_verify_commit:
+-            assert seq_lens_pre_verify is not None
++                bs=bs,
++            )
++            if sampling_mask_capture is not None:
++                logits_output.sampling_mask_output = sampling_mask_capture.build_output(
++                    out_tokens=out_tokens,
++                    commit_lens=commit_lens,
++                )
++
++            if batch.return_logprob:
++                compute_spec_logprobs(
++                    batch,
++                    logits_output,
++                    out_tokens.reshape(-1),
++                    chain_stride=block_size,
++                )
++
++            if self._need_mamba_verify_commit:
++                assert seq_lens_pre_verify is not None
++                if new_seq_lens is None:
++                    new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
++                self._update_target_mamba_state_after_verify(
++                    batch=batch,
++                    seq_lens_pre_verify=seq_lens_pre_verify,
++                    seq_lens_post_verify=new_seq_lens,
++                    commit_lens=commit_lens,
++                )
++
+             if new_seq_lens is None:
+                 new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+-            self._update_target_mamba_state_after_verify(
+-                batch=batch,
+-                seq_lens_pre_verify=seq_lens_pre_verify,
+-                seq_lens_post_verify=new_seq_lens,
+-                commit_lens=commit_lens,
+-            )
+-
+-        if new_seq_lens is None:
+-            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+-        if on_publish is not None:
+-            on_publish(new_seq_lens)
++            if on_publish is not None:
++                on_publish(new_seq_lens)
+ 
+         # --- 3) Materialize committed verify-input tokens into draft KV cache.
+         hidden = logits_output.hidden_states
+@@ -2989,6 +3045,7 @@
+             cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
+             positions=positions,
+             commit_lens=commit_lens,
++            projected_context=projected_context,
+         )
+ 
+         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.

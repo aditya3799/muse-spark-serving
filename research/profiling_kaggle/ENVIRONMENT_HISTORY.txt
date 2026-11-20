@@ -1,0 +1,13 @@
+PROFILING ENVIRONMENT HISTORY
+
+User clarification received November 15, 2026:
+Earlier profiling runs were executed on Google Colab T4. After Colab limits were exhausted, the user switched to Kaggle T4. Notebook 12 is the latest completed run at the time of this clarification and was run on Kaggle.
+
+Observed software for recent earlier timing runs: PyTorch 2.14.1+cu130, Triton 3.8.0, NumPy 2.4.6.
+Observed Notebook 12 software: PyTorch 2.11.0+cu130, Triton 3.6.0, NumPy 2.1.3. Two T4 devices were visible; the notebook used device 0.
+
+Provider attribution above comes from the user; version/device details come from the results. Notebook filenames and the profiling_kaggle directory name describe the prepared workflow, not proof of where earlier runs executed. Earlier report/chat references calling those runs Kaggle should be read with this correction.
+
+Keep reported environments intact. Use matched within-run baseline/candidate comparisons. Do not attribute changes in absolute latency across Colab/Kaggle runs to code alone: framework versions, host resources and GPU operating conditions may differ. Notebook 12 is correctness-only and does not reproduce prior latency gains on Kaggle.
+
+Notebook 14 correction (user explicitly confirmed November 15, 2026): the final cache-choice repeat ran on Colab T4, not Kaggle. Run 20261114T200742Z_6317d4 reports PyTorch 2.14.1+cu130, Triton 3.8.0, NumPy 2.4.6, driver 580.82.07. Notebook 12/13 remain Kaggle correctness runs. Kaggle latency replication is not established. The phase closes after this Colab repeat without another notebook.

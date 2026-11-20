@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "/mnt/d/OpenKernelChallenge/serving/research_2026-11-19_round2/moe/compile_wgs_register.py", line 24, in <module>
+    dis=subprocess.run([str(cuda/'bin/cuobjdump'),'--dump-sass',str(output)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=20,env=env)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 548, in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 1026, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/usr/lib/python3.12/subprocess.py", line 1955, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+FileNotFoundError: [Errno 2] No such file or directory: '/home/aditya/.venvs/okc-marlin-tiles/lib/python3.12/site-packages/nvidia/cu13/bin/cuobjdump'

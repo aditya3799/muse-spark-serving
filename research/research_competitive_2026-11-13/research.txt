@@ -1,0 +1,207 @@
+﻿Competitive serving research — 2026-11-13
+Workspace: D:\OpenKernelChallenge\serving
+Objective: improve geometric-mean serving score at 1/4/16/32 users; investigate a credible path toward 3x, without claiming an unmeasured result.
+
+DECISION
+
+Treat 1.3x as an intermediate milestone, not the ambition. The current small-fusion patch does not replace the dominant expert GEMMs and cannot support a credible 3x forecast. Pursue three substantial changes: (1) a Muse-specific BF16/NVFP4 Humming expert adapter, compared with our validated custom MoE donor; (2) output-sharded pooler/unpooler projections on H200; (3) a correct serving adapter for our attention kernels. Prefill, speculative acceptance and communication must then be optimized together. Several well-chosen fused kernels are a better first implementation strategy than a wholesale monolithic engine rewrite.
+
+There is no verified 3x serving result for our engine. The Slack report is user-provided context; the thread was not available. Public claims on different hardware and standalone kernel results are research leads, not expected overall scores.
+
+This research changed no serving implementation and submitted no new judge run. It produced source snapshots, arithmetic, synthetic route analysis and a distributed projection probe. The probe's CPU partition/reconstruction test passed; its eight-GPU execution remains unrun because this workstation has no eight-H200 node. A pinned dependency in pyproject.toml does not prove that its import and JIT succeed in the judge image; that preflight remains mandatory.
+
+1. WHAT THE SCORE ACTUALLY MEASURES
+
+RULES.md defines throughput per GPU at stock's per-user speed, divided by stock's throughput on the same node, then a geometric mean over four loads. This is a serving frontier comparison, not simply the inverse of a decode-step latency. Amdahl calculations below describe fixed-work latency scenarios only. They cannot directly predict the score, whose detailed interpolation and token accounting are not available here.
+
+Our validated v3 scored run 5183861a98ee4825 passed correctness and scored 1.0006. Per-load ratios were 0.9884 / 1.0076 / 1.0053 / 1.0011. These are the measured serving baseline. A 3x improvement at just one load, with the others unchanged, yields only 3^(1/4) = 1.3161 overall. The target therefore requires gains across loads.
+
+The result contains substantial first-turn prefill and later-turn behavior: first-turn TTFT p90 was approximately 8.95 / 21.31 / 82.81 / 185.27 seconds; later-turn p90 was 0.225 / 0.253 / 0.339 / 3.343 seconds. Overall cache hit was around 0.92. These observations justify measuring prefill and cache movement; they do not justify tuning to the sampled conversation contents.
+
+Fixed-work examples: improving 90% of runtime by 3x gives 2.5x overall; improving that region by 4x gives 3.08x. With 20% untouched, a 4x region gives only 2.5x. Transplanting a 2.26x standalone layer into a system with 10% untouched work gives about 2.01x in this simplified model. Therefore we need to attack communication, prefill, draft overhead and acceptance as well as target kernels. These are conditional arithmetic examples, not profiling estimates.
+
+Contract: stock precision and work, exact requested token counts, outputs agreeing with stock, at most 2 GB extra peak GPU memory per GPU, TTFT at most 2x stock at each load. Source/JSON patch under python/sglang only, excluding model_loader; at most 400 KB and no added line over 400 characters. Generic model/device/shape dispatch is appropriate; special-casing challenge load identities is not. Flags can change except those listed fixed in the local flags file. In particular, changing KV precision or enabling quantized communications is not a route to an eligible gain.
+
+2. CURRENT CANDIDATE AND DONOR PROVENANCE
+
+Frozen submission_v4.diff: 13,593 bytes; SHA256 92054389830a8e5c07a37eb524810ac83690fbbcf88c60e3ae8a132909bb65f1. It modifies small route alignment/mapping and post-expert finalization; it does not port the main custom GEMMs. Its outstanding one-user check is 717001a114f3471a. See the final status artifact for the latest observation, if available.
+
+Use the hashes in analysis.json as the source manifest:
+- MoE v139: ../muse_moe_w4a16/submission_v139_wgs_kperm3.py, 214,000 bytes, a24b8374aad49fbaa5e0cdeffb7f1fa64960d8321f343cf8b88bd97dfdd20c09. Standalone result 13cca0e4992b4983: 2.38986x; M8/32/128/256 approximately 2.246/1.682/2.651/2.983x.
+- Attention: ../muse_attention_decode/submission.py, 260,290 bytes, 3e6d676275706a76c624b27a970583e6157a8cc536c4843d72fdc40b986172a2. Standalone result fcf3d95f5f2046bc: 2.693485x.
+- Decode S081: ../muse_decode_layer/submission_s081_keell0renz_890809c.py, 979,654 bytes, 82c098ae7534b20b5d80f59d547650cb0853fc7d5e313fe29e1e9d9373e1bb19. Scored result 725c19cbeb9b4d48: 2.2611966x. The active submission.py is a DIFFERENT 993,238-byte file with hash 02c34a53b0254e1534b2bf12b5c8a542832c935a2f7846d63a87992e234ff863. Do not silently substitute it for the validated donor.
+- Final eligible prefill donor identified by its local ledger: ../muse_prefill_layer/submission_scored_399cbda410c440ee.py, 467,943 bytes, 7a5aedf8b6def500d72463a5a12eea7f9bb07c49a8977b400ccb27739d23676e. Reported 200.105694 ms, 1.935996x. Earlier faster FP8-weight-copy variants were subsequently marked incompatible; do not revive them based on their earlier checks.
+
+The decode component uses identity collectives and is not the distributed serving engine. Its measured whole-layer gains are more useful than multiplying isolated kernel ratios, but still omit a material cost. The MoE and attention donors alone total 474,290 source bytes, already beyond the patch budget before integration. Extract minimal used kernels, preserve attribution, and reuse existing dependencies rather than pasting whole submissions.
+
+3. PRIORITY A: REAL EXPERT GEMM REPLACEMENT THROUGH HUMMING
+
+Local pyproject.toml pins humming-kernels[cu13]==0.1.12. I fetched and inspected that exact version's x86 wheel, not only current upstream. Its schema and API include Modelopt NVFP4 weights, BF16 input support, indexed and grouped expert GEMMs, and caller-provided raw GEMM output. The local generic SGLang Humming runner already demonstrates configuration, preparation and dispatch patterns.
+
+Relevant files:
+- sglang/python/pyproject.toml
+- sglang/python/sglang/srt/layers/moe/moe_runner/humming.py
+- sglang/python/sglang/srt/layers/quantization/humming_utils.py
+- sglang/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
+- sglang/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
+- sources/humming_0_1_12_humming_layer.py and schema/modelopt snapshots
+
+Why this is promising: the dependency provides Hopper-oriented weight-dequantizing tensor-core kernels without spending the entire patch budget on a new CUDA implementation. The current Muse layer rejects a non-Marlin path on pre-Blackwell hardware; the generic Humming runner is not directly interchangeable because it combines expert outputs without Muse's intervening per-expert RMSNorm. Enabling a flag alone is insufficient.
+
+Proposed adapter:
+1. Add an explicit Muse Humming backend branch and weight preparation hook in the permitted layer code, leaving other models/device paths intact. Preflight the existing dependency in the actual image before changing weights.
+2. Prepare one Humming weight representation from the model's existing NVFP4 tensors. Preserve BF16 inputs and FP32 accumulation; do not activate online input quantization, reduced accumulation or FP8 dispatch.
+3. Produce gate/up outputs using an indexed GEMM for small decode. Apply stock SiLU/multiply with the stock rounding boundaries. Produce uncombined down-projection outputs with the second GEMM.
+4. Apply the existing Muse per-expert RMSNorm and route-weighted reduction, then the original cross-rank reduction. Norm cannot move across the expert sum or all-reduce.
+5. Add grouped prefill using the same packed weight representation and bounded workspaces. Keep a valid generic path within that representation for unsupported shapes. Do not retain a second full Marlin copy as an automatic runtime fallback: it risks the memory budget.
+6. Select tactics using generic shape, dtype, architecture and route occupancy. Avoid .item() or CPU copies of routing counts during replay. Check the Humming estimate_local_valid_shape_m helper: its generic estimate needs EP-aware treatment in this use case.
+
+Numerical trap: stock Marlin does nontrivial global-scale preprocessing, including handling the gate/up global scale and BF16 rounding. A mathematically equivalent dequantization using raw FP32 scales can disagree. Compare repacked weights and both GEMM stages against stock on real layer tensors, including distinct global scales, small/large scales, cancellation and negative inputs. Retain the stock BF16 output boundary and scale application where required. Passing a random standalone matmul is not enough to establish full-model agreement.
+
+Memory trap: conversion can transiently hold original and transformed weights. Measure peak during model load, tuning, graph capture and serving, not just steady-state allocated bytes. Delete replaced registered tensors only after successful conversion, and bound tuning allocations. Baseline graphs already consume material memory.
+
+Go/no-go: first demonstrate exact representation/scale handling and eligible precision; then compare against Marlin and our v139 donor at M=1,3,8,15,32,63,128,255,256 and representative prefill sizes. Include balanced, skewed and repeated routes, all ranks, and full expert finalization. If Humming does not beat Marlin on a significant region or cannot preserve semantics, use a minimal extraction of v139 with the same memory discipline. Humming is a high-priority candidate, not a proven speedup.
+
+Public reference: https://github.com/vllm-project/humming and https://pypi.org/project/humming-kernels/0.1.12/ . The Humming publication includes H200 comparisons against Marlin, but formats/shapes differ from this task. Its headline gains are not used as a Muse forecast.
+
+4. PRIORITY B: REMOVE DUPLICATED PROJECTION WORK ACROSS EIGHT GPUS
+
+The H200 model path performs the full pre-expert projection on each rank. Larger post-expert projections also fall back to the full GEMM. Existing output-shard/all-gather machinery is largely gated to capability (10,3); the small projection path is more permissive. Startup evidence shows CustomAllreduceV2 with multicast support on the H200 node, which makes a Hopper implementation worth testing.
+
+Relevant code:
+- srt/models/muse_spark.py, pre_expert_proj and post_expert_proj branches
+- srt/layers/communication/muse_spark_gemm_ag.py
+- kernels/ops/communication/muse_spark_all_gather.py
+- the associated all_gather.cuh implementation
+
+Both projection weights have 33,554,432 BF16 values, or 64 MiB. Sharding the OUTPUT dimension eight ways lets each rank use an 8 MiB weight view and one-eighth the GEMM work, then gather BF16 outputs. This preserves each output's full K dot product, unlike K sharding with partial-sum reductions. It still requires numerical validation because different GEMM shapes can select different tactics.
+
+At M=256 the complete outputs are only 2 MiB for pooler and 4 MiB for unpooler, before communication protocol overhead. Ideal cold weight streaming at advertised H200 bandwidth is about 13.98 us for the full weight versus 1.75 us for the shard. These figures exclude launches, computation, caches and collectives; they are byte accounting, NOT promised 8x or 12 us measured savings. At large prefill, output traffic grows linearly and may reverse the tradeoff.
+
+Implementation order: portable GEMM + NCCL gather baseline; then existing SGLang multicast gather with an explicit audited Hopper eligibility path; then capture and optional epilogue fusion. Do not simply remove all architecture checks. Fused norm/residual support has separate cluster requirements. Workspace phases, identical rank call order, padded rows, transport limits and timeout behavior must remain correct.
+
+The existing small/large token limits and symmetric buffers are not arbitrary permission to accept M=16384. Larger prefill may need chunked gather or a generic collective fallback. Use bounded buffers and a measured crossover, not a larger constant with no memory accounting. Perform full-vector RMSNorm after the gather; a norm of a local output slice is not equivalent.
+
+Prepared probe: projection_sharding_probe.py. On the actual node:
+  torchrun --standalone --nproc-per-node=8 projection_sharding_probe.py --output projection_h200.json
+It compares replicated BF16 GEMM against output sharding + generic NCCL + layout copy, alternates paired order, records all raw samples and the maximum rank time, and checks every rank. It is an eager baseline, not a claim about captured multicast performance. CPU --self-test validates only mathematical partition and row reconstruction, in 15 cases.
+
+5. PRIORITY C: SERVING-SAFE ATTENTION AND KV FUSION
+
+Our attention result is strong enough to justify a port, but its component interface is narrower than serving. The donor derives several strides from dimensions, assumes a particular head relationship and q lengths, and derives positions from sequence lengths. These assumptions must be explicit guards or generalized inputs.
+
+Mandatory adapter work:
+- Pass actual Q/K/V/cache strides and absolute RoPE positions. A sliding-window-trimmed sequence length is not necessarily an absolute position.
+- Honor actual FP8 K/V scalar scales and stock Q scaling; preserve the current normalization/RoPE rounding boundaries and full softmax work.
+- Use FA3's actual sliding-window physical mapping and output cache locations. Do not double-translate an already physical page table.
+- Protect slot zero and inactive graph lanes. The standalone component's reserved slot convention differs from serving's dummy/padding convention.
+- Handle variable sequence lengths, reorderings, partial batches, and graph replay with changed metadata. Fall back to stock for unsupported layouts or q lengths.
+- Keep full and sliding attention distinct; test window boundaries and long contexts, not only the fixed component case.
+
+Test matrix: q=1 and 8; odd/partial token batches; context around 1, 2047/2048/2049 and up to 131072; randomized physical pages; nonunit cache scales; padding and empty lanes; shuffled requests; noncontiguous strides; repeated graph replay; concurrent streams where supported. If draft width changes to 16, q=16 needs a validated implementation or stock fallback.
+
+A lower-risk first extraction is the Q/K normalization + RoPE + FP8 KV store prologue, adapted to FA3. The existing specialized fused store is backend-gated; do not assume it is already used by target FA3. Benchmark the entire attention path including store and metadata, not just the central attention kernel.
+
+6. ROUTING, TILES AND WORKSPACES: IMPORTANT SUPPORTING WORK
+
+The current Marlin tile heuristic estimates global route count against LOCAL experts. With EP8, this can overestimate average per-expert occupancy eightfold. Current M8/32/128/256 choices are 8/16/48/64; an EP-aware starting sweep includes 8/8/8/16, but these are trial points, not prescribed winners.
+
+Smaller tiles reduce padding but can increase weight reloads and scheduling overhead. analysis.json contains 24 synthetic scenarios (100 seeds each) varying M, expert skew and within-request route repetition. They show why occupancy and tile counts must both be considered. They are generated independently, not reconstructed judge workloads, and provide no GPU timing.
+
+Under an independent uniform route model, the expected active local experts at M8/32/128/256 are 7.18/20.41/31.45/31.99 out of 32. Each local expert's raw NVFP4 weights and block scales total approximately 27 MiB. This explains why correlated routing and cache reuse matter; the independence assumption is not a measured model property or a hard latency bound.
+
+The sorted-expert path is also worth a proper EP-aware implementation: the current public interface/implementation explicitly disables EP support. Do not lie about is_ep to bypass an assertion. Preserve -1 inactive entries, local expert mapping and ordering. Use a genuine supported path with tests for absent experts and skew.
+
+Prefill route buffers often scale with global M*top_k even when most routes belong to other ranks. Compact active routes using GPU-resident counts and graph-stable allocation bounds. Measure preparation cost, both GEMMs, finalization and max-rank latency together. A routing kernel win that makes the GEMM slower is a regression.
+
+7. PREFILL, DRAFT AND GRAPH EXECUTION
+
+Prefill matters to both frontier throughput and the TTFT guard. Start from the final eligible BF16-dense prefill donor and grouped BF16/NVFP4 expert techniques; exclude earlier FP8-weight copies. Test chunk sizes such as 8192 and 16384 only after kernel changes, with cache-hit and cache-miss cases. The scheduler's dynamic-chunking branch inspected here is conditional on PP>1; current PP1 does not benefit merely by enabling that flag.
+
+CUDA graphs are already enabled. Observed graph memory was roughly 15.8 GB for prefill, 0.25 GB for target verify and 0.08 GB for draft. Adding graph coverage consumes memory and can worsen capacity. Do not describe 'enable CUDA graphs' as a new optimization.
+
+MetadataGlueGraph explicitly warns that host-fed DFlash plans can be frozen by capture and silently reduce acceptance. The proper route is device-generated or correctly refreshed plans, stable buffers, valid capture keys and fallback. A run returning correct tokens can still lose speed through acceptance degradation, so correctness alone does not validate this change.
+
+Draft-width tuning should maximize accepted output tokens per COMPLETE draft/verify/commit cycle. Sweep supported widths only after measuring acceptance, cycle cost and memory. The current width is 8; changing width alters attention support, graph shapes, draft convolution shape and temporary storage. Tokenizer metrics define spec_accept_length as completion tokens / verify count, including the bonus token; do not mix this with accepted draft-token fraction.
+
+The public Meta megakernel work uses a token tree and reports 2.1x on batch-one GB300 with the same draft/acceptance baseline. Its architecture is informative, but is not a drop-in H200 engine. Our DFlash path is explicitly linear; a tree requires ancestor masks, verify metadata, exact acceptance and KV commit changes. Enabling an EAGLE top-k flag does not create that implementation. Preserve the target greedy verification and fixed draft model.
+
+Do not redo optimizations already present: target greedy LM-head skipping/gather avoidance, many norm/gate fusions, captured target/draft kernels and custom all-reduce. Profile their remaining cost before proposing replacements.
+
+8. WHAT TO BORROW FROM PUBLIC WORK
+
+A. facebookresearch/sgl-muse-mega: study overlap, a complete draft/verify/accept graph, and distributed projection design. Reported 1109 versus 517 tok/s uses eight GB300s at batch one. Architecture, precision paths and multi-request coverage differ. Selectively borrow concepts; do not claim its measured ratio for H200.
+https://github.com/facebookresearch/sgl-muse-mega
+https://www.lmsys.org/blog/2026-11-05-muse-spark-open-ultrafast/
+(The article displays November 11 despite its URL date.)
+
+B. vLLM PR 64077: another megakernel direction; its published GB300/forced-acceptance comparison is not our end-to-end workload. PRs 65438 and 64553 provide concrete implementation material to inspect for communication/fusion. Their diffs are preserved in sources/ so review is reproducible. Reuse only architecture-compatible, precision-preserving portions.
+https://github.com/vllm-project/vllm/pull/64077
+https://github.com/vllm-project/vllm/pull/65438
+https://github.com/vllm-project/vllm/pull/64553
+
+C. SGLang PR 43363: prefill tuning evidence from another backend. Useful motivation for shape-aware profiling, not a Marlin drop-in or a numerical gain forecast.
+https://github.com/sgl-project/sglang/pull/43363
+
+D. Distribution-aware MoE research supports GPU-resident occupancy-based dispatch. SonicMoE provides useful IO/tile ideas, but any token rounding or route alteration is incompatible here.
+https://arxiv.org/abs/2607.23099
+https://arxiv.org/abs/2512.14080
+
+E. Existing local reference repository and our decode ledger show that combining individually faster kernels can regress a complete layer. Extract measured, attributable kernels and preserve licenses. Do not carry over component harness assumptions, score-specific tricks, or approximation paths.
+
+9. IMPLEMENTATION AND EXPERIMENT ORDER
+
+Stage 0 — preserve the current candidate and establish a real distributed profile.
+Record source hash, flags, image, GPU topology, dependency versions and model configuration. Capture separate target prefill, target verify, draft, commit/cache movement and communication phases. Inspect CPU gaps as well as GPU work. Use maximum-rank critical-path time, not a sum of overlapping kernel durations. The existing ProfileReq supports CPU/GPU/MEM activities and stage profiling; use the current API fields rather than an assumed profiler command. Nsight graph-node tracing is useful on a self-hosted node, with profiling runs separated from performance runs.
+
+Stage 1 — establish representation and communication feasibility.
+Preflight Humming's exact pinned API with real weights; run the projection probe and then the captured multicast variant. These address independent high-upside mechanisms. Keep their measurements separately attributable before combining them.
+
+Stage 2 — implement the main expert adapter and EP-aware tuning.
+Compare end-to-end expert paths with Marlin and the frozen v139. Confirm loading/capture/serving memory peaks. Keep stock semantics and a generic valid shape fallback in the chosen weight format.
+
+Stage 3 — add projection sharding and attention fusion where measured wins hold.
+Benchmark the complete layer after each addition, on both full and sliding attention and distributed ranks. Preserve the existing all-reduce placement. Re-evaluate crossover thresholds after combining changes; isolated winners can interact through cache/occupancy.
+
+Stage 4 — optimize prefill and speculation using the new cost profile.
+Only then change draft width, chunking or graph metadata. Measure acceptance and total cycle time together. A tree or a persistent H200 layer kernel is a later larger project if the profile still justifies it, not today's prerequisite for progress.
+
+Priorities are based on plausible affected work and integration feasibility, not claimed speedups. Humming and distributed projections could fail their numerical or latency gates; our existing custom donor is an alternative, not a multiplier on top of the same replaced GEMM.
+
+10. VALIDATION AND CHECK BUDGET
+
+Before a judge check:
+- Differential layer outputs, real scales, randomized routes, all-reduce outputs and final greedy token sequences.
+- Empty/padded rows, non-power-of-two batch sizes, skew, absent experts, long/full/sliding contexts and graph replay with different inputs.
+- No lower-precision activations/accumulation, no dropped routes/keys, no output-token truncation.
+- Peak memory measured through loading, tuning, graph capture and serving; at most +2 GB/GPU.
+- Generic unsupported-shape/device fallback and source/patch budget checks.
+- Paired warmed measurements, alternate order, raw samples, maximum rank, fixed topology and precision. A local timing difference within noise is not a win.
+
+The last quota observation during this research showed 2 checks remaining and 1 scored run remaining for the UTC day. One unscored check evaluates ONE load; it is not an overall four-load validation. Use the next eligible check at 16 users for the main expert change. Choose the remaining load based on the highest remaining risk: 32 for capacity/prefill/communication, or 4 for an uncovered dispatch boundary. The pending one-user v4 check does not validate the later adapter. Run the combined four-load scored build only after correctness and memory gates, with the best-supported candidate. Do not spend checks on spelling/import failures that can be caught in the image first.
+
+Daily reset is 00:00 UTC (05:30 IST). Queue state and remaining quota must be freshly queried before spending a run. No new run was spent by this research.
+
+11. DELIVERABLES AND LIMITS
+
+analysis.json: frozen donor hashes, projection byte/FLOP accounting, route scenarios and conditional Amdahl math.
+analyze_competitive.py: reproducible generator; asserts the v4 patch hash.
+projection_sharding_probe.py: eight-rank Hopper benchmark and CPU self-test.
+projection_self_test.json: 15 passing CPU reconstruction cases, maximum absolute difference about 2.84e-14.
+sources/: public PR diffs, public scoring-page assets and exact Humming 0.1.12 schema/API snapshots with hashes. The wheel was inspected, not installed.
+
+No H200 speedup, Humming integration correctness, distributed probe timing or new overall score is claimed. Those require target-device execution. The useful result of this research is a concrete implementation path that targets much more work than small finalizer fusions, with known integration hazards and tests that can falsify each hypothesis.
+
+Additional primary sources:
+https://openkernelchallenge.dev/rules
+https://www.nvidia.com/en-us/data-center/h200/
+https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/
+https://github.com/vllm-project/vllm-project.github.io/blob/main/_posts/2026-10-21-humming.md
+
+APPENDIX — DIRECT MOE DONOR STORAGE AUDIT
+
+The v139 prepare() calls _prepare_layout twice, for tiny and larger. Each call retains the base packed codes/scales, fat-order copies, unit-order copies, and WGS copies (MAIN_DEFINES enables WGS). Thus it retains eight equivalent packed weight layouts. For 32 local experts, one raw packed layout is 864 MiB; eight layouts are 6.75 GiB PER LAYER PER RANK, excluding original weights, scratch and conversion temporaries. Excess over one layout is 5.90625 GiB, already beyond the serving allowance even for a single layer. This is a source-level storage calculation, not a measured allocator peak.
+
+A direct prepare() transplant is therefore ruled out. A serving port must choose a common layout or retain only the necessary layout per initialization choice, release obsolete weights, and share bounded scratch where stream ordering permits. Separate tiny/large kernels may still be worthwhile; separate full-model weight copies are not. See analyze_competitive.py / analysis.json for the arithmetic.
+
+Verification completed: research scripts pass Ruff; projection CPU self-test passes 15 cases. The serving checkout still has the original four-file v4 diff, and submission_v4.diff retains its recorded hash. At approximately 14:32 UTC on November 13, existing check 717001a114f3471a remained queued; quota was 2 checks and 1 scored run remaining, reset 2026-11-14 00:00 UTC. This status is a timestamped observation, not a promise of subsequent queue state.

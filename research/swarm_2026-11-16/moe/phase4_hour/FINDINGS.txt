@@ -1,0 +1,82 @@
+MoE research hour: 2026-11-16
+
+Outcome
+The isolated research now has a concrete default-off Hopper producer candidate,
+complete offline coverage of its 88 scored configurations, and exact local
+fragment/MMA gates. No H200 numerical or serving speedup is claimed. The scored
+1.2237x baseline and active checkout are unchanged. No remote run was submitted.
+
+What was implemented and proved
+1. canonical_fragment.cuh decodes the canonical NVFP4/FP8 layout directly into
+   the BF16 register fragment required by the pinned Humming arithmetic. It
+   preserves the internal FP4/4 scaling, separate BF16 group-scale multiply,
+   FP32 accumulation, epilogue compensation x4 exactly once, BF16 result round,
+   and separate BF16 global scale. Exhaustive pinned-bit and changed-input graph
+   checks passed. The corrected independent oracle covers all254 finite FP8
+   encodings; original252-code mask coverage and failed receipts are retained.
+2. fragment_gemm.cuh integrates both decoders with the same SM86 FP32 MMA loop.
+   M1/8/33,N64,K4096 produced21 passing comparisons, including accumulator,
+   raw/scaled BF16 and changed-input graphs. Timings were approximately parity.
+   This is controlled decoder/MMA equality, not production Humming equality.
+3. producer_tuning.py and producer_layer_view.py enable existing Humming TMA B
+   or B+scale loaders while preserving exact block/warp/K shapes, stages, FP32
+   accumulation, routing, global scales and finalizer. They share existing
+   weight tensors and allocate no duplicate persistent weights.
+4. All22 unique scored geometries per stage, for both stages and both policies,
+   compiled offline for SM90a:88/88. Every job has generated source, cubin,
+   resource logs, flags, hashes, durable progress journal and actual child exit.
+   No CUDA context or cubin execution occurred. Max shared memory is140288B.
+5. Ten same-geometry baseline builds show BM144/152/160/168/176 spills already
+   exist in the original kernels. B-only reduces them modestly. B+scale has
+   fewer registers than B-only in28/44 pairs, equal in12, higher in4. Neither
+   policy is a universal resource winner. Representative reductions do not
+   improve the one-CTA-per-SM register-capacity bound.
+6. CPU address checks cover80 complete code/scale tiles across all5 transfer
+   geometries at first/last expert,N,K coordinates. Legacy and TMA source
+   addresses are equal. This does not test CUDA descriptor encoding or barriers.
+7. The SGLang-only export contains the10 scored source files plus one helper.
+   Only the preparation return hook differs from baseline. UTF8/LF and AST
+   identity checks pass;25 CPU guards cover default off, exact version/arch,
+   explicit HIP rejection, geometry/metadata fallback and shared ownership.
+   Attention peer-reviewed the source and the final HIP amendment.
+
+Decisions from failures and negative evidence
+- Warp specialization is not exported: representative down kernels spill badly.
+- Plain indexed B multicast is unsafe. Adjacent BM tiles can be different
+  experts while only rank0 issues the B transfer.24 CPU cases establish the
+  counterexample and required per-expert BM*cluster padding plus BM-granularity
+  expert-ID expansion. Cluster padding has real extra-work costs.
+- One-expert BF16 scratch needs64MiB if safely reused, but minimum weight traffic
+  grows from27MiB to219MiB per active expert (8.111x). It also changes the GEMM
+  reduction implementation, so fullK FP32 alone cannot prove the original raw
+  gate. This remains lower priority for large-prefill exploration only.
+- A pinned public donor reports tensor-map-copy regressions at bs8/bs16
+  (ratios0.937/0.952). Our transfer geometry differs, but this prevents treating
+  TMA or lower register counts as evidence of a speedup.
+
+Lifecycle and memory
+Host tensor-map descriptors are built from live tensor pointers on each eager
+or capture call and passed by value. Captured graphs retain captured addresses;
+replacing weight storage requires recapture. All kernel cache layers include
+producer configuration. No descriptor cache or extra persistent weight layout
+was introduced. CPU metadata and kernel/module/graph cache overhead remain to
+be measured on the full model. Actual checkpoint layer count is unknown.
+
+Next gate
+NEXT_HOPPER_GATE.json specifies numerical-first runs for both policies and
+int32/int64 routes, followed only on success by paired cold wholechain timing,
+body1 latency and body8 throughput controls, then multi-layer memory/TTFT and
+serving validation. Existing relative-L2<=0.003 and max-absolute<=0.03125 gates
+remain unchanged and comparisons are persisted before assertions. The local
+RTX3050 is power-capped; its absolute or relative timings are not H200 forecasts.
+The environment opt-in may not be available through the allowed OKC flag
+mechanism. Do not enable or submit this export until that and SM90 gates pass.
+
+Key artifacts
+HANDOFF.json: exact source/result hashes and statuses.
+producer_complete_compile_summary.json:88 builds and44 paired resources.
+producer_spill_comparison.json:10 matched baseline comparisons.
+producer_export/manifest.json: full source snapshot and default-off status.
+producer_lifecycle_audit.json: pinned source references and CUDA driver docs.
+producer_counterevidence.json: donor negative result and occupancy bound.
+NEXT_HOPPER_GATE.json: executable argument plans, not an authorization to run.

@@ -1,0 +1,34 @@
+NOTEBOOK 05: VERIFIED RESULTS REVIEW
+Run: 20261114T160139Z_2d5e90
+
+VALIDATION
+All nine artifact checksums and the source manifest matched. Recomputed 264 event/wall median pairs from 2,904 samples; verified 132 comparison rows and normalized cycle costs.
+All 66 benchmark/cadence cases passed: 288 prefix changed-input graph checks and 72 cadence checks. Source checks included 576 actual fallback cases and 96 deferred-fused cases. Deferred cases checked branch/metadata/scores only; no alignment kernel ran.
+Trace contained 84 actual kernels, all attributed; eight per baseline prefix versus six per candidate prefix. No annotation spans were counted as kernels.
+
+UNCHANGED-MAP SOURCE PREFIX
+eager: 48/48 wins; median latency reduction 27.05% (range 16.41% to 34.57%).
+graph: 48/48 wins; median latency reduction 18.49% (range 15.13% to 23.39%).
+
+UPDATE PLUS K PREFIX CALLS: directly measured cycles
+K | execution | wins/6 | median latency reduction | range
+1 | eager | 0/6 | -13.29% | -20.77% to -11.44%
+1 | graph | 5/6 | 3.63% | -0.59% to 6.14%
+8 | eager | 6/6 | 18.37% | 15.53% to 19.10%
+8 | graph | 6/6 | 16.77% | 14.05% to 18.72%
+64 | eager | 6/6 | 26.33% | 23.45% to 27.76%
+64 | graph | 6/6 | 19.46% | 17.19% to 21.36%
+
+INTERPRETATION
+At K=1, every eager comparison regressed: median slowdown 13.29%, range 11.44%-20.77%. Refreshing every forward erases the cached-path benefit in this workload.
+At K=8 and K=64, all eager and captured-cycle graph comparisons favored the candidate. Do not infer that K=8 is the exact crossover: K=2 and K=4 were not measured here.
+K=1 captured-cycle graph results were marginal: five of six wins; one 128-token trial regressed by 0.59%. The entire update and prefix sequence was captured in a single graph, which removes host-side update dispatch from replay.
+The existing V4 class constructs _expert_map during initialization; the inspected file showed no later writes. Static reuse is plausible, but runtime mapping update frequency and all external writers have not been established by a model run.
+Three trials occurred within one Kaggle session. Absolute graph times drifted substantially across some trials; use matching within-trial comparisons, not pooled absolute timings or previous-notebook ratios.
+
+NEXT EXPERIMENT: NOTEBOOK 06
+Keep the same unapplied source candidate. Compare three schedules under torch.inference_mode: static map + K separate graph replays; eager update outside capture + K separate replays; and one captured update-plus-K cycle as a control.
+Test K=1,2,4,8,64 at 32/128 tokens, with interleaved baseline/candidate variants and three shuffled trials. Primary gate: external update scenario, where refresh overhead is paid before replaying an already-captured graph.
+Correctness covers buffers created normally and within inference mode, with updates/forwards in inference mode. Incoming maps already reside on GPU; CPU data preparation is not included.
+This is a schedule test on source-sliced prefixes, not a full-model graph. It supplies no H200 speedup, serving fraction, actual alignment/GEMM validation, or startup profile.
+Active V4 and the unapplied patch remain unchanged. Do not promote or submit the candidate automatically.

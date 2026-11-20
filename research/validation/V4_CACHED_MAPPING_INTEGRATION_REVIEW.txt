@@ -1,0 +1,16 @@
+V4 CACHED-MAPPING INTEGRATION AND UNSCORED CHECK
+
+User authorized integration of the selected profiling candidate into V4 and an unscored submission.
+The exact selected two-buffer source is now active. No new notebook is required.
+Original V4 patch and a pre-integration source/metadata backup are preserved.
+
+Changes: register a nonpersistent lookup with leading -1 sentinel; use it in the existing mapping fallback; retain the original map for fused small-batch alignment. Explicit update/refresh APIs preserve buffer storage. No per-forward refresh is added.
+Other existing methods and the alignment/GEMM tail are unchanged. The other three V4 source files match their baseline hashes. Extra map storage is 1,028 bytes per layer for 256 experts.
+
+Lifecycle audit: model creates this map from its fixed EP rank/local range. No external direct mutations were found in the Muse Spark model/layer sources. Default loading constructs on the target device; model checkpoint loading selects supplied names. The derived lookup is nonpersistent. Layered meta/to_empty loading requires a model-specific load_weights_to_module API absent from this model; it is not the configured default path. Future map mutation needs refresh and stream ordering; buffer replacement/movement needs recapture.
+
+Validation: exact selected delta applied cleanly to V4; integrated source matches the tested draft hash. All four-file cumulative patch outputs match the live tree when applied to the pinned base. Python syntax, whitespace and size/line/path constraints passed. 27 actual Python adapter cases passed with AOT CUDA alignment on the local GPU, including 8/9-token branch boundary. Small fused alignment is shimmed; Marlin GEMMs and activation are stubbed in this adapter validation. Full serving remains the H200 check's responsibility.
+
+T4 evidence: roughly 30% eager and 26% graph median improvement in the measured mapping prefix. This is not an estimate of end-to-end H200 serving speedup. The 16-user run checks correctness and compares performance against stock, not a paired same-node original-V4 baseline. Original V4 only has a historical one-user check, so those two run ratios cannot isolate this cache's incremental gain.
+
+Accepted check job: f1513498e8d84de8, 16 users, judge-default flags. Result pending.

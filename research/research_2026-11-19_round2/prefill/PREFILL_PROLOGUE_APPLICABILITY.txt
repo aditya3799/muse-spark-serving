@@ -1,0 +1,77 @@
+﻿Prefill prologue applicability: guarded source design, NOT implemented/enabled
+
+Reuse candidate: round2/decode/prologue_package, frozen cumulative37a7be22.
+Its exact18-head row reduction and two BF16 rounding boundaries have strong local
+decode evidence, but the corrected broader four-block target chain gained only
+~0.208%. No serving or prefill gain follows from its2.10x component timing.
+
+Do not simply allow is_extend() in the decoder host guard. The frozen Muse model
+already excludes prefill fused cache store and documents breakable replay failure.
+BCG eager_on_graph explicitly retains capture-time argument identities. Current
+cache locations and physical SWA ownership must be read within the eager function,
+not captured from the dummy forward batch. The original RadixAttention boundary
+exists specifically to refresh this dynamic state and trim real token rows.
+
+Potential integration layout, if arithmetic/ownership gates later pass:
+1. Static opt-in branch only for ordinary target FA3, unchanged Triton native
+   FusedQKNorm, matching BF16 QKV/head geometry/unit scales and BREAKABLE prefill.
+   Keep optional FULL graphs, CP/DP, unified memory, cascade, MLA, cross attention,
+   bias/sinks/returnLSE and unsupported query/cache row mappings native.
+2. Leave QKV GEMM and raw o_gate extraction in the captured producer segment.
+   Allocate the original BF16 attention output BEFORE the graph break, using the
+   same graph-owned shape/lifetime as allocate_attention_outputs. Do not return a
+   newly allocated eager output retained per layer/bucket by eager_on_graph.
+3. Replace the existing attention boundary with one eager callback taking only
+   static graph-owned qkv, positions and output plus immutable layer identity.
+   Inside, fetch get_forward_batch() NOW; derive real query/cache lengths from
+   the existing graph_utils policy and enter attention_input_scope. Obtain native
+   backend-owned full/SWA locations and backing buffers after metadata narrowing.
+   Fresh physical destinations, reused prefixes and request boundaries remain
+   authoritative. Do not assume capture-time out_cache_loc is current.
+4. Candidate only reads real token rows and stores original FP8 bytes at those
+   destinations. The existing decoder runtime16MiB shape qualifier rejects large
+   prefill M (M*8192+262144 bound). Do not bypass that policy in production or
+   qualify a smaller shape and publish larger M. A separately budgeted whole-shape
+   qualifier would be needed after correctness is resolved, charging first use.
+5. Invoke RadixAttention._eager_attention.run_eager(...) within this existing eager
+   region to avoid nested graph segmentation. With successful direct stores pass
+   K/V=None and save_kv_cache=False; fallback executes the original complete norm,
+   RoPE, casts/cache write, exactly once. Return None, preserving preallocated
+   output and its original padded-zero policy. Original o_norm/o_gate/o_proj stay.
+6. Fallback must use the ORIGINAL padded QKV/position geometry when reproducing
+   native normalization. Native BLOCK_M depends on padded_M*18; realM can choose a
+   different block. Although reduction is per-head, source equivalence alone is
+   insufficient to assert bit parity. Any prefill candidate must compare against
+   the original padded native operation and all backing KV bytes.
+
+New experiment and current veto:
+The standalone byte probe reuses the exact frozen candidate kernel and original
+native norm. It compares native padded QKnorm/cast/store with candidate real-row
+norm/cast/store, preserving sparse valid destinations and reserved slot0, changed
+positions, row stride, integers, magnitude changes and poisoned padding.
+30 combinations passed through real3640/padded4096, including BLOCK4->8,
+8->16 and16->32 boundaries. At real16383/padded16384, first random full/noRoPE
+case had exactQ andV but differingK backing (bothBLOCK32). It stopped immediately.
+This is a correctness veto, NOT an invitation to enable only earlier test shapes.
+Native norm, candidate arithmetic and scatter cause remain to be localized by an
+independent direct-scatter and before-storage diagnostic. Current fixture had
+explicitly bypassed production shape publication only to test raw kernel math;
+no large shape was enabled in the frozen package. Metadata identity GPU control
+was after this failure and therefore did not execute in the initial probe.
+
+Exact local source locations/hashes: prefill_guard_source_index.json (18 entries).
+NativeH200 FP8 attention, actual full SGLang BCG startup/replay, real request traces,
+combined memory/latency gates and whole-model correctness all remain unresolved.
+No unapplied prefill model patch is being promoted while the K-byte veto remains.
+Localization follow-up (unchanged candidate kernel):
+prefill_prologue_diagnostic.json reproduces exactly3K-byte differences in one
+head, logical token4546, columns4/17/42. Candidate bytes50/34/178 versus native
+49/33/177. Live destinations are unique and within capacity; native cache store
+matches independent indexed scatter. Native real-M and padded-M K match in BF16
+and FP8. Thus the earlier candidate mismatch is arithmetic/cast, not destination
+collision, padding ownership, or native store. The saved64-value BF16 head is a
+small deterministic input for the next diagnostic. CPU FP32 reduction sensitivity
+places one normalized value5.96e-8 below a BF16 half-way boundary, but this does
+not identify the GPU reduction tree or rsqrt approximation. No prefill activation.
+
+Superseding completed localization and plan: prologue_rounding_debug/VERDICT.txt proves the FP32 reduction-tree mismatch, prologue_warp8/byte_matrix.json records the separate42-case eight-warp repair, and PREFILL_BCG_INTEGRATION_PLAN.txt records actual source boundaries and unchanged-budget nonactivation. The original failure/cause-pending prose above is historical, not the latest verdict.

@@ -1,0 +1,16 @@
+﻿from pathlib import Path
+p=Path(__file__).with_name("gpu_regions.py")
+s=p.read_text(encoding="utf-8-sig")
+s=s.replace("import torch\n","import torch,os\n",1)
+s=s.replace("FORK=32768","FORK=32768\nSMALL=os.environ.get('OKC_SMALL_WINDOW_REPLAY')=='1'\nif SMALL:CHUNK,END,FORK=1024,7953,4096\nMIX_AT=3072 if SMALL else 32768\nMIX_N=1024 if SMALL else 2048\nLABEL='smoke' if SMALL else 'regions'")
+s=s.replace('("cold_74160",','(f"cold_{END}",')
+s=s.replace("inp=torch.empty((CHUNK,40960)","inp=torch.empty((max(CHUNK,MIX_N+16),40960)")
+s=s.replace("else:r,p,physical=mixlong,32768,0","else:r,p,physical=mixlong,MIX_AT,0").replace("else p+2048","else p+MIX_N")
+s=s.replace("FORK+DELTA,32768+2048","FORK+DELTA,MIX_AT+MIX_N")
+s=s.replace("receipt=dict(agent=", "receipt=dict(complete=False,agent=")
+s=s.replace("for step in range(-1,rounds):","print('setup ready',stage,CHUNK,END,flush=True)\n    for step in range(-1,rounds):")
+s=s.replace("us=(time.perf_counter_ns()-t)/1000","us=(time.perf_counter_ns()-t)/1000\n                if step in (-1,0):print(stage,step,scene,arm,round(us/1e6,3),flush=True)")
+s=s.replace('detail["complete"]=step==rounds-1','detail["complete"]=receipt["complete"]=step==rounds-1')
+s=s.replace('f"regions_{stage}', 'f"{LABEL}_{stage}')
+p.write_text(s,encoding="utf-8")
+

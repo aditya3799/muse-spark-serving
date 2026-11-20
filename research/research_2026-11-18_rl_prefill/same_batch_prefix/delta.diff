@@ -1,0 +1,62 @@
+--- a/python/sglang/srt/managers/schedule_policy.py
++++ b/python/sglang/srt/managers/schedule_policy.py
+@@ -1391,6 +1391,48 @@
+             return
+         if self.tree_cache.buffer_pipeline is not None:
+             self.tree_cache.buffer_pipeline.defer_staged_admission(req, pool)
++
++    def shares_admitted_prefix(self, req: Req) -> bool:
++        """Wait for an admitted request to publish a substantial part of this extension."""
++        if (
++            not self.can_run_list
++            or req.host_hit_length
++            or req.skip_radix_cache_insert
++            or req.is_dllm()
++            or req.return_logprob
++            or self.tree_cache.supports_mamba()
++            or not self.tree_cache.supports_prefix_sharing()
++        ):
++            return False
++
++        ids = req.full_untruncated_fill_ids
++        start = req.prefix_len
++        budget = self.rem_chunk_tokens
++        pending = len(ids) - start
++        if budget is not None:
++            pending = min(pending, budget)
++        # Delay only when at least half of the work that fits could be reused.
++        tokens = max(IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD, (pending + 1) // 2)
++        end = ((start + max(tokens, 1) + self.page_size - 1) // self.page_size) * self.page_size
++        if end >= len(ids) or end > start + pending:
++            return False
++
++        for earlier in self.can_run_list:
++            if (
++                earlier.skip_radix_cache_insert
++                or earlier.host_hit_length
++                or earlier.prefix_len != start
++                or earlier.extend_end < end
++                or earlier.last_node != req.last_node
++                or earlier.extra_key != req.extra_key
++                or earlier.cache_salt != req.cache_salt
++            ):
++                continue
++            other = earlier.full_untruncated_fill_ids
++            if ids[start] == other[start] and ids[end - 1] == other[end - 1]:
++                if ids[start:end] == other[start:end]:
++                    return True
++        return False
+ 
+     def add_one_req(
+         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -4267,6 +4267,8 @@
+                 req.time_stats.observe_storage_staging_ready(staging_ready)
+                 if not staging_ready:
+                     continue
++            if adder.shares_admitted_prefix(req):
++                continue
+             res = adder.add_one_req(
+                 req,
+                 has_chunked_req=(self.chunked_req is not None),

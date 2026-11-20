@@ -1,0 +1,47 @@
+nvrtc: error: failed to open libnvrtc-builtins.so.13.0.
+  Make sure that libnvrtc-builtins.so.13.0 is installed correctly.
+nvrtc_compile: compile failed: NVRTC_ERROR_BUILTIN_OPERATION_FAILURE
+
+Traceback (most recent call last):
+  File "/mnt/d/OpenKernelChallenge/serving/research_2026-11-19_round2/moe/test_facade_gpu.py", line 107, in <module>
+    run(which);stream.synchronize()
+    ^^^^^^^^^^
+  File "/mnt/d/OpenKernelChallenge/serving/research_2026-11-19_round2/moe/test_facade_gpu.py", line 97, in run
+    y,loc=helper(parents[li],x,ids,torch,defer_downscale=True,global_experts=256)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/OpenKernelChallenge/serving/release_2026-11-18/candidate_sources/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py", line 319, in _humming_expert_outputs
+    return split_expert_outputs(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/OpenKernelChallenge/serving/release_2026-11-18/candidate_sources/python/sglang/kernels/ops/moe/muse_spark_humming_split.py", line 350, in split_expert_outputs
+    return _original_split_expert_outputs(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/OpenKernelChallenge/serving/release_2026-11-18/candidate_sources/python/sglang/kernels/ops/moe/muse_spark_humming_split.py", line 119, in split_expert_outputs
+    HummingMethod.forward_layer(layer,inputs=x,outputs=cache1,top_k=topk,sublayer_name='w13',
+  File "/mnt/d/OpenKernelChallenge/serving/swarm_2026-11-16/moe/humming_vendor/humming/layer.py", line 246, in forward_layer
+    return humming_forward(
+           ^^^^^^^^^^^^^^^^
+  File "/mnt/d/OpenKernelChallenge/serving/swarm_2026-11-16/moe/humming_vendor/humming/forward.py", line 113, in humming_forward
+    return ops.humming_gemm(
+           ^^^^^^^^^^^^^^^^^
+  File "/home/aditya/.venvs/okc-marlin-tiles/lib/python3.12/site-packages/torch/_ops.py", line 1350, in __call__
+    return self._op(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/OpenKernelChallenge/serving/swarm_2026-11-16/moe/humming_vendor/humming/ops/__init__.py", line 97, in humming_gemm
+    configs = HummingKernel.prepare_kernels(layer_config, compute_config, tuning_config)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/OpenKernelChallenge/serving/swarm_2026-11-16/moe/humming_vendor/humming/kernel/humming.py", line 514, in prepare_kernels
+    kernel = HummingKernel(**config)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "<string>", line 51, in __init__
+  File "/mnt/d/OpenKernelChallenge/serving/swarm_2026-11-16/moe/humming_vendor/humming/kernel/humming.py", line 114, in __post_init__
+    KernelRuntime.__post_init__(self)
+  File "/mnt/d/OpenKernelChallenge/serving/swarm_2026-11-16/moe/humming_vendor/humming/jit/runtime.py", line 42, in __post_init__
+    self.init_kernel()
+  File "/mnt/d/OpenKernelChallenge/serving/swarm_2026-11-16/moe/humming_vendor/humming/kernel/humming.py", line 161, in init_kernel
+    self.prepare()
+  File "/mnt/d/OpenKernelChallenge/serving/swarm_2026-11-16/moe/humming_vendor/humming/jit/runtime.py", line 90, in prepare
+    kernel_filename = compiler_cls.compile(
+                      ^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/OpenKernelChallenge/serving/swarm_2026-11-16/moe/humming_vendor/humming/jit/compiler.py", line 101, in compile
+    raise RuntimeError(f"{cls} run failed")
+RuntimeError: <class 'humming.jit.compiler.NVRTCCompiler'> run failed

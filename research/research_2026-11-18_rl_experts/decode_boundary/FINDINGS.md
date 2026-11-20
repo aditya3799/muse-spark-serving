@@ -1,0 +1,9 @@
+# SM90 target unpool gather and FFN boundary
+
+This two-file change consumes incoming rank columns inside the existing full-width one-CTA RMS and residual calculation. Both original producer paths retain their full-K projection. The patch passed a fresh application check against the scored parent and pinned base. [Increment](incremental.diff) · [CPU checks](dispatch.json)
+
+Scored model construction binds the boundary for nonfinal sparse layers and requests an 8 MiB multicast push slot before CUDA graph capture. The official log confirms the 18.01 MiB initial workspace and multicast support. It is truncated before confirmation of the model-level reallocation. Existing distribution uses GEMM+gather at M≤8 and a Hopper-specific sharded projection for eligible M<512. The preexisting fused boundary requires SM100. The incremental patch selects SM90's 256- or 512-thread standalone RMS mapping under the existing JIT, workspace and mode guards. [Source and checks](build.py)
+
+We compiled both true FFN input-scale CUDA kernels offline on SM90a with no spills. The fused vs standalone registers/thread were 202 vs 176 at 256 threads, and 75 vs 56 at 512 threads. The CPU model agreed on 9,895,936 BF16 wire words in ten sequential workspace epochs, including signed-zero encoding and reset. Real peer progress, GPU output parity and latency under TP8 graph replay remain untested. [Compiler receipt](sm90_compile.json) · [Wire checks](protocol.json)
+
+Each eligible block removes one launch and an activation write plus read. That covers 0.25/1/4/8 MiB per rank at M8/32/128/256. The peer payload, projection and both full-width norm reductions still execute.

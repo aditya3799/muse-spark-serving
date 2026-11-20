@@ -1,0 +1,18 @@
+Additional primary-source review, 2026-11-19 around09:57UTC. No candidate modification and no new measured performance claim.
+
+FlashAttention4 beta39, released2026-11-11, exact commitdceb374126248b17dbfee91c202514f533fd2ec6:
+https://github.com/Dao-AILab/flash-attention/releases/tag/fa4-v4.0.0.beta39
+https://github.com/Dao-AILab/flash-attention/commit/dceb374126248b17dbfee91c202514f533fd2ec6
+The newly listed performance mechanisms are chiefly SM100 scheduling, register allocation, MXFP8 and backward kernels. FA4 as a project supports Hopper, but that does not make these SM100 updates a usable H200 Muse prefill optimization. No precision/backend replacement is proposed from this release.
+
+SGLang PR43363, merged2026-10-20:
+https://github.com/sgl-project/sglang/pull/43363
+Extends the FlashInfer CUTLASS MoE tactic tuning range to prefill chunks. It reports H200 prefill improvements across several models while leaving other MoE runners unchanged. This is evidence for searching shape coverage in the SAME kernel, not evidence that switching the frozen Humming parent to CUTLASS would help. It also reports persistent tuning-buffer memory and longer startup, which must be charged. Root's independent Humming pipeline-policy experiment investigates the analogous mechanism in the actual parent backend.
+
+SGLang PR40796, merged2026-09-24:
+https://github.com/sgl-project/sglang/pull/40796
+Repairs FlashInfer mixed sliding/full-attention ragged prefill to read cached-prefix lengths rather than stale, not-yet-written extend slots. It explicitly claims correctness rather than throughput. No performance gain is attributed to this fix here; a serving candidate must preserve prefix ownership and cannot omit prefix reads to create a nominal speedup.
+
+SGLang current Muse cookbook:
+https://github.com/sgl-project/sglang/blob/main/docs/cookbook/autoregressive/Meta/MuseSparkOpen.mdx
+Its prefill sequence-parallel/MegaMoE recipe remains explicitly SM100-only. This is not evidence that the same integrated all-to-all backend exists on H200.

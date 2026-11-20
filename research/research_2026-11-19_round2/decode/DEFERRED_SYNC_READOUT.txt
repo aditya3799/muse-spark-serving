@@ -1,0 +1,78 @@
+Target greedy broadcast provenance experiment, 2026-11-19
+
+Status: data-equivalence proof PASS locally; net performance UNRESOLVED.
+The separate cumulative patch is UNAPPLIED and default OFF. It is not combined
+with the draft packed sampler, prologue, projection or MoE experiments.
+
+Native source: SGLang297e54fd105e974cdf401e5b4d20253a22c16f90.
+logits_processor.py deferred_argmax1103-1120 retains the native softcap-local-max
+kernel and one packed float32 all-gather. Every rank receives the same ordered
+rank payload, then computes the same first-rank argmax, gathers its float ID and
+casts to int64. dflash_worker_v2.py subsequently broadcasts these IDs again at
+the DFLASH_ACCEPT_GREEDY site. This last broadcast has no additional value
+information for this exact native producer/group pair. Other producer paths
+cannot inherit that proof.
+
+Implementation: deferred_sync.py; builder build_deferred_sync.py;
+deferred_sync_integration/{delta.diff,candidate.diff,manifest.json,validation.json}.
+Opt-in flag: SGLANG_EXPERIMENTAL_DFLASH_DEFERRED_SYNC=1.
+Startup CPU agreement checks identical flags, architecture, rank order, native
+LogitsProcessor method, native SpecTpSync method/sites, exact GroupCoordinator
+and its gather/broadcast methods, matching producer/sync TP-group object, and
+absence of an MSCCL++ route. No graph pointers/device ordinals enter the common
+descriptor. No tensor arithmetic, dtype, softcap or collective payload changes.
+
+A fresh single-use result/stream token is created only immediately after the
+native producer. The actual acceptance method consumes it before taking its
+view. Each worker iteration starts with no token. Ordinary logits, adjusted
+sampling, grammar, selector and unsupported producers retain native sync.
+Capturing an outer epilogue retains the broadcast; normal target graph replay
+finishes before the eager producer is called, so every replay gets a fresh token.
+Changing provider/group/sync contract after startup is a fatal configuration
+error, not a rank-local collective-skipping fallback. The source read-set has
+no write to predicted IDs between production and consumption; this is not a
+general-purpose provenance/security API against arbitrary external raw writes.
+
+Final CPU Gloo proof: deferred_sync_final_gloo_tp2.json and tp4.json. Together:
+112 exact payload cases over rows1/7/8/32/56/128/256 and normal/tie/signedzero/
+positiveinf/negativeinf/singleNaN/multipleNaN/integer inputs;80 actual original
+versus patched worker acceptance cases covering batch1/4/7/16/32 and every
+accepted-draft length0..7;24 startup coherence cases and26 lifecycle guards.
+Subsequent real Gloo reductions preserve matching collective order. Changed
+dynamic sampling routes remain synchronized. The native deferred_argmax and
+acceptance ASTs are executed, but LOCAL SOFTCAP IS A CPU SURROGATE, native GPU
+acceptance uses its original CPU fallback, and group wrappers are structural
+mocks backed by real Gloo. This does not validate NCCL/H200 or server startup.
+First proof receipts remain separately available as deferred_sync_gloo_tp*.json.
+The final monitor retained the3GiB available-memory preflight and768MiB abort
+guard, with CUDA hidden. No GPU or compiler was used for these tests.
+
+Ordering evidence: pinned GroupCoordinator routes CUDA all-gather to PyNccl on
+the current stream or synchronous Torch ProcessGroupNCCL; broadcast uses the
+same current stream/native group. Pinned pynccl.py146,199,378 resolves current
+device stream for both operations. PyTorch2.14 explicitly guarantees that
+synchronous collective outputs can be used by subsequent operations on that
+same CUDA stream. Thus local data dependencies do not require a second
+broadcast. Removing one uniformly chosen collective also preserves the order
+of all remaining collectives. This is a source argument, not measured evidence
+about deployed multiple NCCL communicators, graph launch ordering, peer failure
+or asynchronous allocator behavior. Actual multi-GPU stress/trace remains a
+mandatory gate; no stronger ordering guarantee is claimed.
+
+https://docs.pytorch.org/docs/2.14/distributed.html#synchronous-and-asynchronous-collective-operations
+https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/groups.html
+https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2276/user-guide/docs/usage/communicators.html
+Exact pinned implementation URLs/hashes: sync_sources/manifest.json and
+dflash_sources/logits_processor_receipt.json.
+
+Host cost is a significant negative caveat. deferred_sync_host_cost.json runs
+the exact helper on Python3.12.3 with identity producer and constant stream
+state, avoiding Torch/GPU/transport entirely. Across31 ABBA blocks, median
+candidate4.654us versus native0.0666us and duplicatecontrol0.0638us: added
+bookkeeping4.593us. This EXCLUDES the real CUDA stream-query API cost and is a
+lower bound on added host work. It may offset a tiny broadcast. No end-to-end
+speedup, reward KEEP or submission recommendation follows from this experiment.
+
+Remaining gates: full installed server import/startup, NCCL TP8 same-stream and
+multi-communicator graph-replay stress, H200 trace including all added Python
+work, dynamic fallback routes, and repeated exact whole-output/acceptance checks.

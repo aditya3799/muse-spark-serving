@@ -1,0 +1,4 @@
+﻿from pathlib import Path
+import json,hashlib
+P=Path(__file__).resolve().parent;f=P.parent/'hopper_moe/swap_humming_pipeline_01/results.json';r=json.loads(f.read_text())
+q=P/'SWAP_AB_INTEGRATION_MAP_AND_REVIEW.json';s=json.loads(q.read_text());s['subsequent_cross_lane_evidence']={'path':str(f),'sha256':hashlib.sha256(f.read_bytes()).hexdigest(),'status':r['status'],'cases':len(r['rows']),'raw_and_postscale_checks':sum(2*len(x['checks'])for x in r['rows']),'peak_allocated':r['peak_allocated'],'scope':'Hopper executed fixedE1N256K4096/BM16BK128. Allthree variants match pinned BF16 output/postscale, sentinels pass. No timing; weights/group scales held fixed across this initial graph-reuse gate; nextBM8/24 changedweight gate pending.'};q.write_text(json.dumps(s,indent=2)+'\n');print(s['subsequent_cross_lane_evidence'])

@@ -1,0 +1,4 @@
+﻿✓ submitted research_2026-11-19/prefill/integration_joint/candidate.diff as a check run at 4 users  20 files changed · job f43fa02892254879
+  flags       --enable-profile-cuda-graph · --moe-runner-backend humming
+
+next  okc serve status f43fa02892254879 --wait

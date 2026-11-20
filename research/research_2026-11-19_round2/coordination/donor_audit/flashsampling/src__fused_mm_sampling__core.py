@@ -1,0 +1,881 @@
+import math
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Callable, NamedTuple, Protocol
+
+import flashinfer
+import nvtx
+import torch
+import torch.distributed as dist
+import triton
+import triton.language as tl
+from torch._dynamo.trace_rules import manual_torch_name_rule_map
+from torch._dynamo.variables.functions import UserFunctionVariable
+from torch.distributed._functional_collectives import all_gather_tensor
+
+from .alg_names import ShortNames as S
+from .tensor_parallel_reduce import (
+    allocate_symm_mem_outputs,
+    tp_post_kernel_p2p_reduce,
+    tp_post_kernel_reduce,
+)
+from .tl_matmul import matmul
+from .tp_info import TP1, TPInfo
+
+# Workaround for https://github.com/pytorch/pytorch/issues/179722: torch 2.11's
+# dynamo skips _maybe_view_chunk_cat (called by all_gather_tensor when
+# gather_dim != 0), breaking torch.compile(fullgraph=True) on _sample_compiled
+# / greedy_sample_compiled. Upstream fix is in flight (PRs #180389, #182435);
+# patch the rule map until it lands.
+manual_torch_name_rule_map.setdefault("torch._utils._maybe_view_chunk_cat", UserFunctionVariable)
+
+
+def sample(
+    weights: torch.Tensor,  # [V, D] (may be a TP shard over dim V)
+    hidden_states: torch.Tensor,  # [n_hidden_states, D]
+    num_samples: int,
+    temperature: torch.Tensor,  # scalar (0-d)
+    return_probs: bool = False,
+    seed: int = None,
+    tl_matmul: bool = False,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    use_qitra: bool = False,
+    tp: "TPInfo" = TP1,
+):
+    if seed is not None:
+        torch.manual_seed(seed)
+    if tl_matmul:
+        logits = matmul(hidden_states, weights)  # [n_hidden_states, V]
+    else:
+        logits = hidden_states @ weights.T  # [n_hidden_states, V]
+    if tp.size > 1:
+        logits = _allgather_logits(logits)  # shape [H, V_local] -> [H, V]
+    # Upcast to float32 before temperature scaling: Qitra asserts float32, and
+    # torch.multinomial produces imprecise distributions with bfloat16.
+    # See findings/upcasting-before-softmax.md.
+    logits = logits.float() / temperature
+    if use_qitra:
+        probs = apply_top_k_top_p_qitra(logits, top_k, top_p)
+    else:
+        probs = apply_top_k_top_p(logits, top_k, top_p)
+    samples = torch.multinomial(probs, num_samples, replacement=True)
+    if return_probs:
+        return samples, probs
+    return samples
+
+
+def _fast_multinomial(probs: torch.Tensor, num_samples: int) -> torch.Tensor:
+    """Sample from a categorical distribution using the exponential race method.
+
+    Avoids torch.multinomial's 10-kernel validation overhead (~2/3 of its runtime).
+    For each row, draws exponential noise, computes probs / noise, and takes argmax.
+    See https://github.com/pytorch/pytorch/issues/177127
+    """
+    H, V = probs.shape  # noqa: N806
+    q = torch.empty(num_samples, H, V, device=probs.device, dtype=probs.dtype)
+    q.exponential_()
+    return probs.unsqueeze(0).div(q).argmax(dim=-1).T  # [H, num_samples]
+
+
+def _allgather_logits(
+    logits: torch.Tensor,  # [H, V_local]
+) -> torch.Tensor:
+    """All-gather local logits along the vocab dimension to reconstruct [H, V_global]."""
+    return all_gather_tensor(logits, gather_dim=1, group=dist.group.WORLD)
+
+
+def apply_top_k_top_p(
+    logits: torch.Tensor,  # [batch, V], float32
+    top_k: int | None,
+    top_p: float | None,
+) -> torch.Tensor:
+    """Apply top-k and top-p filtering and return probabilities. Single softmax."""
+    if top_k is None and top_p is None:
+        return logits.softmax(dim=-1)
+
+    k = top_k if top_k is not None else logits.shape[-1]
+    topk_vals, topk_idx = logits.topk(k, dim=-1)
+    probs = topk_vals.softmax(dim=-1)
+
+    if top_p is not None:
+        cumsum = torch.cumsum(probs, dim=-1)
+        top_p_mask = (cumsum - probs) >= top_p
+        top_p_mask[:, 0] = False  # always keep the most probable token
+        probs.masked_fill_(top_p_mask, 0.0)
+        probs.div_(probs.sum(dim=-1, keepdim=True))
+
+    out = torch.zeros_like(logits)
+    return out.scatter_(dim=-1, index=topk_idx, src=probs)
+
+
+@lru_cache
+def print_once(msg: str):
+    print(msg)
+
+
+def apply_top_k_top_p_qitra(
+    logits: torch.Tensor,  # [batch, V], float32
+    top_k: int | None,
+    top_p: float | None,
+) -> torch.Tensor:
+    """Apply top-k and top-p filtering using vLLM's Qitra Triton kernel and return probabilities."""
+    from .qitra import apply_top_k_top_p_triton
+
+    print_once(msg="Using Qitra for top-k/top-p filtering")
+
+    batch_size = logits.shape[0]
+    k = (
+        torch.full((batch_size,), top_k, dtype=torch.int32, device=logits.device)
+        if top_k is not None
+        else None
+    )
+    p = (
+        torch.full((batch_size,), top_p, dtype=torch.float32, device=logits.device)
+        if top_p is not None
+        else None
+    )
+    logits = apply_top_k_top_p_triton(logits, k, p)
+    return logits.softmax(dim=-1)
+
+
+@nvtx.annotate()
+def greedy_sample(
+    weights: torch.Tensor,  # [V, D]
+    hidden_states: torch.Tensor,  # [n_hidden_states, D]
+    num_samples: int,  # ignored (always returns 1 sample per row)
+    temperature: torch.Tensor,  # ignored (greedy)
+    tp: "TPInfo" = TP1,
+    **_kwargs,
+) -> torch.Tensor:
+    """Baseline: matmul for logits followed by argmax. Returns [n_hidden_states, 1]."""
+    logits = hidden_states @ weights.T  # [n_hidden_states, V]
+    if tp.size > 1:
+        logits = _allgather_logits(logits)
+    return logits.argmax(dim=-1, keepdim=True)  # [n_hidden_states, 1]
+
+
+greedy_sample_compiled = nvtx.annotate()(torch.compile(greedy_sample, fullgraph=True))
+
+_sample_compiled = torch.compile(sample, fullgraph=True)
+
+
+@nvtx.annotate()
+def sample_compiled(*args, seed: int | None = None, **kwargs):
+    # torch.manual_seed is dynamo-skipped, so seed handling has to live outside
+    # the compiled region. Pass seed=None into the compiled inner; the dead
+    # `if seed is not None` branch in sample() is folded at trace time.
+    if seed is not None:
+        torch.manual_seed(seed)
+    return _sample_compiled(*args, **kwargs)
+
+
+@nvtx.annotate()
+@torch.compile(fullgraph=True)
+def sequential_sample_pt(
+    weights: torch.Tensor,  # [V, D]
+    hidden_states: torch.Tensor,  # [n_hidden_states, D]
+    num_samples: int,
+    temperature: torch.Tensor,  # scalar (0-d)
+    **kwargs,
+):
+    device = weights.device
+    V, D = weights.shape  # noqa: N806
+    H, D2 = hidden_states.shape  # noqa: N806
+    if D2 != D:
+        raise ValueError(
+            f"hidden_states second dimension ({D2}) must match weights first dimension ({D})"
+        )
+    block_size = 8192
+    # compute logits blocks
+    gumbel_max = torch.full((num_samples, H), float("-inf"), device=device)
+    gumbel_max_idx = torch.empty(size=(num_samples, H), dtype=torch.long, device=device)
+    n_blocks = cdiv(V, block_size)
+    for blk_idx in range(n_blocks):
+        idx_from = blk_idx * block_size
+        idx_to = (blk_idx + 1) * block_size
+        w_blk = weights[idx_from:idx_to, :]  # [block_size, D]
+        logits_blk = hidden_states @ w_blk.T / temperature  # [n_hidden_states, block_size]
+        unif_noise = torch.rand((num_samples, *logits_blk.shape), device=device)
+        gumbel_noise = -(-unif_noise.log()).log()
+        new_max, new_max_idx_local = torch.max(logits_blk + gumbel_noise, dim=2)
+        new_max_idx_global = idx_from + new_max_idx_local
+
+        replace_mask = new_max > gumbel_max
+        gumbel_max = torch.where(replace_mask, new_max, gumbel_max)
+        gumbel_max_idx = torch.where(replace_mask, new_max_idx_global, gumbel_max_idx)
+    return gumbel_max_idx.T
+
+
+def cdiv(n: int, div: int) -> int:
+    return (n + div - 1) // div
+
+
+@lru_cache(maxsize=1)
+def num_sms_cached(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+MIN_BLOCK_SIZE_V = 128
+
+
+# @torch.compile(fullgraph=True)
+@nvtx.annotate()
+def fused_mm_sample_triton(
+    weights: torch.Tensor,  # [V_local, D] (may be a TP shard)
+    hidden_states: torch.Tensor,  # [n_hidden_states, D]
+    num_samples: int,
+    temperature: torch.Tensor,  # scalar (0-d)
+    seed: int,
+    greedy_sampling: bool = False,
+    tp: "TPInfo" = TP1,
+    return_logits: bool = False,
+    p2p_no_overlap: bool = False,
+):
+    assert torch.cuda.is_available(), "fused_mm_sample_triton requires CUDA"
+    V, D = weights.shape  # noqa: N806
+    H, D2 = hidden_states.shape  # noqa: N806
+    if D2 != D:
+        raise ValueError(
+            f"hidden_states second dimension ({D2}) must match weights second dimension ({D})"
+        )
+
+    # The kernel uses TMA descriptors which need a runtime allocator. Some
+    # autotuner configs (notably the ones picked on B200/sm_100) request global
+    # scratch from this allocator; without it Triton raises a RuntimeError at launch.
+    set_torch_allocator_for_tma_descriptors_cached()
+
+    NUM_SMS = num_sms_cached(weights.device.index)  # noqa: N806
+
+    max_grid_size_v = triton.cdiv(V, MIN_BLOCK_SIZE_V)
+    fan_out_tp = tp.size > 1 and not p2p_no_overlap
+    if tp.size > 1:
+        maxs, maxs_idx, symm_mem_hdl, storage_offset_maxs_idx = allocate_symm_mem_outputs(
+            num_samples=num_samples,
+            max_grid_size_v=max_grid_size_v,
+            H=H,
+        )
+        kernel_maxs = maxs[tp.rank]
+        kernel_maxs_idx = maxs_idx[tp.rank]
+        symm_mem_buffer_ptrs = symm_mem_hdl.buffer_ptrs_dev
+    else:
+        maxs = torch.empty(
+            (num_samples, max_grid_size_v, H),
+            dtype=torch.float32,
+            device=weights.device,
+        )
+        maxs_idx = torch.empty_like(maxs, dtype=torch.long)
+        kernel_maxs = maxs
+        kernel_maxs_idx = maxs_idx
+        storage_offset_maxs_idx = 0
+        symm_mem_buffer_ptrs = maxs
+
+    # logits_out is only read when RETURN_LOGITS=True. For the common path
+    # (return_logits=False), allocating a (V, H) fp32 buffer per call is wasted
+    # HBM (155 MB per decode step at Qwen3-1.7B / H=256) for a buffer the
+    # kernel never touches. Pass a 1-element dummy in that case so the kernel
+    # still has a valid pointer to receive.
+    logits_shape = (V, H) if return_logits else (1,)
+    logits_out = torch.empty(logits_shape, dtype=torch.float32, device=weights.device)
+
+    grid_size = {"v": None}
+
+    def grid(meta):
+        grid_size_v = triton.cdiv(V, meta["BLOCK_SIZE_V"])
+        grid_size_h = triton.cdiv(H, meta["BLOCK_SIZE_H"])
+        grid_size["v"] = grid_size_v
+        num_tiles = grid_size_v * grid_size_h
+        # Persistent kernel: launch min(NUM_SMS, num_tiles) programs
+        return (min(NUM_SMS, num_tiles),)
+
+    fused_mm_sample_triton_kernel[grid](
+        weights_ptr=weights,
+        hidden_states_ptr=hidden_states,
+        max_out_ptr=kernel_maxs,
+        max_out_idx_ptr=kernel_maxs_idx,
+        symm_mem_buffer_ptrs=symm_mem_buffer_ptrs,
+        vocab_size=V,
+        hidden_size=D,
+        n_hidden_states=H,
+        num_samples=num_samples,
+        temperature_ptr=temperature,
+        seed=seed,
+        max_grid_size_v=max_grid_size_v,
+        storage_offset_maxs_idx=storage_offset_maxs_idx,
+        tp_rank=tp.rank,
+        tp_world_size=tp.size,
+        logits_out_ptr=logits_out,
+        # On B200/Triton 3.6, NVWSInsertAref crashes on small correctness-test
+        # shapes when the compile-time num_samples loop is large. Production
+        # decoding requests one sample per row, so keep WS on that path and use
+        # the non-WS lowering for multi-sample distribution tests.
+        WARP_SPECIALIZE=(
+            supports_warp_specialization_cached()
+            and num_samples == 1
+            and V > 2 * MIN_BLOCK_SIZE_V
+        ),
+        NUM_SMS=NUM_SMS,
+        GREEDY_SAMPLING=greedy_sampling,
+        RETURN_LOGITS=return_logits,
+        FAN_OUT_TP=fan_out_tp,
+    )
+
+    assert grid_size["v"] is not None
+
+    if tp.size > 1:
+        if fan_out_tp:
+            samples = tp_post_kernel_reduce(
+                local_maxs=maxs,
+                local_maxs_idx=maxs_idx,
+                symm_mem_hdl=symm_mem_hdl,
+                grid_size_v=grid_size["v"],
+            )
+        else:
+            samples = tp_post_kernel_p2p_reduce(
+                local_maxs=maxs,
+                local_maxs_idx=maxs_idx,
+                symm_mem_hdl=symm_mem_hdl,
+                storage_offset_maxs_idx=storage_offset_maxs_idx,
+                grid_size_v=grid_size["v"],
+            )
+    else:
+        samples, _ = _local_reduce(
+            maxs[:, : grid_size["v"], :], maxs_idx[:, : grid_size["v"], :], vocab_start_index=0
+        )
+
+    if return_logits:
+        return samples, logits_out.T  # [n_hidden_states, num_samples], [H, V]
+    return samples  # [n_hidden_states, num_samples]
+
+
+@lru_cache(maxsize=1)
+def supports_warp_specialization_cached():
+    is_cuda = triton.runtime.driver.active.get_current_target().backend == "cuda"
+    supports_ws = is_cuda and torch.cuda.get_device_capability()[0] >= 9
+    print("Supports warp specialization:", supports_ws)
+    return supports_ws
+
+
+@torch.compile(fullgraph=True)
+def _local_reduce(
+    maxs: torch.Tensor,  # [num_samples, n_tiles, H]
+    maxs_idx: torch.Tensor,  # [num_samples, n_tiles, H]
+    vocab_start_index: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce across V-tiles (dim=1) on this rank and adjust to global vocab indices."""
+    idxs = maxs.max(dim=1).indices  # [num_samples, H]
+    samples = maxs_idx.gather(1, idxs.unsqueeze(1)).squeeze(1)  # [num_samples, H]
+    max_values = maxs.gather(1, idxs.unsqueeze(1)).squeeze(1)  # [num_samples, H]
+    samples += vocab_start_index
+    return samples.T.contiguous(), max_values.T.contiguous()  # [H, num_samples]
+
+
+def clip(low, high, x):
+    return min(max(x, low), high)
+
+
+def is_config_valid(bsz_v, bsz_d, bsz_h):
+    # Derive limit from hardware constraints:
+    # - H100/A100 shared memory: 232448 (from Triton logs)
+    max_bytes = 232448
+
+    # Memory usage in kernel:
+    # - logits_blk: bsz_v * bsz_h * 4 bytes (float32, persists)
+    # - w_blk: bsz_v * bsz_d * 2 bytes (bfloat16, during matmul)
+    # - hidden_states_blk: bsz_h * bsz_d * 2 bytes (bfloat16, during matmul)
+    # - noise: bsz_v * bsz_h * 4 bytes (float32)
+    # - gumbel_noise: bsz_v * bsz_h * 4 bytes (float32)
+
+    # Peak memory during sampling phase:
+    # logits_blk + gumbel_noise = bsz_v * bsz_h * (4 + 4) bytes
+    # = bsz_v * bsz_h * 8 bytes per element
+    bytes_per_elem = 8
+    max_elements = max_bytes / bytes_per_elem  # ~16,384 elements
+
+    if bsz_v * bsz_h > max_elements:
+        return False
+
+    # Also check matmul phase memory (w_blk + hidden_states_blk)
+    matmul_bytes = bsz_v * bsz_d * 2 + bsz_h * bsz_d * 2
+    if matmul_bytes > max_bytes:
+        return False
+
+    return True
+
+
+@triton.jit
+def _compute_tile_pid(tile_id, num_pid_in_group, num_pid_v, GROUP_SIZE_V):  # noqa: N803
+    """Compute pid_v, pid_h from tile_id using grouped ordering for L2 cache efficiency."""
+    group_id = tile_id // num_pid_in_group
+    first_pid_v = group_id * GROUP_SIZE_V
+    group_size_v = tl.minimum(num_pid_v - first_pid_v, GROUP_SIZE_V)
+    pid_v = first_pid_v + (tile_id % group_size_v)
+    pid_h = (tile_id % num_pid_in_group) // group_size_v
+    return pid_v, pid_h
+
+
+def metadata_fn(
+    grid: tuple,
+    metadata: NamedTuple,
+    args: dict,
+):
+    """Copied from https://github.com/triton-lang/triton/blob/main/third_party/proton/tutorials/matmul.py"""
+    grid_x, grid_y, grid_z = unpack_grid(grid)
+    num_warps = metadata.num_warps
+    num_stages = metadata.num_stages
+    cluster_x, cluster_y, cluster_z = unpack_grid((metadata.num_ctas,))
+    shared_memory = metadata.shared
+    return {
+        "name": f"fused_mm_sample_triton_<grid:{grid_x}x{grid_y}x{grid_z}>_<cluster:{cluster_x}x{cluster_y}x{cluster_z}>_<warps:{num_warps}>_<shared:{shared_memory}>_<stages:{num_stages}>",
+    }
+
+
+def unpack_grid(grid):
+    if len(grid) == 1:
+        return grid[0], 1, 1
+    if len(grid) == 2:
+        return grid[0], grid[1], 1
+    if len(grid) == 3:
+        return grid[0], grid[1], grid[2]
+
+
+def get_autotuning_configs() -> list[triton.Config]:
+    cc = torch.cuda.get_device_capability()
+    is_dev_machine: bool = cc == (8, 6)  # RTX 3090 config
+    if is_dev_machine:
+        return [
+            triton.Config(
+                {"BLOCK_SIZE_V": MIN_BLOCK_SIZE_V, "BLOCK_SIZE_D": 32, "GROUP_SIZE_V": 4},
+                num_warps=4,
+                num_stages=2,
+                # Persistent kernel: grid = NUM_SMS, so only 1 block per SM.
+                # No occupancy benefit from limiting registers, so let ptxas
+                # use the full register file instead of spilling to local memory.
+                maxnreg=255,
+            )
+        ]
+    return [
+        triton.Config(
+            {"BLOCK_SIZE_V": bsz_v, "BLOCK_SIZE_D": bsz_d, "GROUP_SIZE_V": 4},
+            num_warps=num_warps,
+            num_stages=num_stages,
+            maxnreg=maxnreg,
+        )
+        for bsz_v in [MIN_BLOCK_SIZE_V, 2 * MIN_BLOCK_SIZE_V]
+        for bsz_d in [64, 128]
+        for num_warps in [8]  # Default 4
+        # Can't use 255: warp specialization adds warps (8+4=384 threads), 255*384 > 65536 reg file
+        for maxnreg in [128]
+        for num_stages in [4]  # 4 outperforms 2, and 3
+    ]
+
+
+@triton.autotune(
+    configs=get_autotuning_configs(),
+    key=["vocab_size", "hidden_size", "BLOCK_SIZE_H", "num_samples", "GREEDY_SAMPLING"],
+    cache_results=True,
+)
+@triton.heuristics(values={"BLOCK_SIZE_H": lambda args: bsz_h(args["n_hidden_states"])})
+@triton.jit(launch_metadata=metadata_fn)
+def fused_mm_sample_triton_kernel(
+    weights_ptr,  # [V, D]
+    hidden_states_ptr,  # [n_hidden_states, D]
+    max_out_ptr,  # [num_samples, max_grid_size_v, n_hidden_states]
+    max_out_idx_ptr,  # [num_samples, max_grid_size_v, n_hidden_states]
+    symm_mem_buffer_ptrs,  # [tp_world_size] uint64 base pointers when FAN_OUT_TP=True
+    vocab_size,  # V
+    hidden_size: tl.constexpr,  # D
+    n_hidden_states: int,
+    num_samples: tl.constexpr,
+    temperature_ptr,  # scalar (0-d tensor)
+    seed: int,
+    storage_offset_maxs_idx: tl.constexpr,
+    tp_rank: tl.constexpr,
+    tp_world_size: tl.constexpr,
+    BLOCK_SIZE_V: tl.constexpr,  # noqa: N803
+    BLOCK_SIZE_D: tl.constexpr,  # noqa: N803
+    BLOCK_SIZE_H: tl.constexpr,  # noqa: N803
+    GROUP_SIZE_V: tl.constexpr,  # noqa: N803
+    max_grid_size_v: tl.constexpr,
+    logits_out_ptr,  # [V, n_hidden_states] float32 (or dummy when RETURN_LOGITS=False)
+    WARP_SPECIALIZE: tl.constexpr,  # noqa: N803
+    NUM_SMS: tl.constexpr,  # noqa: N803
+    GREEDY_SAMPLING: tl.constexpr,  # noqa: N803
+    RETURN_LOGITS: tl.constexpr,  # noqa: N803
+    FAN_OUT_TP: tl.constexpr,  # noqa: N803
+):
+    """Persistent kernel for fused matmul + Gumbel-max sampling.
+
+    Each SM processes multiple tiles in a loop, staying persistent on the SM
+    rather than exiting after processing a single tile.
+    """
+    if not GREEDY_SAMPLING:
+        temperature = tl.load(temperature_ptr)
+    start_pid = tl.program_id(axis=0)
+    num_pid_v = tl.cdiv(vocab_size, BLOCK_SIZE_V)
+    num_pid_h = tl.cdiv(n_hidden_states, BLOCK_SIZE_H)
+    num_tiles = num_pid_v * num_pid_h
+    num_pid_in_group = GROUP_SIZE_V * num_pid_h
+
+    # TMA descriptors are used for the matmul LOADS (where the bandwidth wins
+    # really matter) but NOT for the small per-tile output stores. The output
+    # stores were originally TMA descriptors with shape=[num_samples, V_tiles,
+    # H] and block_shape=[1, 1, BLOCK_SIZE_H]. That 3D-with-two-singleton-dims
+    # pattern silently no-ops most stores on Blackwell (sm_100): only 2/1187
+    # V-tile slots get written, leaving the rest uninitialized. The Triton
+    # tutorial 09-persistent-matmul only uses TMA stores in the canonical 2D
+    # form, so we sidestep the issue by switching the output stores to plain
+    # tl.store with computed offsets.
+    w_desc = tl.make_tensor_descriptor(
+        weights_ptr,
+        shape=[vocab_size, hidden_size],
+        strides=[hidden_size, 1],
+        block_shape=[BLOCK_SIZE_V, BLOCK_SIZE_D],
+    )
+    hidden_states_desc = tl.make_tensor_descriptor(
+        hidden_states_ptr,
+        shape=[n_hidden_states, hidden_size],
+        strides=[hidden_size, 1],
+        block_shape=[BLOCK_SIZE_H, BLOCK_SIZE_D],
+    )
+    # tile_id_c is used in the epilogue to break the dependency between
+    # the prologue and the epilogue (workaround for Blackwell pipelining bug)
+    tile_id_c = start_pid - NUM_SMS
+
+    # Persistent loop: each SM processes multiple tiles
+    for tile_id in tl.range(
+        start_pid, num_tiles, NUM_SMS, flatten=True, warp_specialize=WARP_SPECIALIZE
+    ):
+        # Compute pid_v, pid_h from tile_id using grouped ordering for L2 cache
+        pid_v, pid_h = _compute_tile_pid(tile_id, num_pid_in_group, num_pid_v, GROUP_SIZE_V)
+
+        v_start = pid_v * BLOCK_SIZE_V
+        h_start = pid_h * BLOCK_SIZE_H
+
+        offsets_v = v_start + tl.arange(0, BLOCK_SIZE_V)
+        mask_v = offsets_v < vocab_size
+
+        logits_blk = tl.zeros((BLOCK_SIZE_V, BLOCK_SIZE_H), dtype=tl.float32)
+
+        # Compute a block of logits logits_blk
+        for d_start in range(0, hidden_size, BLOCK_SIZE_D):
+            # load weights tile [BLOCK_SIZE_V, BLOCK_SIZE_D]
+            w_blk = w_desc.load([v_start, d_start])
+            # load hidden_states tile [BLOCK_SIZE_H, BLOCK_SIZE_D]
+            hidden_states_blk = hidden_states_desc.load([h_start, d_start])
+            logits_blk = tl.dot(w_blk, hidden_states_blk.T, acc=logits_blk)
+
+        # Optionally store raw logits to GMEM before masking and temperature.
+        if RETURN_LOGITS:
+            offsets_h = h_start + tl.arange(0, BLOCK_SIZE_H)
+            logits_ptrs = logits_out_ptr + offsets_v[:, None] * n_hidden_states + offsets_h[None, :]
+            logits_mask = mask_v[:, None] & (offsets_h < n_hidden_states)[None, :]
+            tl.store(logits_ptrs, logits_blk, mask=logits_mask)
+
+        # Later we will take max over logits + noise, but rows outside the mask
+        # should not be considered. Setting them to -inf achieves this.
+        logits_blk = tl.where(mask_v[:, None], logits_blk, -float("inf"))
+
+        if not GREEDY_SAMPLING:
+            logits_blk = logits_blk / temperature  # [Vblk, n_hidden_states]
+
+        # Epilogue: use tile_id_c to break dependency with prologue
+        tile_id_c += NUM_SMS
+        pid_v_c, pid_h_c = _compute_tile_pid(tile_id_c, num_pid_in_group, num_pid_v, GROUP_SIZE_V)
+        v_start_c = pid_v_c * BLOCK_SIZE_V
+        h_start_c = pid_h_c * BLOCK_SIZE_H
+
+        for sample_idx in range(num_samples):
+            noise_size: tl.constexpr = BLOCK_SIZE_V * BLOCK_SIZE_H
+            noise_offsets = tl.arange(0, noise_size).reshape((BLOCK_SIZE_V, BLOCK_SIZE_H))
+            if not GREEDY_SAMPLING:
+                tile_noise_offsets = (
+                    (pid_v_c * num_pid_h + pid_h_c) * noise_size + noise_offsets
+                )
+                gumbel_max, gumbel_max_idx_local = tl.max(
+                    logits_blk + _gumbel_noise(seed, sample_idx, tile_noise_offsets),
+                    axis=0,
+                    return_indices=True,
+                )
+            else:
+                gumbel_max, gumbel_max_idx_local = tl.max(logits_blk, axis=0, return_indices=True)
+
+            gumbel_max_idx_global = gumbel_max_idx_local + v_start_c + tp_rank * vocab_size
+
+            # Plain tl.store (no TMA) for the small per-tile outputs. See note
+            # above the descriptor block.
+            offsets_h_out = h_start_c + tl.arange(0, BLOCK_SIZE_H)
+            mask_h_out = offsets_h_out < n_hidden_states
+            base_offset = (
+                sample_idx * max_grid_size_v * n_hidden_states
+                + pid_v_c * n_hidden_states
+                + offsets_h_out
+            )
+            if FAN_OUT_TP:
+                buffer_ptrs = symm_mem_buffer_ptrs.to(tl.pointer_type(tl.uint64))
+                source_rank_base_offset = (
+                    tp_rank * num_samples * max_grid_size_v * n_hidden_states + base_offset
+                )
+                for peer_rank in tl.static_range(0, tp_world_size):
+                    peer_base = tl.load(buffer_ptrs + peer_rank)
+                    peer_maxs_ptr = peer_base.to(tl.pointer_type(tl.float32))
+                    peer_maxs_idx_ptr = peer_base.to(tl.pointer_type(tl.int64))
+                    tl.store(
+                        peer_maxs_ptr + source_rank_base_offset,
+                        gumbel_max,
+                        mask=mask_h_out,
+                    )
+                    tl.store(
+                        peer_maxs_idx_ptr + storage_offset_maxs_idx + source_rank_base_offset,
+                        gumbel_max_idx_global,
+                        mask=mask_h_out,
+                    )
+            else:
+                tl.store(max_out_ptr + base_offset, gumbel_max, mask=mask_h_out)
+                tl.store(max_out_idx_ptr + base_offset, gumbel_max_idx_global, mask=mask_h_out)
+
+
+@triton.jit
+def _gumbel_noise(seed, sample_idx, noise_offsets):
+    # Use the seed as the sample-stream identifier and the offset as the
+    # element identifier. Keeping these two dimensions separate avoids the
+    # collisions caused by combining sample and tile IDs with arbitrary
+    # decimal multipliers.
+    return -tl.log(-tl.log(tl.rand(seed + sample_idx, noise_offsets)))
+
+
+@lru_cache(maxsize=1)
+def set_torch_allocator_for_tma_descriptors_cached():
+    """From https://triton-lang.org/main/python-api/generated/triton.language.make_tensor_descriptor.html"""
+    # TMA descriptors require a global memory allocation
+    triton.set_allocator(alloc_on_cuda)
+
+
+def alloc_on_cuda(size: int, alignment: int, stream: int | None):
+    return torch.empty(size, device="cuda", dtype=torch.int8)
+
+
+class Sampler(Protocol):
+    def prepare(self) -> "Sampler":
+        raise NotImplementedError()
+
+    def sample(self, **kwargs) -> torch.Tensor:
+        raise NotImplementedError()
+
+
+@dataclass
+class SimpleSampler(Sampler):
+    fn: Callable[..., torch.Tensor]
+
+    def prepare(self) -> "SimpleSampler":
+        return self
+
+    def sample(self, **kwargs) -> torch.Tensor:
+        return self.fn(**kwargs)
+
+
+@dataclass
+class JLSampler(Sampler):
+    weights: torch.Tensor  # [V, D]
+    k: int
+    prepared: bool = False
+
+    @classmethod
+    def from_weights(
+        cls,
+        weights: torch.Tensor,  # [V, D]
+        epsilon: float = 0.2,
+    ) -> "JLSampler":
+        k = optimal_k(n=weights.shape[0], epsilon=epsilon)
+        print(f"JLSampler optimal k={k}")
+        return cls(weights, k=k)
+
+    def prepare(self) -> "JLSampler":
+        D = self.weights.shape[1]  # noqa: N806
+        self.rand_mat = torch.randn(
+            (D, self.k),
+            dtype=self.weights.dtype,
+            device=self.weights.device,
+        ) / math.sqrt(self.k)
+        self.w_p = self.weights @ self.rand_mat  # [V, k]
+        self.w_p = self.w_p.contiguous()
+        self.prepared = True
+        self.weights = None  # not needed anymore
+        return self
+
+    @torch.compile(fullgraph=True)
+    def sample(
+        self,
+        hidden_states: torch.Tensor,  # [n_hidden_states, D]
+        temperature: torch.Tensor,  # scalar (0-d)
+        num_samples: int,
+        seed: int | None = None,  # ignored
+        weights: torch.Tensor = None,  # ignored
+    ):
+        """
+        Sampling using low-dimensional random projections (Johnson-Lindenstrauss lemma).
+        """
+        if not self.prepared:
+            raise ValueError("Sampler not prepared. Call .prepare() first.")
+        logits_p = self.compute_logits(hidden_states)
+        probs = (logits_p / temperature).softmax(dim=1)
+        samples = _fast_multinomial(probs, num_samples)
+        return samples
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,  # [n_hidden_states, D]
+    ) -> torch.Tensor:
+        h_p = hidden_states @ self.rand_mat  # [n_hidden_states, k]
+        return h_p @ self.w_p.T  # [n_hidden_states, V]
+
+    def rrt(self) -> torch.Tensor:
+        """Return R @ Rᵀ, which should be close to the identity matrix."""
+        m = self.rand_mat
+        return m @ m.T
+
+
+def optimal_k(n: int, epsilon: float) -> int:
+    """Source: https://cs.stanford.edu/people/mmahoney/cs369m/Lectures/lecture1.pdf"""
+    k_float = 24 * math.log(n, math.e) / (3 * epsilon**2 - 2 * epsilon**3)
+    return int(math.ceil(k_float))
+
+
+def get_sampler(provider: str, weights: torch.Tensor) -> Sampler:
+    match provider:
+        case S.fused_triton:
+            return SimpleSampler(lambda **kwargs: fused_mm_sample_triton(**{"seed": 0, **kwargs}))
+        case S.fused_triton_p2p_no_overlap:
+            return SimpleSampler(
+                lambda **kwargs: fused_mm_sample_triton(
+                    **{"seed": 0, "p2p_no_overlap": True, **kwargs}
+                )
+            )
+        case S.fused_triton_ret_logits:
+            return SimpleSampler(
+                lambda **kwargs: fused_mm_sample_triton(
+                    **{"seed": 0, "return_logits": True, **kwargs}
+                )[0]
+            )
+        case S.fused_triton_greedy:
+            return SimpleSampler(
+                lambda **kwargs: fused_mm_sample_triton(
+                    **{"seed": 0, "greedy_sampling": True, **kwargs}
+                )
+            )
+        case S.naive_pt:
+            return SimpleSampler(sample)
+        case S.naive_compiled:
+            return SimpleSampler(sample_compiled)
+        case S.pt_qitra:
+            return SimpleSampler(lambda **kwargs: sample(**kwargs, use_qitra=True))
+        case S.sequential_compiled:
+            return SimpleSampler(sequential_sample_pt)
+        case S.naive_tl_matmul:
+            return SimpleSampler(lambda **kwargs: sample_compiled(**kwargs, tl_matmul=True))
+        case S.jl_compiled:
+            return JLSampler.from_weights(weights)
+        case S.fused_topk:
+            from .tl_fused_mm_topk import fused_mm_topk_and_sample
+
+            return SimpleSampler(fused_mm_topk_and_sample)
+        case S.flashinfer_top_k_top_p_sampling_from_logits:
+            return SimpleSampler(
+                lambda **kwargs: flashinfer_top_k_top_p_sampling_from_logits(
+                    **_default_top_k_top_p(kwargs),
+                )
+            )
+        case S.fused_cuda:
+            from .cuda_impl import fused_mm_sample_cuda
+
+            return SimpleSampler(fused_mm_sample_cuda)
+        case S.helion:
+            from .helion_impl import fused_mm_sample_helion
+
+            return SimpleSampler(fused_mm_sample_helion)
+        case S.flashinfer_sampling_from_logits:
+            return SimpleSampler(flashinfer_sampling_from_logits)
+        case S.greedy_baseline:
+            return SimpleSampler(greedy_sample_compiled)
+        case _:
+            raise NotImplementedError(f"Unknown provider: {provider}")
+
+
+def _default_top_k_top_p(kwargs: dict) -> dict:
+    """Set flashinfer defaults for top_k/top_p when not provided by the caller."""
+    if "top_k" not in kwargs:
+        kwargs["top_k"] = -1
+    if "top_p" not in kwargs:
+        kwargs["top_p"] = 1.0
+    return kwargs
+
+
+def flashinfer_top_k_top_p_sampling_from_logits(
+    weights: torch.Tensor,  # [V, D]
+    hidden_states: torch.Tensor,  # [n_hidden_states, D]
+    num_samples: int,
+    temperature: torch.Tensor,  # scalar (0-d)
+    top_p: float,
+    top_k: int,
+    tp: "TPInfo" = TP1,
+    **_kwargs,
+) -> torch.Tensor:
+    batch_size = hidden_states.shape[0]
+    logits, indices = flashinfer_create_logits_and_indices(
+        weights, hidden_states, num_samples, temperature
+    )
+    if tp.size > 1:
+        logits = _allgather_logits(logits)
+    result = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+        logits=logits,
+        top_k=top_k,
+        top_p=top_p,
+        indices=indices,
+    )
+    return result.reshape(batch_size, num_samples)
+
+
+@nvtx.annotate()
+@torch.compile(fullgraph=True)
+def flashinfer_create_logits_and_indices(
+    weights: torch.Tensor,  # [V, D]
+    hidden_states: torch.Tensor,  # [n_hidden_states, D]
+    num_samples: int,
+    temperature: torch.Tensor,  # scalar (0-d)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = weights.device
+    batch_size = hidden_states.shape[0]
+    assert weights.shape[1] == hidden_states.shape[1], "weights must transposed"
+    logits = hidden_states @ weights.T  # [batch_size, vocab]
+    logits /= temperature
+    indices = torch.repeat_interleave(
+        torch.arange(batch_size, device=device, dtype=torch.int32), num_samples
+    )
+    return logits, indices
+
+
+@nvtx.annotate()
+def flashinfer_sampling_from_logits(
+    weights: torch.Tensor,  # [V, D]
+    hidden_states: torch.Tensor,  # [n_hidden_states, D]
+    num_samples: int,
+    temperature: torch.Tensor,  # scalar (0-d)
+    tp: "TPInfo" = TP1,
+    **_kwargs,
+) -> torch.Tensor:
+    batch_size = hidden_states.shape[0]
+    logits, indices = flashinfer_create_logits_and_indices(
+        weights, hidden_states, num_samples, temperature
+    )
+    if tp.size > 1:
+        logits = _allgather_logits(logits)
+    result = flashinfer.sampling.sampling_from_logits(logits=logits, indices=indices)
+    return result.reshape(batch_size, num_samples)
+
+
+def bsz_h(H: int) -> int:  # noqa: N803
+    if H <= 16:
+        return 16
+    elif H <= 32:
+        return 32
+    return 64

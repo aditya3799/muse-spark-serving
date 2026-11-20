@@ -1,0 +1,26 @@
+NOTEBOOK 02: KAGGLE ROUTING OVERHEAD
+
+Upload only 02_kaggle_routing_overhead.ipynb. It is self-contained.
+
+1. Import the notebook into Kaggle. Select GPU T4; only GPU 0 is used.
+2. Internet can stay off. No packages, datasets, model weights or credentials are needed.
+3. Keep the default configuration and choose Run All.
+4. Expected: environment passed, correctness passed, benchmark passed; profiler passed or partial if GPU trace collection is unavailable.
+5. The default benchmark contains 50 comparisons, 250 changed-input graph checks, 110 timing rows and 1,650 raw samples. A failure records an error and excludes affected timing rows.
+6. Run the last export cell even if an earlier section reports failed/partial/skipped.
+7. Download v4_routing_overhead_*.zip from the final link or Kaggle's output/file panel in /kaggle/working.
+8. Put the ZIP inside profiling_kaggle/notebook02_results locally. Keep Notebook 01 outputs intact.
+9. Stop the interactive GPU session after downloading. No additional saved execution is needed just to obtain this ZIP.
+
+What is being compared:
+- The same routing diagnostic under eager execution versus CUDA graph replay.
+- A separate labeled eager control to quantify diagnostic-label overhead.
+- Conversion, the exact project expert-ID mapping helper, synthetic sorting/counting and padding-count operations.
+
+What it does not establish:
+- Actual V4 alignment/GEMM speed, scheduler/tokenizer startup cost, full serving latency, or H200 speedup.
+- A pure launch-overhead number: graph replay also changes allocation behavior.
+
+Development files (not needed for upload): notebook02_support/routing_study.py,
+build_notebook.py, validate_local.py, mapping_helper.py, source_manifest_02.json.
+LOCAL_VALIDATION_02.json records local validation, not Kaggle measurements.

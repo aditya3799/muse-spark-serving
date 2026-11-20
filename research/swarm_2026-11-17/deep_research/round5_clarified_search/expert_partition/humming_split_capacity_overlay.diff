@@ -1,0 +1,32 @@
+--- a/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
++++ b/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
+@@ -54,8 +54,8 @@
+     return light, heavy, counts
+ 
+ 
+-def choose_partition_configs(layer, actual_routes, global_experts):
+-    experts = layer.w13_post_scale.numel()
++def choose_partition_configs(layer, actual_routes, global_experts, policy_experts=None):
++    experts = layer.w13_post_scale.numel() if policy_experts is None else policy_experts
+     default = {s:next(c for lo,hi,c in intervals if lo < actual_routes <= hi)
+                for s,intervals in layer.fp32_configs.items()}
+     selections = {s:select_ep_config(intervals,actual_routes,experts,global_experts)
+@@ -92,12 +92,16 @@
+         return fallback()
+     valid = local_ids.numel()
+     experts = layer.w13_post_scale.numel()
++    # Opt-in research metadata separates allocated slots from baseline policy.
++    policy_experts = getattr(layer, "_research_policy_local_experts", experts)
+     if (valid == 0 or valid > 4096 or not 0 < experts <= 256
+             or not isinstance(global_experts,int) or isinstance(global_experts,bool)
+-            or global_experts < experts or global_experts % experts
++            or not isinstance(policy_experts,int) or isinstance(policy_experts,bool)
++            or not 0 < policy_experts <= experts
++            or global_experts < experts or global_experts % policy_experts
+             or layer.w2_post_scale.numel() != experts):
+         return fallback()
+-    plan = choose_partition_configs(layer,valid,global_experts)
++    plan = choose_partition_configs(layer,valid,global_experts,policy_experts=policy_experts)
+     if plan is None:
+         return fallback()
+     light_ids,heavy_ids,counts = partition_routes(local_ids,experts,plan['cutoff'])

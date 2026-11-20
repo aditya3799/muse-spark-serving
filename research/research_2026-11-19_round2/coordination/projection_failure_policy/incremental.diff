@@ -1,0 +1,116 @@
+--- /dev/null
++++ b/python/sglang/srt/speculative/dflash_lt_status.py
+@@ -0,0 +1,18 @@
++"""Fail-stop policy for a dispatched draft-projection cuBLASLt call.
++
++Only a documented unsupported configuration is an ordinary plan rejection.
++CUDA execution, library, allocation and unknown statuses must remain visible.
++This does not detect asynchronous failures; native stream synchronization does.
++"""
++class ProjectionVendorError(RuntimeError):
++    def __init__(self, status, operation):
++        self.status = int(status)
++        self.operation = operation
++        super().__init__(f"{operation} returned cuBLAS status {self.status}; worker abort required")
++
++
++def checked_vendor_status(status, operation):
++    status = int(status)
++    if status not in (0, 15):  # SUCCESS, NOT_SUPPORTED
++        raise ProjectionVendorError(status, operation)
++    return status
+--- a/python/sglang/srt/speculative/dflash_projection_row.py
++++ b/python/sglang/srt/speculative/dflash_projection_row.py
+@@ -10,6 +10,7 @@
+ from pathlib import Path
+ import torch
+ import torch.distributed as dist
++from sglang.srt.speculative.dflash_lt_status import checked_vendor_status, ProjectionVendorError
+ import torch.nn.functional as F
+ 
+ HERE=Path(__file__).resolve().parent
+@@ -56,7 +57,8 @@
+         self.scratch=torch.empty(workspace_bytes,dtype=torch.uint8,device=x.device)
+         self.index=None
+     def invoke(self,index,full,x,w,y):
+-        return self.lib.row_plan_call(self.handle,index,int(full),w.data_ptr(),x.data_ptr(),y.data_ptr(),self.scratch.data_ptr(),self.scratch.numel(),_stream(x))
++        status=self.lib.row_plan_call(self.handle,index,int(full),w.data_ptr(),x.data_ptr(),y.data_ptr(),self.scratch.data_ptr(),self.scratch.numel(),_stream(x))
++        return checked_vendor_status(status, 'DFlash row projection')
+     def local(self,x,w,rank):
+         if not eligible(x,w,self.world) or tuple(x.shape)!=self.shape or _identity(w)!=self.identity or _stream(x)!=self.stream or _policy()!=self.policy:return None
+         count=x.shape[0]//self.world
+@@ -137,8 +139,17 @@
+         self.registration_index+=1
+         if any(d['error'] is not None or d['shape']!=declarations[0]['shape'] or d['index']!=declarations[0]['index'] for d in declarations):
+             return dict(accepted=False,reason='inconsistent registration request',ranks=declarations)
++        fatal=None
+         try:plan,metadata=discover_fn([(x,self.original.weight) for x in examples],self.group.world_size)
+-        except Exception as error:metadata=dict(reason='local discovery error',error=repr(error))
++        except torch.OutOfMemoryError as error:
++            metadata=dict(reason='recoverable discovery allocation failure',error=repr(error))
++        except Exception as error:
++            fatal=repr(error)
++        failures=[None]*self.group.world_size
++        dist.all_gather_object(failures,fatal,group=self.group.cpu_group)
++        if any(error is not None for error in failures):
++            if plan is not None:plan.close()
++            raise RuntimeError('DFlash row qualification aborted: '+repr(failures))
+         # Even an unexpected local discovery failure joins this CPU collective.
+         # Peers therefore fall back together instead of entering a GPU gather.
+         accepted=torch.tensor(int(plan is not None),dtype=torch.int32)
+--- a/python/sglang/srt/speculative/dflash_projection_n/runtime_projection.py
++++ b/python/sglang/srt/speculative/dflash_projection_n/runtime_projection.py
+@@ -8,6 +8,7 @@
+ from functools import lru_cache
+ 
+ import torch
++from sglang.srt.speculative.dflash_lt_status import checked_vendor_status
+ from .native_build import native_library_path
+ from torch.nn import functional as F
+ 
+@@ -82,8 +83,9 @@
+                     [self.lib.projection_config(self.handle,index,i) for i in range(9)])))
+ 
+     def invoke(self,index,full,w,x,out,temp):
+-        return self.lib.projection_call(self.handle,index,int(full),w.data_ptr(),x.data_ptr(),out.data_ptr(),
++        status=self.lib.projection_call(self.handle,index,int(full),w.data_ptr(),x.data_ptr(),out.data_ptr(),
+             temp.data_ptr() if temp.numel() else None,temp.numel(),torch.cuda.current_stream().cuda_stream)
++        return checked_vendor_status(status, 'DFlash output-column projection')
+ 
+     def local(self,x,w,rank):
+         if self.index is None or not compatible(x,w,self.world) or x.device!=self.device:
+@@ -164,4 +166,3 @@
+     except Exception:
+         plan.close()
+         raise
+-
+--- a/python/sglang/srt/speculative/dflash_projection_n/adapter.py
++++ b/python/sglang/srt/speculative/dflash_projection_n/adapter.py
+@@ -69,7 +69,7 @@
+   self.registration_index+=1
+   if any(s.get('error') is not None or s!=signatures[0] for s in signatures):
+    return dict(globally_enabled=False,reason='inconsistent registration',ranks=signatures)
+-  plan=None;metadata={}
++  plan=None;metadata={};fatal=None
+   try:
+    plan,metadata=discover_fn([(v,w) for v in examples],self.group.world_size)
+    if plan is not None:
+@@ -78,9 +78,17 @@
+     workspace_key=(w.device,stream,state[0][1])
+     if workspace_key not in self.stream_workspaces:
+      self.stream_workspaces[workspace_key]=torch.empty(state[0][1],device=w.device,dtype=torch.uint8)
++  except torch.OutOfMemoryError as exc:
++   if plan is not None:plan.close();plan=None
++   metadata={'reason':'recoverable qualification allocation failure','error':repr(exc)}
+   except Exception as exc:
+    if plan is not None:plan.close();plan=None
+-   metadata={'reason':'local qualification failed','error':repr(exc)}
++   fatal=repr(exc)
++  failures=[None]*self.group.world_size
++  dist.all_gather_object(failures,fatal,group=self.group.cpu_group)
++  if any(error is not None for error in failures):
++   if plan is not None:plan.close()
++   raise RuntimeError('DFlash output-column qualification aborted: '+repr(failures))
+   available=torch.tensor(int(plan is not None),dtype=torch.int32)
+   dist.all_reduce(available,op=dist.ReduceOp.MIN,group=self.group.cpu_group)
+   if not int(available):

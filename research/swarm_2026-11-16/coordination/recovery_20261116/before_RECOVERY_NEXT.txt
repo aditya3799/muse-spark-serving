@@ -1,0 +1,10 @@
+Ubuntu recovery is complete. No restart is needed.
+Current checkpoint: STATE.json
+Scored job e399c79bb1994630 is DONE and PASSED.
+Confirmed serving speedup: 1.2237x. Target 1.6x has not been met.
+Correctness and later-turn checks passed; extra peak GPU memory: 0.1 GB per GPU.
+Full result: status_e399c79bb1994630.json
+Next: inspect comparison checks 9689b3114c2a45ab, fa0d2a0fcf584339 and 6570fbd9e1b64ce4, then use their results to identify remaining bottlenecks.
+Do not duplicate or resubmit existing jobs. Daily quota resets at 00:00 UTC.
+Original active checkout and root patch.diff were not changed by the swarm round.
+All specialist tasks completed; routine polling stopped.

@@ -1,0 +1,7 @@
+﻿from pathlib import Path
+H=Path(__file__).resolve().parent
+p=H/'audit_target_argmax_reachability.py';s=p.read_text(encoding='utf-8-sig');s=s.replace("'judge_source':'RULES.md lines72-80 TP8/EP8, Marlin, DFLASH width8; saved score flags[]'", "'judge_source':'RULES.md lines72-80 base TP8/EP8, Marlin, DFLASH width8; scored candidate explicitly overrides moe-runner-backend=humming per plan/receipt. Aggregate result flags[] is incomplete metadata, not evidence of no override.'")
+s=s.replace("'job_flags':job['result']['flags'],", "'job_flags':job['result']['flags'],'explicit_candidate_override':{'--moe-runner-backend':'humming'},'override_sources':['swarm_2026-11-16/coordination/round5_humming_adaptive_fused/scored_submission_plan.json','swarm_2026-11-16/coordination/round5_humming_adaptive_fused/scored_submission_receipt.json'],")
+s=s.replace("Source reachability combines official local judge flags, saved job flags[] and pinned defaults", "Source reachability combines official local judge flags, explicit Humming candidate override and pinned defaults")
+p.write_text(s)
+p=H/'render_target_argmax_overlay.py';s=p.read_text(encoding='utf-8-sig');s=s.replace("'overlay_sha256':sha(text.encode())", "'overlay_lf_normalized_sha256':sha(text.encode()),'overlay_file_sha256':sha(dest.read_bytes())");s=s.replace("'source_sha256':None if original is None else sha(original.encode())", "'source_lf_normalized_sha256':None if original is None else sha(original.encode())");p.write_text(s)

@@ -1,0 +1,7 @@
+Parallel native softcap row-argmax: NOT PROMOTED
+
+2800 changed-input payload cases pass bit-for-bit against pinned native, including empty/partial shards, seven adversarial patterns, four softcaps, rowstride, graphreplay and guards. Original4096-element/8-warp per-block arithmetic and strict sequential tile fold are preserved. API guards require nonnegative offsets and float32-exact index range.
+
+Local capturedGPU N8 speedup2.61085x (25256columns) and2.19888x (32768columns); all eight duplicate-control intervals are valid. Six larger-batch cells are about0.9677x to1.0290x and fail the predeclared>1.05lower-bound screen. Actual eager cells do not establish a win: six control intervals fail, while the two validN256 cells regress0.95588x/0.98367x. No retiming or source tuning was performed to chase favorable noise.
+
+No LMhead, actual allgather, acceptance, transformer or serving timing. Pinned Muse model-specific LMhead override forces FP32 output, so the native target deferred path is source-applicable despite globalflagfalse; actual vocabulary/cap checkpoint config is not authenticated. No serving hook was built. A stateful last-CTA scheme could remove a launch but introduces counterpublication/reset and graph/streamownership requirements; defer it untilH200trace establishes importance.

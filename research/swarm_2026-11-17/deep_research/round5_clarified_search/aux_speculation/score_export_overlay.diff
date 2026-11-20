@@ -1,0 +1,19 @@
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -263,6 +263,7 @@
+         self.selector = draft_model.candidate_selector
+         self.block_size = int(block_size)
+         self.sampling_enabled = sampling_enabled
++        self._research_score_export = None  # Explicit pre-capture attachment only.
+         max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
+         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
+         # Written by the host before replay, or read after it; the addresses are
+@@ -308,6 +309,8 @@
+             temperatures=self.temperatures[:bs],
+             greedy_mask=self.greedy_mask[:bs],
+         )
++        if self._research_score_export is not None:
++            self._research_score_export.capture_write(candidate_ids, scores, tokens)
+         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
+         self.candidate_out[:bs].copy_(candidate_ids)
+         self.q_out[:bs].copy_(q_rows)

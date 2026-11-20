@@ -1,0 +1,98 @@
+﻿Failure/lifecycle audit and minimal next validation (source-only)
+
+Scope: proposed early_projection_unapplied74d63805 + row_no_grad_unapplied07f4c518,
+relative to frozen joint530e. No frozen files changed; no new serving check.
+
+1. Actual startup order and streams
+Initial pools -> attention backends -> proposed row/N registration on eventual
+serving stream -> target EagerRunner warmup/prefill capture -> target decode capture
+-> draft capture -> idempotent sampling prewarm -> final KV resize. Model forward
+stream already exists. Non-overlap schedule stream is created once earlier and
+reused; actual scheduler AST controls cover this identity. Canonical graph stream
+is different but no FC adapter is selected inside the draft model capture: worker
+_append_target_hidden selects the projection during the existing append path,
+after target outputs, and the original model graphs remain separate. Router guards
+still reject unregistered streams; published shapes fall back via native slice plus
+the SAME all-gather, so one-rank plan absence cannot change collective sequence.
+
+Normal's first qualification occurs during eligible uncaptured target warmup.
+Its successful Arena remains in _STATE and reaches capture on the registered
+cuda_graph_capture stream. Prefill precedes decode (cuda_graph_setup421–437), so
+normal qualification can precede WGS decode scratch capture. If prefill disabled,
+no eligible warmup, or later runtime shape first enables normal, no such ordering
+proof exists: late qualification must reserve the whole current phase or stay
+native. Never free an Arena referenced by captured graphs to make room.
+
+2. Recoverable and fatal failures
+The existing row startup declares full shape lists and registration sequence on
+CPUgroup, catches local discovery exceptions, and takes all-rank MIN acceptance.
+Transport allocates before its readiness vote. Recoverable OOM on one rank causes
+coherent rejection before gather; fatal CUDA errors abort startup. A startup
+exception escapes run_scheduler_process, which signals parent failure; the
+one-shot initialized flag must not be treated as permission to retry that worker.
+Early hook adds no new CPU collective during CUDA capture or replay.
+
+Runtime published-shape fallback is deliberately collective-compatible: missing
+stream, changed metadata/policy, or local plan rejection computes native output,
+selects this rank's contiguous row view and participates in gather. Native full
+output remains alive until assembled output is complete. For M16384 the additional
+full output is268,435,456B; the local row view ordinarily aliases it. The phase
+ledger charges local33,554,432B too as a conservative bound. Original output plus
+gather cannot be assumed mutually exclusive on this path.
+
+Residual runtime error issue: RowPlan.local currently turns EVERY nonzero
+cublasLtMatmul status into None/native fallback. A vendor execution/internal error
+is not established recoverable by these local tests. A future production revision
+should distinguish pre-dispatch unsupported status from fatal execution failure
+and preserve process failure semantics; never mask a potentially damaged CUDA
+context or claim one-rank recovery after an asynchronous fatal error.
+
+3. Grad mode and calibration lifetime
+Frozen row factory lacked no_grad. model.eval() does not disable FC parameter
+autograd. Actual tiny CPU proof confirms reference can hold generated x after
+'del x', invalidating the input-released-before-gather phase assumption. Separate
+07f4c518 amendment applies @torch.no_grad to the entire factory, including transport
+and timing. N factory already has this guard. With this amendment the1.703GB source
+bound is conditional on native handles/reservations as documented; without it the
+conservative16K bound is1.9717GB. No serving-memory compliance claim either way.
+
+4. Recapture, stream changes and weights
+Worker initializer uses a one-shot flag set before first work. Graph recapture
+paths do not reset it; therefore they do not repeat synthetic calibration or
+allocate per-recapture projection workspaces. Existing projection plans and one
+workspace per serving stream remain. The early scheduler hook itself executes
+only initial worker startup. Additional configured buckets are never qualified
+implicitly; unsupported shapes stay native.
+This is not a reload lifecycle implementation. Scheduler weight updater can select
+draft runners and can recapture runner graphs, but no hook invalidates row/N
+adapters. Pointer/shape/stride/version guards catch ordinary replacement/version
+changes; inference tensors use version=None, which cannot detect same-storage
+in-place replacement. Static checkpoint scope is required. Before enabling hot
+reload, coherently disable both adapters while paused, synchronize all device work,
+destroy any graphs that reference them, close plans, then requalify under the
+current memory phase. Simply resetting the initialized flag is unsafe and may
+reintroduce the >3GB overlap. Reconfiguration that changes TP group or serving
+stream also requires explicit invalidation, not automatic new-stream scratch.
+
+5. Minimal next validation, only when suitable resources/quota are available
+- CPU source/control gates already completed: actual scheduler order8 cases,
+  existing row/N asymmetric registration controls, actual Torch grad-lifetime4cases,
+  AST parse and apply checks. Verify combined incremental patches against frozen
+  source and exact source hashes before any execution.
+- One small authorized GPU contract gate can use requires_grad=True FC weights
+  and actual factory no_grad, changed inputs, asymmetric recoverable failure, and
+  allocator events proving input freed before full gather. It must not allocate
+  the known-overbudget combined16K experiment. Existing realweight math evidence
+  remains separate; no extra performance claim follows this one-line fix.
+- Native TP8 startup: log rank-min remaining ownership budget and rank-max native
+  workspace; qualify only exact configured shapes whose phase bound fits. Capture
+  before/after memory_allocated, memory_reserved, historical peaks and cudaMemGetInfo
+  without resetting peaks. Distinguish baseline weights/pools/graph footprint from
+  new ownership; include native handles and NCCL/symmetric allocations.
+- Verify order logs: projection complete before normal Arena construction; normal
+  qualification before WGS capture; no repeated calibration during prewarm or
+  recapture. Verify actual plan latency gate activation on all ranks.
+- Exercise qualified full chunks, ragged native fallback, first/cached turns,
+  future forks and partial accepted draft lengths under original model output
+  checks. Report full TTFT/TPOT separately. No score request based on component
+  speedups or source ledger alone.

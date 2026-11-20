@@ -1,0 +1,94 @@
+2026-11-16 independent review of completed fresh-process memory pair
+
+Conclusion: no local preparation/graph peak-memory regression was measured.
+Humming persistent allocated storage is 7,680 bytes (7.5 KiB) higher. Both paths
+reuse graph scratch across the five captured buckets. Full-model H200 <=2 GB/GPU
+peak-delta compliance remains UNVERIFIED.
+
+Inputs and provenance
+  moe/memory_stock/memory.json
+    SHA256 2b0f090dd750b5c641b9f26f355f015908f0cf811d88adcf7c50ce3067e89f33
+  moe/memory_humming/memory.json
+    SHA256 42582d2f78ca00b84d4e7580e947907d4d17c5f9d01ee972600301ac54e9281b
+  Exact harness SHA256:
+    fac8570130f2aa84346ee2af5148afbeea82afcd3d7fa59261af13f501f620bc
+  Exact Humming NVFP4 source SHA256:
+    bc19ab1afd56f204b85c54ff4d80f22bb6c8214e75d978eff37cdef1eeeb0277
+  FP4 source SHA256:
+    426658ee8f7e5e9b226134097d84a57b6b865d51fa132ae7ca7099857c9663f4
+Both JSON reports say completed, contain five buckets, identical geometry,
+raw allocation, harness/export hashes, and pinned source provenance. MoE agent
+reported stock session 50420 exit 0 and Humming session 28422 exit 0. This reviewer
+did not launch GPU/compiler work. These are the coordinated local SM86 laptop
+runs, not H200 measurements; JSON does not independently record GPU model/UUID.
+
+Scope
+One synthetic local expert layer: E=32, global E=256, H=I=4096, top-k=8.
+Fresh processes; retained original tensor storage through the complete prepare
+call in both modes, then released at simulated loader-context exit. Shared graph
+pool and capture stream, largest-first buckets 256,128,32,8,1, one largest set of
+input buffers sliced for smaller buckets. Every captured graph reports pool[0,1]
+within its own process. Pool IDs are process-local, not cross-process sharing.
+Source-minimal runtime omitted package initializers, but selected arithmetic
+function bodies were unmodified; this is not a full serving construction test.
+
+Paired byte results (Humming minus stock; MiB uses 2**20)
+Metric                        Stock          Humming        Delta
+Raw allocated                 905970688      905970688      0
+Prepare peak allocated        1996490240     1845496832     -150993408
+Prepare peak reserved         2501902336     1847590912     -654311424
+Persistent allocated          905971200      905978880      +7680
+Persistent reserved           1008730112     941621248      -67108864
+Largest graph allocated peak  963696640      958485504      -5211136
+Max graph reserved peak       1124073472     1035993088     -88080384
+
+Preparation allocated peak improves by about 144 MiB and reserved by 624 MiB in
+this sample. Persistent allocated rises by 7.5 KiB, consistent with the larger
+Humming locks allocation versus the small stock workspace at allocator granularity.
+Do not extrapolate allocator reservation savings linearly over model layers.
+Both reports have zero original-storage intersections and zero surviving original
+Parameter weak references after preparation/context exit. This supports the
+source finding that old packed layouts are released rather than retained.
+
+Graph bucket results: delta peak allocated MiB / peak reserved MiB
+  M256: -4.969727 / -84
+  M128: -3.983398 / -84
+  M32:  -1.240723 / -84
+  M8:   -1.241699 / -104
+  M1:   -1.242188 / -104
+After-allocated is always exactly 7,680 bytes higher for Humming. For BOTH paths,
+each captured bucket increases after-allocated over before-allocated by exactly
+M*4096*2 bytes: 2,097,152; 1,048,576; 262,144; 65,536; 8,192. These are precisely
+the retained final output sizes. Thus this probe shows scratch reuse with no
+extra per-bucket persistent activation storage. Reserved memory does not grow
+monotonically by scratch size; temporary warmups/allocator packing still affect
+its peaks. Major cache13/cache2 storage equality from the source audit remains
+consistent with these measurements; lower transient peaks do not mean those
+nominal buffers disappeared.
+
+Evidence limits retained
+1. Single layer, only M<=256 and this synthetic shape/routing, local SM86. No
+   full-model sequential layers, actual prefill token sizes, target/draft graph
+   interactions, real EP/TP communication, or H200 WGMMA memory was measured.
+2. PyTorch allocator metrics exclude external CUDA driver/module/graph overhead.
+   There is no device-level peak memory trace in these JSON files.
+3. Shared-pool capture is tested, but serving GraphPoolPrecarve, graph borrowing,
+   full output-buffer policy and KV sizing lifecycle are not instantiated.
+4. Source-minimal helper extraction bypasses full loader/model construction. The
+   retained-originals fixture matches the audited preparation storage lifetime,
+   but it is not a full-model loading peak. Stock helper also retains original
+   data aliases itself throughout preparation; there is no demonstrated unfair
+   early-release advantage for stock in this final harness.
+5. Live-buffer replay checks verify all-inactive zero output and finite active
+   output. Numerical equivalence belongs to separate frozen-helper tests. After
+   the first bucket's replay mutations, smaller buckets use all-local routing;
+   this is matched A/B allocation evidence, not realistic workload timing.
+6. One fresh process per arm establishes this observed pair, not allocator
+   variance over repeated runs. No speedup can be inferred from memory peaks.
+
+Disposition
+Local preparation and graph-memory validation is improved and shows no material
+regression. Keep root's full-model H200 memory gate open: run matched complete
+stock/candidate startup, capture and replay, including the full combined package,
+per-rank device-visible and allocated/reserved peaks, and unchanged KV sizing
+inputs. Equality of final free memory after automatic KV resizing is insufficient.

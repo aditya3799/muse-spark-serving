@@ -1,0 +1,48 @@
+Fresh secondary engine sweep: exact format/hardware eligibility
+
+All sources/metadata are pinned under sources/nov10_sweep/other_engines. This is
+a bounded primary-source sweep, not proof that every engine/PR on the market has
+been examined. The initial query uses updated>=Nov10; creation may be earlier.
+The broad group_size16 query was polluted by issue-number matches and discarded.
+
+LMDeploy5142 (Nov16, open, head2e3592cf12d63b96d8adc27bb999fc92ace127f9)
+and5173 (Nov19 11:59:58, open, head6f0dc62301d2e13a59499a95659877a4122450b4):
+These are genuinely new NVFP4g16 engine integrations. They preserve packedE2M1
+and avoid activation quantization, but the actual5173 registration is
+Config_NVFP4<Sm80,half>, Family{kHalf,kHalf}; the source contradicts its PR prose
+saying BF16compute. NVFP4Format.finalize divides block scales by the checkpoint
+global and converts them toFP16, before the MMA. It therefore changes our
+activation dtype and original global/rounding boundaries. Not a drop-in candidate.
+SM75-only5142 does not changeSM80+ dispatch. 5161 is AWQ integerg128;5174 is
+MXFP4g32/GPT-OSS and states it adds no new kernel code. Those do not provide our
+NVFP4g16BF16 Hopper kernel. Exact config/format/registration leaves are archived.
+
+FlashInfer9581 (Nov17, open, headfd6d8549c6bdac3d3a748663711fa1c1c1f9413c):
+Real Hopper W4A16 code, but fixedE56/H3584/I3072/top16, MXFP4UE8M0 group32 and
+SiTU. Multiple prefill output paths call atomicAdd on BF16/BF162 outputs.
+Thus neither original format nor our FP32 combine contract matches. The PR's
+4.08x weighted number is against Marlin on synthetic routing/tensors for another
+model; it explicitly discloses L2-resident and decode-incumbent variance limits.
+No transfer of that speedup to this task. Its resident cooperative decode grid,
+stream-owned workspace and changed-input graph controls may inform future tests;
+they do not establish Muse compatibility.
+
+HuggingFace kernels-community1240 (createdOct16, stillopen; currenthead
+cbd5b592734823dd0f9eab1fd006c41e1a912033, updated within this sweep):
+Unlike the prior two, this source DOES have NVFP4g16 weight-only grouped Triton:
+formats.py accepts E4M3 group16+rawBF16; mma.py::mx_weight_upcast unpacks FP4 and
+multiplies the full group scale inBF16 before tl.dot. The scalar alternative
+reduces inFP32 per group then applies group scale, so it has another reduction
+order. grouped.py uses the same pure weight-only dispatcher for these formats.
+However, gemm_epilogue applies global scale toFP32acc before BF16store/GLU, and
+SIMULATE_UNFUSED has its own activation-rounding convention. This is not the
+scored customHumming boundary. Reported benchmark results/optimizations areB200,
+notHopper. Some paths are explicitlySM10x-scoped; ordinary dot/upcast has no
+such hard gate in the inspected leaf, but a full Hopper backend/runtime test is
+not performed. Its grouped/batched choice, swapped-weight small-token tiles and
+path autotuner are secondary source leads, not evidence of a newH200speedup.
+No downloaded implementation was imported or executed.
+
+The strongest new eligible structural source remains SGLang50800, with separate
+original, boundary-restored, and raw-scale-layout evidence. None of these sources
+proves2x serving against the scoredHumming parent or authorizes a submission.

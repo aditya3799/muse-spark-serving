@@ -1,0 +1,50 @@
+diff --git a/python/sglang/srt/speculative/dflash_info.py b/python/sglang/srt/speculative/dflash_info.py
+index 5826777..5503aeb 100644
+--- a/python/sglang/srt/speculative/dflash_info.py
++++ b/python/sglang/srt/speculative/dflash_info.py
+@@ -69,6 +69,7 @@ class DFlashVerifyInput(SpecInput):
+         target_worker: TpModelWorker,
+         *,
+         defer_metadata_init: bool = False,
++        defer_graph_init: bool = False,
+     ) -> tuple[ForwardBatch, bool]:
+         """Prepare a DFLASH verify forward batch for overlap scheduling.
+ 
+@@ -121,6 +122,9 @@ class DFlashVerifyInput(SpecInput):
+             # DP padding can change the live rows and graph eligibility.
+             # ModelRunner owns planning after final batch preparation.
+             return verify_forward_batch, can_run_cuda_graph
++        elif can_run_cuda_graph and defer_graph_init:
++            # The target runner stages graph inputs and metadata at replay.
++            return verify_forward_batch, can_run_cuda_graph
+         elif can_run_cuda_graph:
+             target_worker.model_runner.decode_cuda_graph_runner.load_batch(
+                 verify_forward_batch
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index 27b845e..233fad0 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -2847,10 +2847,11 @@ class DFlashWorkerV2(BaseSpecWorker):
+             batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+             batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
+ 
+-        verify_forward_batch, _ = verify_input.prepare_for_verify(
++        verify_forward_batch, graph_eligible = verify_input.prepare_for_verify(
+             batch,
+             self.target_worker,
+             defer_metadata_init=get_parallel().attn_dp_enabled,
++            defer_graph_init=is_cuda(),
+         )
+         batch.seq_lens_cpu = seq_lens_cpu_backup
+         batch.seq_lens_sum = seq_lens_sum_backup
+@@ -2877,7 +2878,9 @@ class DFlashWorkerV2(BaseSpecWorker):
+             forward_batch=verify_forward_batch,
+             is_verify=True,
+             skip_attn_backend_init=(
+-                None if _is_npu or get_parallel().attn_dp_enabled else True
++                None
++                if _is_npu or get_parallel().attn_dp_enabled or (is_cuda() and graph_eligible)
++                else True
+             ),
+         )
+         logits_output = target_out.logits_output

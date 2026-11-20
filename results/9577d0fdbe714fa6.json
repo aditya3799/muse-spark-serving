@@ -1,0 +1,16 @@
+﻿{
+    "id":  "9577d0fdbe714fa6",
+    "mode":  "run",
+    "team":  "aditya3799",
+    "board":  "serving",
+    "result":  null,
+    "status":  "queued",
+    "created_at":  1795157610.857914,
+    "payload_ref":  "serving/44bf747f07b2cb951433f8b6ce077dc1ce29f951b2673fc74396edba5efcfe7e.diff",
+    "content_hash":  "44bf747f07b2cb951433f8b6ce077dc1ce29f951b2673fc74396edba5efcfe7e",
+    "duplicate_of":  null,
+    "serving_flags":  {
+                          "--moe-runner-backend":  "humming",
+                          "--swa-full-tokens-ratio":  "0.35"
+                      }
+}

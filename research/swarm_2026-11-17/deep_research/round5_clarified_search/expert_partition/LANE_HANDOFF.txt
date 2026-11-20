@@ -1,0 +1,13 @@
+Hot-expert replication lane ? final checkpoint
+
+Native local result: replica_helper_01 passed in58.6seconds,10changed-route/weight/scale cases,46finite comparisons including28strict copy gates. Physical33/logical32 used the actual adaptive helper;38comparisons bitwise, eight local emulated EP sums differ by at most0.0078125. Peak tensor allocation10,015,232bytes. SM86 H=I256 only; no timing, H200, peer-copy, actual collective or serving claim.
+
+Main structural findings: generic EPLB is bypassed by scored Muse direct routing. Packed expert rows are independently copyable, but original physical33/40 counts trigger whole-helper fallback. The isolated capacity overlay retains physical bounds and original logical32 policy; default-off path is unchanged. Native full4096 copied expert row costs28,311,556bytes before other overhead, against TOTAL device delta2,000,000,000bytes PER GPU. All resident layers, copies, reallocation and workspace count.
+
+Placement oracle provides exactly-once routes and synthetic rank/tile work, not latency. Global row numbering must match across ranks; token-mod routing is not inherently balanced. Publication model closes abort-after-overwrite by poisoning; actual copy/consensus/graph lifecycle is still absent and the route constructor refuses activation.
+
+Evidence: REPLICA_QUALIFICATION.json pins CPU results and native receipt. PACKED_SLOT_COPY_CPU_RESULT.json uses actual source packing and scale transform. NATIVE_CAPACITY_DISPATCH_CPU_RESULT.json and CAPACITY_HEURISTICS_SOURCE_RESULT.json separate frozen original compute policy from physical-capacity regenerated heuristics. All failed preparation evidence retained.
+
+Independent Hopper review: HOPPER_FA3_FINAL_CPU_REVIEW.json; no new decisive source blocker in explicitly held component scope. Future decimal2GB accounting correction requested; native/fullModelRunner/serving remain unqualified.
+
+GPU lease released. Probe supervisor exited0; no owned Windows WSL processes remain. Independent Linux ps check could not start because WSL CreateInstance timed out; receipt itself confirms normal child completion. Two unrelated docker-desktop unregister processes were observed read-only and left untouched. No TTS/service actions, active serving edits, submissions, remote checks or additional jobs.

@@ -1,0 +1,72 @@
+Research-only target-prefill lead. No serving patch or activation.
+
+Problem: page-size-1 FP8 KV prevents Hopper FA3's TMA KV loader. The frozen
+backend still uses flash_attn_with_kvcache for generation prefill, after writing
+the original FP8 cache. Its raw-varlen skip-cache path is embedding-only and is
+not a valid generation shortcut: raw BF16 K/V would change attention inputs.
+
+Candidate: retain the original cache write and exact stored FP8 bytes. Gather
+these bytes into contiguous [batch, existing_page_table_capacity, heads, dim]
+K/V buffers, then use the SAME flash_attn_with_kvcache call with page_table=None.
+Keep cache_seqlens, cu_seqlens_q, cu_seqlens_k_new, max_seqlen_q, num_splits,
+causal, scaling, softcap, all descale tensors and output buffer unchanged.
+Preserve PackGQA=True. Unlike a switch to the varlen API, this leaves logical
+sequence metadata and cache capacity identical. Invalid page IDs beyond each
+sequence length are never loaded. Shared prefix pages are copied independently
+for each logical request, preserving ownership rather than deduplicating heads.
+
+Source provenance: sgl-project/sgl-flash-attn
+  f89bc2306632d1ec5f97b014dded4254f5b4a907
+Pin comes from frozen SGLang AOT CMake, documented by decode's followup_manifest.
+Actual deployed H200 binary hash remains unverified. Shared source snapshots:
+  research_2026-11-19/decode/sources/sgl-flash-attn
+Additional pinned headers in this directory's sources/.
+Primary URL:
+  https://github.com/sgl-project/sgl-flash-attn/tree/f89bc2306632d1ec5f97b014dded4254f5b4a907/hopper
+
+Source audit:
+- flash_api.cpp399: get_pagedkv_tma requires page_size divisible by native Ntile;
+  page1 is therefore non-TMA. Contiguous storage selects TMA.
+- tile_size.h59: FP8 D64 uses identical192x160 tile, RS PV, intra-WG overlap for
+  both paged and contiguous paths. Small effective Q<=64 uses64x128 in both.
+- heuristics.h10: single-MMA-WG depends only on unchanged Q/Hq/Hkv/D/arch.
+- heuristics.h17: varlen Q keeps PackGQA=True in both; explicitTrue documents it.
+- flash_api.cpp429: automatic split decision receives identical capacity,
+  totalQ, Qmax, head geometry, dtype, causal/local and tile inputs for D64.
+- flash_fwd_launch_template.h: same varlen dynamic scheduler, block shape,
+  stages2, cluster1, output type and accumulator type; only KV loading changes.
+- mainloop_fwd_sm90_tma_gmma_ws.hpp: PagedKVNonTMA selects Use_TMA_KV, while
+  D64's QK/PV MMA shape, FP8 P conversion, online-softmax traversal and rescaling
+  expressions are unchanged. This is strong source reasoning, not binary or
+  numerical proof. Different code generation can still change outputs.
+- flash_api.cpp711 rejects FP8 on SM8x. Local RTX3050 cannot provide native FP8
+  attention qualification. BF16 full-attention tests cover metadata/layout only.
+
+Initial eligibility for any future model integration would exclude SWA/local
+attention, cross-attention, CP, MLA, MXFP8, custom masks/bias/sinks, cascade/spec
+paths, and any geometry whose exact native dispatch is not audited. Generation
+EXTEND only. No current production eligibility or integration has been written.
+
+Memory/lifetime:128MiB total K+V arena cap, shared across sequential full layers,
+one bound forward stream, never resize/free after capture. Capacity is the
+existing metadata page-table width, not sum of logical lengths. FP8 Hkv2,D64
+needs256 bytes per batch*capacity: one80K request20.48MB;32*80K655.36MB exceeds
+the cap and must remain native. A bucket-compatible arena/view layout for BCG
+must be allocated before capture and refreshed entirely on every replay; the
+diagnostic currently uses an immutable per-geometry arena. Per-layer arena
+allocation would multiply memory by16 and is not acceptable. Native-call output,
+scratch and scheduler memory remain part of the real incremental peak audit.
+
+Evidence that motivates this audit, not a transferable measured speedup:
+references/gauravjain14-muse-okc-submissions/muse_prefill_layer/
+10_moe_wide_narrow_split_riders/notes/kv_NOTES.md reports a custom donor kernel's
+bit-identical direct page1 loader~1.8x slower than its packed/TMA path. It also
+overlaps packing with QKV projection. That custom implementation is not native
+FA3 and cannot establish this candidate's gain. Our first diagnostic includes
+packing cost serially; no overlap or H200 gain is assumed.
+
+Old H200 layer profile a1d2f61ed3534773.json has full-attention share8.9% at cold
+M16K,31.8% with32K cached prefix,43.7% with64K cached prefix; SWA only3.5% in its
+32K prefix case. Those are old kernel-track single-layer profiles with mocked
+collectives and different MoE/dense paths. The target has16full/46SWA layers.
+The43.7% value must not be presented as whole-model share or a serving forecast.

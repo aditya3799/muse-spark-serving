@@ -1,0 +1,20 @@
+Research-only Humming finalizer / all-reduce boundary audit.
+The existing Blackwell finalize-AR path cannot simply be enabled on Hopper:
+MuseSparkFP4Experts.forward(use_marlin=True, also Humming) returns _forward_marlin
+without consuming ar_workspace, while the caller skips its ordinary all-reduce
+when a workspace is present. An architecture-gate-only change would be wrong.
+The incumbent CuTe finalizer also has a different FP32 norm reduction tree than
+our frozen Triton finalizer. Do not substitute it as an exact implementation.
+
+Narrow experimental route: preserve the original inverse-RMS Triton kernel for
+M2..8. Fuse only its second tiled weighted combine with the existing one-shot
+push/reduce boundary. This is applicable to generic small-token MoE, not load
+levels. Required: same per-slot order, original BF16 output-scale multiplication,
+FP32 product/FMA convention, final BF16 rounding before inter-rank reduction,
+exact 32-bit Lamport zero-pair encoding, and increasing-rank FP32 summation.
+First local test compares native Triton combine + boundary reduction against a
+CUDA combine/reduction using supplied virtual-peer payloads. It tests arithmetic
+and local memory cost only; it does NOT measure NVLink, multicast, synchronization,
+whole MoE, or serving. No production activation or new remote run is authorized.
+If arithmetic or charged local chain regresses, reject rather than keep tuning.
+Actual peer protocol, graph replay and distributed ownership remain hard gates.

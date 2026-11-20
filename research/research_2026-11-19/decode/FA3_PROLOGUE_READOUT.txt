@@ -1,0 +1,65 @@
+FA3 prologue refinement: local component KEEP, no serving promotion
+Completed2026-11-19 within the parent-authorized bounded follow-up.
+
+Mechanism and scope
+Source-derived native18-head Q/K normalization and original BF16 rounding
+boundaries, with each K task also storing its raw V head. FP8 output bytes use
+a software implementation matching this installed Torch CUDA cast. Native
+FA3 attention, softmax, output norm, target blocks and communication are not
+executed by this fixture. There is no integrated serving patch.
+
+Correctness
+All65,536 BF16 input bit patterns match actual Torch CUDA BF16-to-FP8 bytes,
+including every NaN encoding, infinity and signed zero. Two independent
+controlled seeds pass all12 cases: M8/32/56/57/128/256, full and rotary/SWA
+locations,8 changed-input graph iterations each. Q bytes and complete K/V
+backing pools agree exactly; reserved slot0 stays untouched. Positions and
+sparse physical destinations change in-place between graph replays, and
+random, integer and signed scaled inputs are exercised. The56/57 threshold
+keeps the native18-head _triton_config behavior. No software output tolerance.
+
+Paired timing
+Each timing graph contains64 original operation calls;8 graph repeats give
+512 operations per sample. Eight AB/BA rounds include a duplicate native
+control. Both seeds use the identical final harness and candidate sources.
+Frozen research_2026-11-18_rl/score_trials.py and pinned kar statistics report:
+- seed2918357: KEEP,2.649638x,95%CI[2.634968,2.664080].
+- seed8375193: KEEP,2.629033x,95%CI[2.616138,2.642110].
+- local_keep=true under the existing aggregate noise criteria.
+Global duplicate-control effect/CI: first+0.104%[-0.092%,+0.302%]; second
+-0.306%[-0.709%,+0.061%]. The secondM32 rotary median control ratio0.9233 is
+explicitly noisy and retained; no cell was removed or rerun selectively.
+The first short-timing pilot had much worse control drift and is excluded.
+An attempted nested graph replay capture failed before timing; receipt kept.
+
+Second seed native/candidate median microseconds
+M8 full8.089/1.858, rotary8.191/1.925.
+M32 full8.474/2.682, rotary7.442/2.525 (noisy control cell).
+M56 full7.780/3.226, rotary8.110/3.379.
+M57 full7.693/2.909, rotary8.089/3.235.
+M128 full9.904/4.838, rotary10.430/5.374.
+M256 full16.893/8.387, rotary18.526/9.442.
+
+Limits and historical context
+Single SM86 GPU, synthetic QKV values and pool mappings, software conversion,
+warm graph repetition, exclusive GPU slot. No clock/power telemetry series was
+collected for this bounded screen; duplicate controls are present. H200 native
+conversion, model activations, full attention and full serving remain untested.
+The older decode_qkv fusion used20-head rows and a BF16-to-FP8 lookup table;
+its later wider decoder-chain result was neutral. This is an18-head reduction
+layout and packing refinement, not a new fusion boundary or a2x serving result.
+Production scale/pool/ownership guards remain design requirements in
+NATIVE_FA3_PROLOGUE_FUSION_PLAN.txt, not an implemented serving adapter.
+No remote job, quota request, scored submission, or release change from this
+lane. Frozen output-N package and queued candidate remain unchanged.
+
+Evidence in this directory
+fa3_prologue_experiment_manifest.json: exact source and receipt hashes.
+fa3_prologue_source.json: native source path/hash and generated variant hash.
+fa3_prologue_reward.json: full paired decisions, CIs, per-cell and noise data.
+fa3_prologue_2918357.json / fa3_prologue_8375193.json: raw samples/checks.
+fa3_prologue_7193851.json: noisy short-timing pilot, preserved.
+fa3_prologue_1837951.json and fa3_prologue_timing_harness_failure.json:
+incomplete nested-capture attempt, preserved.
+prepare_fa3_prologue.py / fa3_prologue_kernel.py / fa3_prologue_probe.py:
+reproducible isolated experiment; no production source mutation.

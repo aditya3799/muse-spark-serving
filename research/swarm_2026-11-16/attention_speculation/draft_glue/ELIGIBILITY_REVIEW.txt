@@ -1,0 +1,62 @@
+DRAFT GLUE CONFIGURATION AND RECAPTURE AUDIT - 2026-11-16
+
+Read-only evidence from scored run 468701af35b84e07 and pinned source:
+
+research_iteration_2026-11-15/startup.log:12 explicitly records
+enable_unified_memory=False and enable_page_major_kv_layout=False.
+Lines165/173 etc record separate BF16 draft KV allocation, 1888912tokens,
+4.51GB. Lines230 etc record separate draft hierarchical host pool.
+The unified radix cache logged at174 refers to the cache tree/components;
+it does not imply a unified device KV allocator.
+
+kv_cache_configurator.py:1101 requires enable_unified_memory for fused draft
+placement. Its ordinary target pool initialization also only constructs a
+UnifiedSWA/Mamba allocator when that flag is enabled (~600). The draft
+binding path at650 only binds a fused region if sharing such an allocator.
+kv_index_translator.py:137-150 sets is_translating only for the unified
+target's own pool or a fused draft pool bound to its host allocator.
+Thus the logged judge configuration does not become translated merely
+because hierarchical cache/unified radix tree is enabled. The documented
+reads_are_translated property at643 is false on non-unified pools.
+
+Compact draft cache is orthogonal: dflash_worker_v2.py:670-683 explains that
+windowing gives the draft a private compact request-to-token table over
+the SAME global KV index space and shared allocator. It does not replace
+the draft storage with a fused/translated pool. The narrow glue graph reads
+the persistent table tensor and observes its in-place rebuilds each step.
+
+Released configuration obtained from primary public repository, commit
+46c90f4, via Files -> config.json on 2026-11-16:
+https://huggingface.co/RadixArk/Muse-Spark-Open-DFlash2/blob/main/config.json
+Architecture DFlash2DraftModel, model_type qwen3, five sliding_attention
+layers, window2048, is_causal=false, BF16, no is_hybrid_swa field.
+Pinned model_config.py:2651 does not recognize DFlash2DraftModel as hybrid
+SWA; Qwen3 has no hybrid-pool opt-in. is_local_attention_model at2549 only
+recognizes Llama4. DFlashDraftModel/2 define no is_prefill_aware_swa hook.
+Generic pool dispatch therefore uses ordinary MHATokenToKVPool for this
+non-MLA, non-hybrid/non-Mamba draft (kv_cache_configurator.py:1779-1920,2742).
+The attention window sets has_swa=True, but does not set use_sliding_window_
+kv_pool. Only topk>1 uses additional SWA verify metadata. Our topk<=1 path
+builds ordinary page metadata, independent of layer window/causality.
+Therefore the narrow glue opt-in should enable in the logged judge setup;
+the remaining limitation is no actual judge run of this experimental change.
+Raw/blob direct web opens initially failed; following the repository's
+Files/config hyperlink succeeded. Both older startup_5183861a98ee4825.log
+and startup_full_5183861a98ee4825.log were checked and contain the same
+truncated data, not a separately complete model-config initialization log.
+The existing startup message 'no host-free draft prep' at94 demonstrates
+runner is a draft and SGLANG_RAGGED_VERIFY_MODE=static, because
+decode_cuda_graph_runner.py:1713-1723 consults backend only in that case.
+
+Production recapture lifecycle:
+ModelRunner.recapture_decode_cuda_graph at1627 calls init_decode_cuda_graph
+at1605, which discards the old runner. capture_decode_graph constructs
+GraphRunnerCls(model_runner) anew at cuda_graph_setup.py:779. Elastic
+recapture similarly discards old runner at model_runner.py:2435.
+New DecodeCudaGraphRunner creates a new MetadataGlueGraph at573-574.
+No production direct second call to old decode_runner.capture was found.
+Therefore supported recapture replaces stale glue addresses. Arbitrary
+external replacement of pool/request buffers within a live runner is not
+validated or promised. Existing tests intentionally cover in-place changes.
+
+Candidate remains experimental; no full-draft/acceptance/serving validation.

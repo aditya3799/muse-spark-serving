@@ -1,0 +1,24 @@
+﻿# DFlash context-path results on one RTX 3050
+
+The measured parent is the 1.2363 scored build from job `317c88a5fd474cd2`, with patch SHA256 `8c7547213fb993a318321a26f84e2872db8c87b358ee3d3ea638695702b0dc2b`. The pinned checkout is `297e54fd105e974cdf401e5b4d20253a22c16f90`. These experiments used one RTX 3050 Laptop 6 GB (SM86), PyTorch 2.6.0+cu124, Triton 3.8.0, independent synthetic BF16 weights per seed, and changing inputs with checkpoint-matched dimensions. They establish component performance and correctness within these tests.
+
+| Experiment | Pilot | Independent holdout | Eligibility |
+| --- | ---: | ---: | --- |
+| Prefix-compact 40,960→8,192 FC | Failed parity | Failed parity | Different native GEMM geometries changed retained BF16 values. |
+| Direct KV, isolated 8,192→1,280 FC + five-layer write | 1.810× | 1.964× | Plain BF16 NHD draft cache and per-request decode commit lengths. |
+| Direct KV, complete tested capture/FC/RMS/KV chain | 1.0019× | 1.0000× | Both local intervals include 1. |
+| Packed target taps, same complete chain | 1.0122× | 1.0152× | Upstream model already provides the five FP32 residual snapshots. |
+| Both changes, same complete chain | 1.0174× | 1.0147× | Trace interval 1.0082–1.0209× on holdout. |
+
+The coupled trial preserved the packed hidden values, normalized BF16 output, draft-KV projection and physical cache contents exactly across both seeds and all four batch sizes. The “complete chain” covers the producer capture/pack and consumer projection/update subset. It excludes producing the five residuals in full target layers, target verification, the remaining draft network, tensor parallelism and scheduling. It does not establish an end-to-end H200 score. The isolated KV speedup was fully diluted on the coupled holdout. The change with packed taps did not consistently improve on packed taps alone.
+
+The packed target path alternated 20 real executions per arm per load using a 5-arm cyclic Latin square and its inverse. The canonical reward inputs use reciprocal pairs, while each `joint_*_detail.json` preserves chronological order, per-arm wall/device times, output checks and sampled clock/power. The GPU reached 83.1 °C on the largest held-out rung. Clock/power observations include whole-rung warm-up and synchronization intervals; the short rungs have only 3–5 samples.
+
+The hidden-state normalization uses the actual FlashInfer 0.7.2 native CUDA BF16 RMSNorm kernel. Its archive hash is pinned in `build_rms.ps1`. The bridge compiles native source for SM86 using CUDA 12.4 and Visual Studio. H200 can select an alternative backend from the same FlashInfer release. Comparing native CUDA RMS output with explicit FP32 PyTorch RMS arithmetic yielded at least 99.9996% identical BF16 outputs on the heldout shapes, with a maximum absolute difference of 0.0078125. Every arm used the same native upstream kernel. On the held-out direct-cache trial, the full terminal K/V backing buffers and both retained and rejected physical slots agreed bit-for-bit. The 40,960→8,192 compaction trial's mismatch counts and per-input geometry are in `heldout.json`.
+
+The direct-KV hook preserves the original norm, rotary transform and storage dtype. For compatible prefix-valid writes, it sends their results directly to the pool's physical per-layer addresses. Five downstream write launches and temporary K/V traffic disappear. The 13 CPU admission checks include 753- and 16,384-token prefills, which follow the original path, and nonstandard storage, dtype and layout fallbacks. Previous H200 startup logs confirm BF16 draft cache storage in the challenge configuration. Live dispatch and coupled throughput on an 8×H200 job remain unverified.
+
+The CPU-only commands `python build_kv.py`, `python build_kv_trial.py`, `python test_kv_dispatch.py`, `python package_kv.py`, `.\build_rms.ps1`, and `python joint_bench.py cpu` regenerate sources and verify dependencies. Use `python kv_bench.py pilot` / `heldout` for the isolated trial and `python joint_bench.py pilot` / `heldout` for the coupled trial. The full parent+direct patch is `direct_kv_parent.diff`, and the full parent+packed+direct patch is `packed_taps_direct_kv.diff`. Both apply to a clean temporary index at the pinned revision. Only SGLang Python code appears in the patches. No run or submission was initiated.
+
+The pinned upstream sources define the [DFlash2 worker](https://github.com/sgl-project/sglang/blob/297e54fd105e974cdf401e5b4d20253a22c16f90/python/sglang/srt/speculative/dflash_worker_v2.py), [fused KV arithmetic](https://github.com/sgl-project/sglang/blob/297e54fd105e974cdf401e5b4d20253a22c16f90/python/sglang/kernels/ops/speculative/fused_kv_materialize.py), [native RMSNorm option](https://github.com/flashinfer-ai/flashinfer/blob/v0.7.2/include/flashinfer/norm.cuh) and [draft checkpoint geometry](https://huggingface.co/RadixArk/Muse-Spark-Open-DFlash2/blob/main/config.json).
+

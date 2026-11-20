@@ -1,0 +1,11 @@
+Four WGS vendor-CFG hazard audits repaired and rerun, 2026-11-19.
+
+Prior passes were incomplete: native BRA handling omitted three unpredicated BRA.DIV fallthroughs in each binary. Earlier report/script copies are preserved as *_before_bra_div_repair.*. Current finite_vendor_cfg_audit.json files supersede them.
+
+All four final audits pass with zero reported RS/accumulator hazards, all 512 RS sites reachable per artifact, complete vendor instruction reachability, and complete DOT-edge parsing. Vendor block/edge counts: finite1114/1588; register1174/1648; split-ready1210/1748; split-dependency1274/1812. All three BRA.DIV edges and four indirect branch sites are included per binary. Negative omitted-edge and injected A-write controls both detect the fault.
+
+CALL callee edges remain conservatively present even though vendor DOT shows only fallthrough. Their two reachable helper bodies have no GMMA/DEPbar; all helper ordinary register writes remain analyzed. This is an artifact-specific summary, not a general interprocedural checker proof. Omitted terminal self-BRA/NOP padding is after all CFG instructions and has no incoming covered edge or entry reachability.
+
+No frozen candidate, cubin, SASS, vendor CFG, upstream state analysis, GPU workload, or serving setting was changed. No native GPU correctness or speed conclusion follows. Root separately owns original/boundary PR50800 donor audits.
+
+See wgmma_bra_div_repair_review.json for exact source/report hashes, controls, coverage and preserved earlier receipts.

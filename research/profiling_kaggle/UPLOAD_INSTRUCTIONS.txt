@@ -1,0 +1,6 @@
+Upload only 01_kaggle_v4_preflight.ipynb to a private Kaggle notebook.
+Choose GPU T4 in Settings > Accelerator; Internet can remain off.
+Run All, then download v4_preflight_*.zip from the final link or output/file panel.
+Return that ZIP before building the next profiling notebook.
+Triton/Marlin skips on T4 are expected. No H200 or serving percentages are claimed.
+Stop the interactive GPU session when done. Save & Run All would run it again.

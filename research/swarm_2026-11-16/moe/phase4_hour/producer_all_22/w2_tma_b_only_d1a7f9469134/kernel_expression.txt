@@ -1,0 +1,13 @@
+humming<
+    MmaOpClass,
+    Shape<0, 4096, 4096>,
+    Shape<48, 128, 128>,
+    Shape<48, 32, 64>,
+    Shape<0, 0, 0>,
+    FloatingPointType<16, 8, 7>,
+    FloatingPointType<4, 2, 1>,
+    FloatingPointType<16, 8, 7>,
+    FloatingPointType<8, 4, 3>,
+    LayerConfig,
+    ComputeConfig,
+    TuningConfig>

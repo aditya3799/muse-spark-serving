@@ -1,0 +1,38 @@
+LOCAL RESEARCH CHECKPOINT - 2026-11-17
+
+This additional four-agent structural pass ran from 13:35:29 UTC to approximately 15:53 UTC (about 2 hours 18 minutes). It followed the earlier research rounds. The 2.5x whole-serving target is NOT established. Confirmed whole-serving score remains 1.2237x. No new score or numerical confidence percentage is projected.
+
+User constraints honored: TTS was left untouched; reduced local fixtures and a 512 MiB reserve were used. No H200 or paid compute, no submissions or new remote checks, and no active serving/patch edits. The final full-helper fixture peaked at 567 MiB. Shared-GPU timings are provisional.
+
+DECISIVE COMPLETE-HELPER RESULT
+The new canonical-weight swap-AB kernel passed staged arithmetic gates and 134 complete-helper finite/bitwise checks against the frozen scored reference. This includes changed routes, weights and group scales, W13, activation, W2 and finalizer. The local E8/M32 reduced fixture preserves the reference light BK64/WK32 and heavy BK128/WK64 reduction sequences and cutoff16.
+
+Same-geometry swap is effectively 1x. The BM8/BM24 variant gives only about 0.4-0.7% on uniform/mixed routes and regresses about 1.3-1.4% on hot routes. Warm empty-rank timing failed stability controls; its ratio is excluded. Cold empty-rank timing is about 3% worse. This local variant is NOT promoted; there is no reason for a blind follow-on tile sweep.
+
+Cold absolute median microseconds, reference / same-geometry swap / BM8-BM24 swap:
+  uniform: 1406.46 / 1410.56 / 1398.78
+  hot:     3796.99 / 3798.53 / 3853.31
+  mixed:    765.95 /  770.05 /  762.88
+  empty:     24.576 / 25.088 / 25.600
+Paired ratios are stored separately in the raw receipt; ratios of these medians need not match them exactly.
+Evidence: expert_partition/swap_fullhelper_01/results.json and SWAP_FULL_HELPER_VERDICT.json.
+
+OTHER CONCRETE FINDINGS
+1. Compact routing plus fused W13 passed changed-route M32 and M129 gates. Candidate activation scratch fell from 3SH to 2SH (one-third less). Nonempty local M32 throughput gain was only about 1-3%. Native SM90 light/heavy fused kernels compile without spills, but actual tensor-map execution remains untested.
+2. BF16 materialization was iteratively improved: register spills removed, then a native vector-store converter replaced the narrower Triton converter. Conversion became much faster, but complete helper variants remained slower. N256 staging was about0.405x reference; the N128/BM16 causal test was about0.3005x. Its matched W4 control also regressed, and profiling added13-15%, so phase timings are intrusive diagnostics. The local BF16 staging branch is closed.
+3. Indexed G2 swizzle and queue-only changes showed no local gain. The LUT decode alternative increased static instructions and was held.
+4. Chord source was pinned at6199d44a863a165139d2fd8387b307bbe21f1ca9 without installing it. Its INT4/group32 mechanism was adapted only in isolated exact NVFP4/group16 prototypes. Direct canonical weight-to-MMA-A mapping avoids a second persistent weight copy; its scale lane selector was independently proven. Directly transferring Chord's token-loop guard to WGMMA was rejected because that loop indexes output channels.
+5. Raw FP32 swap/standard equality was checked before pipeline integration. Two32-wide versus two64-wide K banks were distinguished with an engineered cancellation counterexample. A separate four-bank microgate reproduced the exact tree (p0+p2)+(p1+p3), with deliberately wrong trees failing. Four-bank pipelined W2 and native WGMMA numerical equivalence remain unqualified.
+6. Native SM90 BM8 swap has a possible two-CTA resource capacity. The unchanged persistent launch requests only one CTA/SM, so resource savings alone do not produce that residency. A narrowly guarded CTA2 offline build passes at128 registers/thread,256 threads,82944 bytes shared and zero spills. It has NOT run on H200. BM24 swap still permits only one CTA and fewer active warps than its original WGMMA comparison.
+7. NVIDIA hardware profiling counters were unavailable (ERR_NVGPUCTRPERM). Ordinary CUDA experiments and offline compilation continued. This was not a one-hour research limit or an automatic approval rejection.
+
+WHAT REMAINS
+The largest earlier local gains remain the K-preserving prefill partition and corrected hot-route M2/fusion paths, with routing-sensitive results. They cannot be multiplied with alternative backend ratios or converted into a whole-serving forecast. Native H200 component/full-serving execution, target workload critical-path fractions, output checks, TTFT and memory validation are still needed to establish2.5x. No claim is made that all possible local research is exhausted.
+
+INTEGRITY AND CLEANUP
+sglang HEAD:297e54fd105e974cdf401e5b4d20253a22c16f90
+Scored candidate.diff SHA256:8b3ed81e053e4ccb2a043afd25cb94bb49017995ece517bb35aeb6e1b79e026b
+Root patch.diff SHA256:cf02617f790e28c9229ac9aec5e517f04344c49491347ef732a352fbaa3aa4a4
+Both hashes match the starting values. Pre-existing dirty files were preserved. No research workers remained at cleanup. Only verified owned keepalive PIDs544 and39631 were stopped; TTS was not touched. No research is claimed to continue after the final reply.
+
+Read SESSION_STATE.json, PRIORITY_REVIEW.json, BRANCH_COMPOSITION_REVIEW.json and lane checkpoints for reproducible details. Failed attempts and negative controls are retained.

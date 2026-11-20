@@ -1,0 +1,9 @@
+PREPARED COMMANDS -- NOT EXECUTED
+
+First, run the unscored 16-user check:
+wsl.exe -d Ubuntu --cd /mnt/d/OpenKernelChallenge/serving --exec env XDG_CONFIG_HOME=/mnt/d/OpenKernelChallenge/.config /mnt/d/OpenKernelChallenge/bin/okc serve check /mnt/d/OpenKernelChallenge/serving/release_2026-11-18/candidate.diff --users 16 --flag moe-runner-backend=humming --no-wait
+
+Only after inspecting its correctness, later-turn, memory, startup and indicative performance result, consider the scored ladder:
+wsl.exe -d Ubuntu --cd /mnt/d/OpenKernelChallenge/serving --exec env XDG_CONFIG_HOME=/mnt/d/OpenKernelChallenge/.config /mnt/d/OpenKernelChallenge/bin/okc serve submit /mnt/d/OpenKernelChallenge/serving/release_2026-11-18/candidate.diff --flag moe-runner-backend=humming
+
+Do not automatically submit or retry an uncertain response. The existing proven parent is already scored; duplicating it does not create a new optimization.

@@ -1,0 +1,599 @@
+diff --git a/docs/config.md b/docs/config.md
+index 26ef8808..f76bacc2 100644
+--- a/docs/config.md
++++ b/docs/config.md
+@@ -148,10 +148,10 @@ block-scaled, channel, tensor, and block-scale layouts are unchanged.
+ | `float8e4m3` / `float8e5m2` / `int8` | 16, 32, 64 | 64, 128 |
+ | `float4e2m1` / `int4` | 16, 32, 64 | 128, 256 |
+ 
+-With `use_packed_k_layout`, warp N must be at least 32. Activation scale groups,
++With `use_packed_k_layout`, warp K must be 128 and warp N can start at 16. Activation scale groups,
+ when present, must cover warp K. Weight scale groups must also cover warp K unless
+ `use_fused_e8m0_scale` is enabled; fused conversion applies each K32 slab's weight
+-scale before WGMMA, so GS32 weights can use warp K64 or K128. Fused packed-K
++scale before WGMMA, so GS32 weights can use packed warp K128. Fused packed-K
+ remains opt-in; the default layout selection is unchanged.
+ 
+ `raster_group_m` controls M tile grouping for dense and grouped-contiguous GEMMs.
+@@ -165,12 +165,21 @@ advances. A value of 1 uses the existing forward warp scan without the prefix ta
+ |-----------|-------------|
+ | `num_stages` | Number of pipeline stages. Must be at least 2. Must be at least 3 when using `use_warp_spec` with WGMMA. |
+ | `use_warp_spec` | Whether to enable Warp Specialization. Requires SM90+. Required for UMMA. |
++| `wgmma_use_late_as` | Delay per-group input-scale register loads until WGMMA accumulator promotion. Defaults to `False`; requires WGMMA with per-group input scales. |
++| `wgmma_split_issue_wait` | Prefetch the next fragment between WGMMA issue and wait. Defaults to `False`; independent of input-scale granularity and `wgmma_use_late_as`. |
+ | `use_mbarrier` | Whether to use MBarrier. Requires SM80+. |
+ | `use_cp_async` | Whether to use CP Async. Requires SM80+. |
+ | `num_ctas_per_sm` | Number of CTAs (Cooperative Thread Arrays / Thread Blocks) launched per SM. |
+ | `umma_cta_group_size` | `1` (default) or `2`. With `2`, a cluster of two CTAs cooperatively executes UMMA for adjacent N tiles. This is independent of CTA residency and TMA multicast. |
+ | `output_chunk_rows` | Output rows per shared-memory chunk for every MMA backend. `0` (default) writes a full tile; positive values must be multiples of 32 up to 256 and are clamped to tile M. Partial final chunks are supported. UMMA alternates two buffers; other backends reuse one buffer. Supports TMA and regular stores, Stream-K, and MoE scatter. Replaces `num_write_splits` (use half of tile M to reproduce two splits). |
+ 
++The two `wgmma_*` options apply only to WGMMA and support both warp-specialized
++and non-warp-specialized kernels. Per-group inputs support all four combinations;
++per-token and per-tensor inputs must leave `wgmma_use_late_as` disabled. They keep
++the existing weight layout and weight-scale consumption order; scale prefetches
++that would overwrite a live scale buffer wait until the current promotion finishes.
++Tune these options together with tile shapes, pipeline stages, and Stream-K.
++
+ ### TMA (Tensor Memory Accelerator)
+ 
+ | Parameter | Description |
+diff --git a/humming/config/config.py b/humming/config/config.py
+index ab8b0ffe..c0dd082a 100644
+--- a/humming/config/config.py
++++ b/humming/config/config.py
+@@ -501,6 +501,10 @@ class TuningConfig(BaseHummingConfig):
+ 
+     use_stream_k: bool = True
+ 
++    # WGMMA mainloop scheduling; independent of the packed weight layout.
++    wgmma_use_late_as: bool = False
++    wgmma_split_issue_wait: bool = False
++
+     num_stages: int = 2
+     num_ctas_per_sm: int = 1
+     umma_num_dequant_warpgroups: int = 1
+@@ -540,6 +544,8 @@ class TuningConfig(BaseHummingConfig):
+     )
+ 
+     _name_map = {
++        "wgmma_use_late_as": "kWgmmaUseLateAS",
++        "wgmma_split_issue_wait": "kWgmmaSplitIssueWait",
+         "use_mbarrier": "kUseMBarrier",
+         "use_tma_as": "kUseTmaAS",
+         "use_tma_as2": "kUseTmaAS2",
+diff --git a/humming/config/mma.py b/humming/config/mma.py
+index c0c489d7..0d9e1b49 100644
+--- a/humming/config/mma.py
++++ b/humming/config/mma.py
+@@ -117,9 +117,14 @@ def get_register_budget_error(layer_config, tuning_config, use_f16_accum=False,
+         instruction_accumulators = warp_m // (4 if use_f16_accum else 2)
+         instruction_overhead = 26 if layer_config.use_raw_weight else 30
+         instruction_registers = instruction_accumulators + instruction_overhead
++        if layer_config.use_packed_k_layout and tuning_config.wgmma_split_issue_wait:
++            # Split packed-K keeps all RS K slabs live across prefetch. The
++            # per-instruction overhead already includes four operand registers.
++            packed_operand_registers = warp_k * layer_config.a_dtype.num_bits // 64
++            instruction_registers += packed_operand_registers - 4
+         if instruction_registers > launch_budget:
+             return (
+-                "register budget exceeded: WGMMA instruction requires at least "
++                "register budget exceeded: WGMMA issue requires at least "
+                 f"{instruction_registers} registers per thread; launch budget {launch_budget:g}"
+             )
+ 
+diff --git a/humming/include/humming/epilogue/pipeline.cuh b/humming/include/humming/epilogue/pipeline.cuh
+index cbd53e7e..d533f512 100644
+--- a/humming/include/humming/epilogue/pipeline.cuh
++++ b/humming/include/humming/epilogue/pipeline.cuh
+@@ -50,6 +50,9 @@ public:
+ 
+   CUDA_INLINE
+   void call(uint32_t *regs_c_ptr) {
++    // Issuing threads drain the previous tile before any math thread reuses its output storage.
++    if constexpr (Ctx::kUseWarpSpec && Ctx::kUseTmaC && Ctx::kSmemReuseMode == SmemReuseMode::NONE)
++      tma_wait_store_group<0, true>();
+     ctx.sync_math_threads();
+     if constexpr (BlockShape::K > WarpShape::K) smem_reducer.reduce(regs_c_ptr);
+     if (slice_count > 1) acquire_gmem_barrier();
+diff --git a/humming/include/humming/kernel/humming.cuh b/humming/include/humming/kernel/humming.cuh
+index 2319d81e..59dcc779 100644
+--- a/humming/include/humming/kernel/humming.cuh
++++ b/humming/include/humming/kernel/humming.cuh
+@@ -136,22 +136,48 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
+       if (remaining_iters == 1) producer.load_channel();
+       PRAGMA_UNROLL
+       for (uint32_t warp_iter_id = 0; warp_iter_id < Ctx::kWarpIters; warp_iter_id++) {
+-        if constexpr (Ctx::kWarpIters == 1) {
+-          mma.run(stage_id, warp_iter_id);
+-          __syncthreads();
+-          if constexpr (kNumStages > 2) {
+-            producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
++        if constexpr (Ctx::kWgmmaSplitIssueWait) {
++          mma.issue(stage_id, warp_iter_id);
++          if constexpr (Ctx::kWarpIters == 1) {
++            // Refill a different stage; the current WGMMA stage stays live until wait.
++            __syncthreads();
++            if constexpr (kNumStages > 2)
++              producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
+           }
+-        }
+-        if (warp_iter_id == Ctx::kWarpIters - 1 && remaining_iters > 1) {
+-          consumer.wait_stage((stage_id + 1) % kNumStages);
+-        }
+-        s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
+-        if constexpr (Ctx::kWarpIters > 1) mma.run(stage_id, warp_iter_id);
+-        if (Ctx::kWarpIters > 1 && warp_iter_id == Ctx::kWarpIters - 2) {
+-          __syncthreads();
+-          if constexpr (kNumStages > 2) {
+-            producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
++          if (warp_iter_id == Ctx::kWarpIters - 1 && remaining_iters > 1)
++            consumer.wait_stage((stage_id + 1) % kNumStages);
++          const bool use_late_scale_prefetch = Ctx::kUseWgmmaLateScalePrefetch && warp_iter_id == Ctx::kWarpIters - 1;
++          if (use_late_scale_prefetch)
++            s2r_pipe.load_stage_iter_data(stage_id, warp_iter_id + 1);
++          else
++            s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
++          mma.wait_and_promote(stage_id, warp_iter_id);
++          if (use_late_scale_prefetch)
++            s2r_pipe.load_stage_iter_scales(stage_id, warp_iter_id + 1);
++
++          if (Ctx::kWarpIters > 1 && warp_iter_id == Ctx::kWarpIters - 2) {
++            __syncthreads();
++            if constexpr (kNumStages > 2)
++              producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
++          }
++        } else {
++          if constexpr (Ctx::kWarpIters == 1) {
++            mma.run(stage_id, warp_iter_id);
++            __syncthreads();
++            if constexpr (kNumStages > 2) {
++              producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
++            }
++          }
++          if (warp_iter_id == Ctx::kWarpIters - 1 && remaining_iters > 1) {
++            consumer.wait_stage((stage_id + 1) % kNumStages);
++          }
++          s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
++          if constexpr (Ctx::kWarpIters > 1) mma.run(stage_id, warp_iter_id);
++          if (Ctx::kWarpIters > 1 && warp_iter_id == Ctx::kWarpIters - 2) {
++            __syncthreads();
++            if constexpr (kNumStages > 2) {
++              producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
++            }
+           }
+         }
+         mma.transform_b(
+diff --git a/humming/include/humming/kernel/humming_ws.cuh b/humming/include/humming/kernel/humming_ws.cuh
+index c9cb2663..049c9d4f 100644
+--- a/humming/include/humming/kernel/humming_ws.cuh
++++ b/humming/include/humming/kernel/humming_ws.cuh
+@@ -202,20 +202,26 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
+         debug_kernel_timeout_check(debug_start_clock);
+         PRAGMA_UNROLL
+         for (uint32_t warp_iter_id = 0; warp_iter_id < Ctx::kWarpIters; warp_iter_id++) {
+-          // Packed N16 keeps B live until wait_and_promote, but can prefetch
+-          // the next quantized weights while the current WGMMA is in flight.
+-          if constexpr (Ctx::kUsePackedLateAS)
++          // Keep register operands live until wait_and_promote while prefetching
++          // the next stage/fragment and delaying scale loads until promotion.
++          if constexpr (Ctx::kWgmmaSplitIssueWait)
+             mma.issue(stage_id, warp_iter_id);
+           else if constexpr (Ctx::kWarpIters == 1)
+             mma.run(stage_id, warp_iter_id);
+           if (warp_iter_id == Ctx::kWarpIters - 1 && slice_iter + 1 < num_slice_iters) {
+             consumer.wait_stage((stage_id + 1) % kNumStages);
+           }
+-          s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
+-          if constexpr (Ctx::kUsePackedLateAS)
++          const bool use_late_scale_prefetch = Ctx::kUseWgmmaLateScalePrefetch && warp_iter_id == Ctx::kWarpIters - 1;
++          if (use_late_scale_prefetch)
++            s2r_pipe.load_stage_iter_data(stage_id, warp_iter_id + 1);
++          else
++            s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
++          if constexpr (Ctx::kWgmmaSplitIssueWait)
+             mma.wait_and_promote(stage_id, warp_iter_id);
+           else if constexpr (Ctx::kWarpIters > 1)
+             mma.run(stage_id, warp_iter_id);
++          if (use_late_scale_prefetch)
++            s2r_pipe.load_stage_iter_scales(stage_id, warp_iter_id + 1);
+           mma.transform_b(
+               ((warp_iter_id + 1) % Ctx::kWarpIters) % 2,
+               (warp_iter_id + 1) % Ctx::kWarpIters);
+@@ -243,12 +249,17 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
+ 
+       if constexpr (kCanOverlapEpilogue) consumer.arrive(kNumStages);
+       epilogue.call(mma.final_regs_c_as_ptr());
+-      if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
++      // Separate output storage is drained at the next epilogue entry, before reuse.
++      if constexpr (TuningConfig::kUseTmaC && kSmemReuseMode != SmemReuseMode::NONE) tma_wait_store_group<0, true>();
+       if constexpr (!kCanOverlapEpilogue) consumer.arrive(kNumStages);
+       if constexpr (Ctx::kIsIndexedGemm) ctx.row_index_buffer ^= 1;
+     }
+   }
+ 
++  // The final tile has no following epilogue entry to drain its TMA reads.
++  if constexpr (TuningConfig::kUseTmaC && kSmemReuseMode == SmemReuseMode::NONE) {
++    if (ctx.is_math_thread()) tma_wait_store_group<0, true>();
++  }
+   __syncthreads();
+   if constexpr (TuningConfig::kMultiCastSizeA * TuningConfig::kMultiCastSizeB > 1) {
+     asm volatile("barrier.cluster.arrive;\n");
+diff --git a/humming/include/humming/memory/s2r_pipeline.cuh b/humming/include/humming/memory/s2r_pipeline.cuh
+index 215ee698..4f73a79e 100644
+--- a/humming/include/humming/memory/s2r_pipeline.cuh
++++ b/humming/include/humming/memory/s2r_pipeline.cuh
+@@ -64,32 +64,46 @@ public:
+ 
+   CUDA_INLINE void seek(uint32_t m_offset) {
+     if constexpr (kHasInputScale) loader_as.seek(m_offset);
+-    if constexpr (Ctx::kUsePackedLateAS) mma.m_scale_offset = Ctx::kIsGroupedGemm ? m_offset % 4 : 0;
++    if constexpr (Ctx::kWgmmaUseLateAS) mma.m_scale_offset = Ctx::kIsGroupedGemm ? m_offset % 4 : 0;
+     if constexpr (kHasInputScale2) loader_as2.seek(m_offset);
+   }
+ 
+   template <bool kIsFirst = false>
+   CUDA_INLINE void load_stage_iter(uint32_t stage_id, uint32_t iter_id) {
++    load_stage_iter_data(stage_id, iter_id);
++    load_stage_iter_scales<kIsFirst>(stage_id, iter_id);
++  }
++
++  CUDA_INLINE void load_stage_iter_data(uint32_t stage_id, uint32_t iter_id) {
+     stage_id = (stage_id + iter_id / Ctx::kWarpIters) % kNumStages;
+     iter_id = iter_id % Ctx::kWarpIters;
+     uint32_t buffer_id = iter_id % 2;
+-    uint32_t k_iter_id = Ctx::kUsePackedKLayout ? 0 : iter_id;
+-    uint32_t bs_iter_id = Ctx::kUsePackedKLayout && Ctx::kUseFusedE8m0Scale ? iter_id : k_iter_id;
+     auto &smem = ctx.smem;
+ 
+     if constexpr (!(kUseWgmma && Ctx::kUseRawWeight))
+       loader_b.load(smem.stages[stage_id].b, mma.regs_qb_as_ptr(buffer_id), iter_id);
+-    if constexpr (USE_PPU && !kUseMxmma && kIsGroupOrBlockWeightScale)
+-      loader_bs.load(smem.stages[stage_id].bs, mma.arith.regs_bs_as_ptr(buffer_id), bs_iter_id);
+     if constexpr (!kUseWgmma && !Ctx::kUseUmma)
+       loader_a.load(smem.stages[stage_id].a, mma.regs_a_as_ptr(buffer_id), iter_id, stage_id);
++  }
++
++  template <bool kIsFirst = false>
++  CUDA_INLINE void load_stage_iter_scales(uint32_t stage_id, uint32_t iter_id) {
++    stage_id = (stage_id + iter_id / Ctx::kWarpIters) % kNumStages;
++    iter_id = iter_id % Ctx::kWarpIters;
++    uint32_t buffer_id = iter_id % 2;
++    uint32_t k_iter_id = Ctx::kUsePackedKLayout ? 0 : iter_id;
++    uint32_t bs_iter_id = Ctx::kUsePackedKLayout && Ctx::kUseFusedE8m0Scale ? iter_id : k_iter_id;
++    auto &smem = ctx.smem;
++
++    if constexpr (USE_PPU && !kUseMxmma && kIsGroupOrBlockWeightScale)
++      loader_bs.load(smem.stages[stage_id].bs, mma.arith.regs_bs_as_ptr(buffer_id), bs_iter_id);
+     if constexpr (kUseMxmma) {
+       if constexpr (kIsGroupInputScale)
+         loader_as.load_sf(smem.stages[stage_id].as, mma.regs_sfa_as_ptr(buffer_id), k_iter_id);
+       if constexpr (kIsGroupOrBlockWeightScale)
+         loader_bs.load_sf(smem.stages[stage_id].bs, mma.regs_sfb_as_ptr(buffer_id), k_iter_id);
+     } else if constexpr (!Ctx::kUseBlockScaledMma) {
+-      if constexpr (kIsGroupInputScale && !Ctx::kUsePackedLateAS)
++      if constexpr (kIsGroupInputScale && !Ctx::kWgmmaUseLateAS)
+         loader_as.load(smem.stages[stage_id].as, mma.arith.regs_as_as_ptr(buffer_id), k_iter_id);
+       if constexpr (!USE_PPU && kIsGroupOrBlockWeightScale)
+         loader_bs.load(smem.stages[stage_id].bs, mma.arith.regs_bs_as_ptr(buffer_id), bs_iter_id);
+diff --git a/humming/include/humming/mma/wgmma.cuh b/humming/include/humming/mma/wgmma.cuh
+index 143d1d7a..29a51b6d 100644
+--- a/humming/include/humming/mma/wgmma.cuh
++++ b/humming/include/humming/mma/wgmma.cuh
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <humming/memory/s2r_loader/loader_as.cuh>
+ #include <humming/utils/all.cuh>
+ 
+ 
+@@ -129,7 +130,7 @@ public:
+     const uint32_t smem_base = cast_smem_ptr_to_uint(&ctx.smem);
+     constexpr uint32_t kItersPerHalf = kUsePackedKLayout ? 1 : kWarpIters;
+     constexpr uint32_t kNumIters = kUsePackedKLayout ? 1 : (WarpShape::N / (MmaShape::N / 4) / kPackedKFactor);
+-    constexpr uint32_t kRunKLoop = kUsePackedKLayout ? kNumKSlabs : kPackedKFactor;
++    constexpr uint32_t kRunKLoop = (kUsePackedKLayout || Ctx::kUseWgmmaSsKBatch) ? kNumKSlabs : kPackedKFactor;
+ 
+     uint32_t delta_m = kUsePackedKLayout ? iter_id : 0;
+     uint32_t delta_j = final_regs_c_index() == 0 ? delta_m : 0;
+@@ -139,7 +140,7 @@ public:
+ 
+     PRAGMA_UNROLL
+     for (uint32_t k = 0; k < kRunKLoop; k++) {
+-      uint32_t k_slab = kUsePackedKLayout ? k : ((iter_id % kItersPerHalf) * kPackedKFactor + k);
++      uint32_t k_slab = (kUsePackedKLayout || Ctx::kUseWgmmaSsKBatch) ? k : ((iter_id % kItersPerHalf) * kPackedKFactor + k);
+       uint32_t smem_addr = smem_base + offsetof(SharedStorage, stages) + stage_id * sizeof(typename SharedStorage::StageStorage);
+       smem_addr += k_slab * 2 * sizeof(int4) + smem_offset;
+       uint64_t desc = make_wgmma_smem_desc<kSwizzleBytes>(smem_addr);
+@@ -179,27 +180,24 @@ public:
+   CUDA_INLINE
+   void wait_and_promote(uint32_t stage_id, uint32_t iter_id) {
+     constexpr uint32_t kNumIters = kUsePackedKLayout ? 1 : (WarpShape::N / (MmaShape::N / 4) / kPackedKFactor);
+-    constexpr uint32_t kRunKLoop = kUsePackedKLayout ? kNumKSlabs : kPackedKFactor;
++    constexpr uint32_t kRunKLoop = (kUsePackedKLayout || Ctx::kUseWgmmaSsKBatch) ? kNumKSlabs : kPackedKFactor;
+     uint32_t delta_m = kUsePackedKLayout ? iter_id : 0;
+     uint32_t delta_j = final_regs_c_index() == 0 ? delta_m : 0;
+     wgmma_wait<0>();
+     fence_accumulators(delta_j);
+ 
+-    if constexpr (Ctx::kUsePackedLateAS) {
+-      // Read each scale only when promoting its accumulator, keeping AS out of
+-      // the live register set during weight conversion and WGMMA.
+-      constexpr uint32_t kScaleBlockM = BlockShape::M + (Ctx::kIsGroupedGemm ? 4 : 0);
+-      const uint32_t base = ctx.k_warp_offset() / 128 * kScaleBlockM +
+-                            ctx.m_warp_offset() + m_scale_offset + (ctx.lane_id() % 4) * 2;
+-      const float *scale = reinterpret_cast<const float *>(ctx.smem.stages[stage_id].as);
+-      float2 *partial = reinterpret_cast<float2 *>(regs_c[0][0][0]);
+-      float2 *final = reinterpret_cast<float2 *>(regs_c[1][0][0]);
+-      PRAGMA_UNROLL
+-      for (uint32_t index = 0; index < MmaShape::M / 4; ++index) {
+-        final[index].x += scale[base + index / 2 * 8] * partial[index].x;
+-        final[index].y += scale[base + index / 2 * 8 + 1] * partial[index].y;
++    if constexpr (Ctx::kWgmmaUseLateAS) {
++      // Load AS only when this fragment's partial accumulators are promoted.
++      constexpr bool kApplyWeightScaleOnC = !kUseFusedE8m0Scale && (Ctx::kIsGroupWeightScale || Ctx::kIsBlockWeightScale);
++      const uint32_t k_end = (kUsePackedKLayout || Ctx::kUseWgmmaSsKBatch) ? WarpShape::K : (iter_id + 1) * kPartMmaShapeK;
++      bool should_promote = k_end == WarpShape::K || k_end % Ctx::kInputScaleGroupSize == 0;
++      if constexpr (kApplyWeightScaleOnC) should_promote |= k_end % Ctx::kWeightScaleGroupSize == 0;
++      if (should_promote) {
++        const uint32_t scale_iter = (kUsePackedKLayout || Ctx::kUseWgmmaSsKBatch) ? 0 : iter_id;
++        S2RMemoryLoaderAS<Ctx> loader(ctx);
++        loader.seek(m_scale_offset);
++        loader.load(ctx.smem.stages[stage_id].as, arith.regs_as_as_ptr(iter_id % 2), scale_iter);
+       }
+-      return;
+     }
+ 
+     PRAGMA_UNROLL
+diff --git a/humming/include/humming/utils/context.cuh b/humming/include/humming/utils/context.cuh
+index 80ab1c71..1075843e 100644
+--- a/humming/include/humming/utils/context.cuh
++++ b/humming/include/humming/utils/context.cuh
+@@ -77,9 +77,12 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
+   static constexpr bool kUsePackedKLayout = LayerConfig::kUsePackedKLayout;
+   static_assert(!kUsePackedKLayout || WarpShape::K == 128);
+   static constexpr uint32_t kPackedKFactor = kUsePackedKLayout ? 2 : 1;
+-  static constexpr bool kUsePackedLateAS = kUseWgmma && kUsePackedKLayout && WarpShape::N == 16 &&
+-                                           LayerConfig::kUseFusedE8m0Scale && ElementA::kBits == 8 && ElementA::kIsFloatingPointType && MmaOpClass::kCTypeBits == 32 &&
+-                                           LayerConfig::kInputScaleGroupSize == 128 && ComputeConfig::kUseMMajorInputScale;
++  static constexpr bool kIsFp8Input = ElementA::kBits == 8 && ElementA::kIsFloatingPointType;
++  static constexpr bool kCanBatchWgmmaSsTypes = kIsFp8Input && MmaOpClass::kCTypeBits == 32;
++  static constexpr bool kCanBatchWgmmaSsAS = LayerConfig::kInputScaleGroupSize == 0 || LayerConfig::kInputScaleGroupSize >= 128;
++  static constexpr bool kCanBatchWgmmaSsK = WarpShape::K == 128 && kCanBatchWgmmaSsAS;
++  static constexpr bool kCanBatchWgmmaSsBS = LayerConfig::kWeightScaleGroupSize == 0 || LayerConfig::kWeightScaleGroupSize >= 128;
++  static constexpr bool kUseWgmmaSsKBatch = kUseWgmmaSs && kCanBatchWgmmaSsTypes && kCanBatchWgmmaSsK && kCanBatchWgmmaSsBS;
+ 
+ 
+   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;
+@@ -89,7 +92,13 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
+   static_assert(!kUseWgmma || N_WARPS % 4 == 0);
+ 
+   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
+-  static constexpr uint32_t kWarpIters = kUsePackedKLayout ? (WarpShape::N / 16) : (WarpShape::K / kPartMmaShapeK);
++  static constexpr uint32_t kWarpIters = kUseWgmmaSsKBatch ? 1 : (kUsePackedKLayout ? (WarpShape::N / 16) : (WarpShape::K / kPartMmaShapeK));
++
++  // With a single fragment, next-stage prefetch aliases the current scale buffer.
++  // Group AS and non-fused BS must survive until accumulator promotion has finished.
++  static constexpr bool kPreserveASForPromotion = LayerConfig::kIsGroupInputScale && !TuningConfig::kWgmmaUseLateAS;
++  static constexpr bool kPreserveBSForPromotion = !LayerConfig::kUseFusedE8m0Scale && (LayerConfig::kIsGroupWeightScale || LayerConfig::kIsBlockWeightScale);
++  static constexpr bool kUseWgmmaLateScalePrefetch = TuningConfig::kWgmmaSplitIssueWait && kWarpIters == 1 && (kPreserveASForPromotion || kPreserveBSForPromotion);
+ 
+   static constexpr uint32_t kUseWarpSpec = TuningConfig_::kUseWarpSpec;
+   static constexpr uint32_t kNumThreads = TuningConfig_::kNumThreads;
+diff --git a/humming/kernel/humming.py b/humming/kernel/humming.py
+index a7e1f3bb..a5d3cf85 100644
+--- a/humming/kernel/humming.py
++++ b/humming/kernel/humming.py
+@@ -443,6 +443,11 @@ def check_dtype(self):
+                 assert self.a_dtype in allowed_f16_dtypes
+ 
+     def check_config(self):
++        if self.wgmma_use_late_as:
++            assert self.mma_type == MmaType.WGMMA, "wgmma_use_late_as requires WGMMA"
++            assert self.is_group_input_scale, "wgmma_use_late_as requires per-group input scales"
++        if self.wgmma_split_issue_wait:
++            assert self.mma_type == MmaType.WGMMA, "wgmma_split_issue_wait requires WGMMA"
+         register_error = get_register_budget_error(
+             self, self, self.use_f16_accum, current_device.max_registers_per_sm
+         )
+diff --git a/humming/testing/tuning.py b/humming/testing/tuning.py
+index 8f5c9b4f..ea6d5cdc 100644
+--- a/humming/testing/tuning.py
++++ b/humming/testing/tuning.py
+@@ -18,6 +18,8 @@
+ SAMPLED_TUNING_VALUES = {
+     "mma_type": tuple(mma_type.value for mma_type in MmaType),
+     "num_stages": (2, 3, 4, 5, 6, 8),
++    "wgmma_use_late_as": (False, True),
++    "wgmma_split_issue_wait": (False, True),
+     "use_tma": (True, False, 123, 456, 789),
+     "use_warp_spec": (True, False),
+     "use_mbarrier": (True, False),
+@@ -316,6 +318,10 @@ def _generate_scheduling_candidates(
+         "smem_reuse_mode",
+         "output_chunk_rows",
+     )
++    if mma_type == MmaType.WGMMA:
++        names += ("wgmma_split_issue_wait",)
++        if layer_config.is_group_input_scale:
++            names += ("wgmma_use_late_as",)
+     if mma_type == MmaType.UMMA:
+         names += ("umma_num_dequant_warpgroups", "umma_cta_group_size")
+     for signature in _generate_cartesian(*names):
+diff --git a/humming/tune/candidate.py b/humming/tune/candidate.py
+index 4728db9b..5cc89726 100644
+--- a/humming/tune/candidate.py
++++ b/humming/tune/candidate.py
+@@ -65,6 +65,8 @@ class ScheduleCandidate:
+     block_shape: tuple[int, int, int]
+     warp_shape: tuple[int, int, int]
+     mma_type: MmaType | None = None
++    wgmma_use_late_as: bool = False
++    wgmma_split_issue_wait: bool = False
+     use_stream_k: bool = True
+     use_f16_accum: bool = False
+     num_stages: int = 2
+@@ -113,6 +115,8 @@ def from_config(
+             mma_type=MmaType(config["mma_type"]) if config.get("mma_type") else None,
+             block_shape=_positive_shape(config["block_shape"], "block_shape"),
+             warp_shape=_positive_shape(config["warp_shape"], "warp_shape"),
++            wgmma_use_late_as=_config_bool(config, "wgmma_use_late_as", False),
++            wgmma_split_issue_wait=_config_bool(config, "wgmma_split_issue_wait", False),
+             use_stream_k=_config_bool(config, "use_stream_k", True),
+             use_f16_accum=_config_bool(config, "use_f16_accum", False),
+             num_stages=_config_positive_int(config, "num_stages", 2),
+diff --git a/tests/kernels/humming/test_moe.py b/tests/kernels/humming/test_moe.py
+index 2ef44a85..61a2c6aa 100644
+--- a/tests/kernels/humming/test_moe.py
++++ b/tests/kernels/humming/test_moe.py
+@@ -61,6 +61,29 @@ def _case(
+ 
+ 
+ MOE_CASES = (
++    _case(
++        "m-major-raw-fp8-group128",
++        GemmType.GROUPED_CONTIGUOUS,
++        use_m_major_input_scale=True,
++        a_dtype=dtypes.float8e4m3,
++        b_dtype=dtypes.float8e4m3,
++        input_scale_group_size=128,
++        weight_scale_group_size=128,
++        sm_version=90,
++    ),
++    _case(
++        "m-major-raw-fp8-block128",
++        GemmType.GROUPED_MASKED,
++        use_m_major_input_scale=True,
++        a_dtype=dtypes.float8e4m3,
++        b_dtype=dtypes.float8e4m3,
++        bs_dtype=dtypes.float32,
++        input_scale_group_size=128,
++        weight_scale_group_size=128,
++        weight_scale_group_size_n=128,
++        weight_scale_type="block",
++        sm_version=90,
++    ),
+     _case(
+         "indexed-uint8-zp",
+         GemmType.INDEXED,
+diff --git a/tests/kernels/humming/test_scale.py b/tests/kernels/humming/test_scale.py
+index 60b08fb5..81ad4cec 100644
+--- a/tests/kernels/humming/test_scale.py
++++ b/tests/kernels/humming/test_scale.py
+@@ -194,6 +194,16 @@ def _bs2_case(bs_dtype, scale_2_type):
+         input_scale_group_size=64,
+         weight_scale_group_size=64,
+     ),
++    _case(
++        "fp8-input-group256-weight-group256",
++        a_dtype=dtypes.float8e4m3,
++        b_dtype=dtypes.uint4,
++        bs_dtype=dtypes.bfloat16,
++        input_scale_group_size=256,
++        weight_scale_group_size=256,
++        use_packed_k_layout=True,
++        sm_version=90,
++    ),
+ )
+ 
+ 
+diff --git a/tests/kernels/humming/test_special_paths.py b/tests/kernels/humming/test_special_paths.py
+index a5d41bfd..e2f5739d 100644
+--- a/tests/kernels/humming/test_special_paths.py
++++ b/tests/kernels/humming/test_special_paths.py
+@@ -289,6 +289,9 @@ def test_special_weight_path_coverage():
+         ("mma", 128, 96, 512, GemmType.GROUPED_CONTIGUOUS, True, 1),
+         ("mma", 128, 96, 504, GemmType.GROUPED_MASKED, True, 1),
+         ("mma", 64, 128, 512, GemmType.DENSE, True, 1),
++        ("wgmma", 128, 0, 512, GemmType.DENSE, True, 1),
++        ("wgmma", 128, 0, 512, GemmType.GROUPED_CONTIGUOUS, True, 1),
++        ("wgmma", 128, 0, 504, GemmType.GROUPED_MASKED, True, 1),
+         ("wgmma", 128, 96, 512, GemmType.DENSE, True, 1),
+         ("wgmma", 128, 96, 504, GemmType.GROUPED_CONTIGUOUS, True, 1),
+         ("umma", 48, 32, 512, GemmType.DENSE, True, 2),
+@@ -336,6 +339,8 @@ def test_output_chunk_rows(
+         umma_cta_group_size=cta_group_size,
+         output_chunk_rows=chunk_rows,
+     )
++    if mma_type == "wgmma":
++        config["use_warp_spec"] = True
+     monkeypatch.setenv("HUMMING_TEST_TUNING_SOURCE", "heuristic")
+     monkeypatch.setattr("humming.testing.tuning.get_heuristics_config", lambda *args, **kwargs: config)
+     case = KernelTestCase(
+diff --git a/tests/test_tuning_candidates.py b/tests/test_tuning_candidates.py
+index 93f1d1e3..f0d7c7a4 100644
+--- a/tests/test_tuning_candidates.py
++++ b/tests/test_tuning_candidates.py
+@@ -90,6 +90,8 @@ def test_schedule_candidate_is_immutable_and_updates_config():
+     config = {
+         "block_shape": (8, 128, 128),
+         "use_stream_k": False,
++        "wgmma_use_late_as": False,
++        "wgmma_split_issue_wait": False,
+         "warp_shape": (8, 32, 64),
+     }
+     candidate = ScheduleCandidate.from_config("base", config)
+@@ -97,12 +99,16 @@ def test_schedule_candidate_is_immutable_and_updates_config():
+         candidate_id="three_stage",
+         warp_shape=(8, 32, 32),
+         num_stages=3,
++        wgmma_use_late_as=True,
++        wgmma_split_issue_wait=True,
+     )
+ 
+     assert candidate.to_config() == config
+     assert updated.to_config() == config | {
+         "warp_shape": (8, 32, 32),
+         "num_stages": 3,
++        "wgmma_use_late_as": True,
++        "wgmma_split_issue_wait": True,
+     }
+     assert updated.candidate_id == "three_stage"
+     with pytest.raises(dataclasses.FrozenInstanceError):
+@@ -567,47 +573,6 @@ def test_sm90_default_backend_supports_activation(a_dtype, expected):
+     assert get_default_mma_type(layer).value == expected
+ 
+ 
+-@pytest.mark.parametrize(
+-    "warp_m,warp_n,group_size,num_ctas,expected",
+-    [(176, 16, 128, 4, False), (80, 64, 128, 3, False), (128, 64, 0, 3, False), (32, 16, 128, 2, True)],
+-)
+-def test_sampled_wgmma_accounts_for_all_accumulators(
+-    warp_m, warp_n, group_size, num_ctas, expected, monkeypatch
+-):
+-    from humming.config import ComputeConfig
+-    from humming.device import DeviceInfo, current_device
+-    from humming.testing import tuning
+-
+-    if current_device.sm_version != 90:
+-        pytest.skip(f"Requires SM90, got SM{current_device.sm_version}")
+-
+-    monkeypatch.setattr(DeviceInfo, "max_registers_per_sm", property(lambda self: 65536))
+-    monkeypatch.setattr(DeviceInfo, "max_threads_per_sm", property(lambda self: 2048))
+-    monkeypatch.setattr(tuning, "fits_device_smem", lambda *args: True)
+-    layer = LayerConfig(
+-        sm_version=90,
+-        shape_n=1024,
+-        shape_k=1024,
+-        a_dtype="float8e4m3",
+-        b_dtype="uint4",
+-        c_dtype="bfloat16",
+-        input_scale_group_size=group_size,
+-        weight_scale_group_size=group_size,
+-        use_fused_e8m0_scale=False,
+-    )
+-    config = dict(
+-        mma_type="wgmma",
+-        block_shape=(warp_m, warp_n * 4, 128),
+-        warp_shape=(warp_m, warp_n, 128),
+-        num_ctas_per_sm=num_ctas,
+-        use_warp_spec=False,
+-        num_stages=2,
+-        use_tma=False,
+-    )
+-    compute = ComputeConfig(gemm_type=GemmType.DENSE)
+-    assert tuning._fits_device_resources(layer, compute, (config, {})) == expected
+-
+-
+ @pytest.mark.parametrize("registers_per_sm,expected", [(65536, False), (131072, True)])
+ def test_device_register_budget(registers_per_sm, expected, monkeypatch):
+     from humming.config import ComputeConfig, TuningConfig

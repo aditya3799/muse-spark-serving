@@ -1,0 +1,79 @@
+2026-11-16 CPU source review: candidate_v3 downscale/finalizer fusion
+
+Exact reviewed hashes are recorded in humming_v3_cpu_review.json:
+FP4 586e2243..., NVFP4 ba13c0c9..., scale 1fb726a2..., finalizer 1244e7e0....
+No source blocker found for the intended BF16 Muse/Humming path. No GPU or
+compiler was launched for this review; numerical/capture proof remains pending.
+
+Independent exact-method CPU tests passed: 8 forward norm-cache/backend routes,
+48 finalizer dispatch combinations, 10 rejected invalid scale/ID/device shapes,
+and AST equality of all 3 arithmetic tails after inserted scale rounding.
+Harness: test_humming_v3_review.py; result: humming_v3_cpu_review.json.
+
+Precision and paths
+- Single-token/ordinary fused kernel, inverse-RMS kernel, and tiled combine each
+  load BF16 x and scale, multiply in FP32, explicitly convert to BF16 then back
+  to FP32 BEFORE the unchanged norm/reduction operations. AST checks prove those
+  arithmetic tails remain identical. Both split kernels recompute the same
+  rounded value; neither uses raw x for its norm or combine.
+- The no-ID eager fallback cannot receive a scale: wrapper requires IDs first.
+  Humming _forward_marlin refreshes the current norm cache before deciding to
+  defer. Recognized norms pass the scale to the fused finalizer; arbitrary norm
+  fallback keeps helper scaling. Direct helper calls default to scaled outputs.
+  Stock Marlin passes no scale. Norm-object transitions passed exact-method spies.
+- All scale and x reads stay inside live (expert ID>=0) branches; inactive
+  storage remains undefined but is not read or reduced. All-inactive outputs
+  retain the zero-accumulator behavior. The inv-RMS kernel stores zero for dead
+  slots and tiled combine skips them. No scalar host read or new synchronization.
+
+Memory/capture and assumptions
+- The scale vector is the persistent registered w2_post_scale buffer. The new
+  paths add no full activation allocation and no invocation-tensor cache; inv
+  storage is unchanged. Host guards use only dtype/device/shape/contiguity.
+  In-place scale/ID changes between replays should be seen by both kernels.
+  As in the old path, replacing a captured buffer requires recapture; mutations
+  between the two split-kernel launches are unsupported concurrent modification.
+- Scale IDs must be either negative or within the local scale vector. There is
+  no hot-path host range check, matching the previous scaling helper's contract
+  and the dispatcher's local mapping. Do not claim support for out-of-range IDs.
+- Norm weights/epsilon are handled by the pre-existing norm cache; mutating the
+  same norm object behind that cache was not newly solved by this change.
+
+Decisive pending GPU checks
+Compare final outputs against explicit v2 scaling followed by the unchanged
+finalizer, bitwise where the operation sequence is identical: M1,2,8,9,32, both
+norm orders, with/without norm weight, no-norm/round_product modes, inactive-only
+and mixed routes, repeated IDs, IDint32/int64, and in-place scales changed across
+graph replay. Include BF16 rounding boundaries, subnormal/extreme finite values,
+and non-power-of-two hidden widths if claiming generic finalizer support. Actual
+model scales are finite; no blanket exceptional NaN/Inf equivalence is claimed.
+Check exact helper/model dispatch, not only manually wiring raw outputs into the
+finalizer. H200 compile/runtime and end-to-end serving correctness remain open.
+
+Follow-up harness review (CPU only)
+finalizer_fusion_probe.py SHA11708c1bdf718603fbed031afdf740d5c07a9bb9cd248f625ba10a30b68b29529:
+No blocker found. Actual source modules are hash pinned; 25 M/mode combinations
+exercise ordinary and split paths; graph replay changes inputs, IDs, scales and
+norm weights, including all-inactive. Exhaustive finite BF16 input patterns at
+14 scales compare final-output bits for a non-power-of-two identity width.
+This does not separately expose intermediate bits or test NaN payload semantics.
+GPU int64 IDs and normalized non-power-of-two widths are not covered there.
+cold_humming_fused_bench.py SHAa725e26e7013b5c4a86be8407811f9598033b1d0c18cee974c14e5954be80a87:
+No blocker found for planned E32/H4096 run with explicit 12 repetitions. It
+compares stock, exact v3 nondeferred helper + baseline finalizer, and deferred
+helper + actual v3 finalizer, with changed graph inputs and balanced labels.
+Recommended before timing: enforce even samples (default11 is not balanced),
+pin imported baseline finalizer hash directly, and add two unmeasured complete
+timing orders. Its numeric-equality check is torch.equal, not an int16 bit test;
+the report correctly calls it numeric equality. No H200 performance inference.
+
+Pre-launch harness amendments reviewed subsequently:
+- Focused probe SHA5c30aa6e4c54ae3f4b72f8f924f1dc785f9f93bc850ccc8f6332b6d9d5678389
+  adds M9/H3072/int64 IDs through all five modes (30 cases total). This addresses
+  an int64 and normalized non-power-of-two ordinary-kernel case; it does not add
+  a non-power-of-two width to the two-kernel M2..8 split path.
+- Full bench SHA780292f830e9b386a3285a852f18196e3f620c3e7852a299d803334b546c6031
+  now pins the baseline finalizer hash AND imported function source path, rejects
+  odd or <6 repetitions, defaults12, and warms two full timing orders. These
+  changes address all three benchmark recommendations above. Candidate sources
+  are unchanged. Runtime results were not yet available at this review update.

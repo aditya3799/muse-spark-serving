@@ -1,0 +1,35 @@
+Current upstream ring and L2 prefetch applicability audit
+
+Pinned upstreama735253e8433d5fc57bf585b3eef93e4b4cfa885; exact source URLs and
+SHA256 receipts in ring_sources/manifest.json. These are source-only leads,
+not patches to the frozen release and not measured performance.
+
+Ring: dflash_draft_ring.py startup predicates explicitly reject FA3. MHA ring
+backends are trtllm_mha/fa4; flashattention_backend.py973 also requires FA4,
+plain MHA pool, no context parallel layout and topk1. An explicit compact draft
+window is incompatible. Ring row sizing includes the attention window, verify
+block and spare row/page to prevent live reads from being overwritten. The
+pool and all writers/readers must share this new ownership map; changing only
+one scatter is not a port.
+
+Prefix ownership is a separate numerical constraint. A ring supplies no draft
+KV in its HiCache plan (worker1161), records a floor equal to the first extend's
+prefix-cache hit (ring349+), and clips reads below that floor. Native per-slot
+draft cache can reuse those prefix rows. ring_applicability_cpu.json executes
+seven actual upstream startup predicate cases and provides a simple equal-score
+attention counterexample: native window8..15 versus ring floor12 reads12..15,
+giving11.5 versus13.5. This is a logical counterexample, not a model measurement.
+Verification could still preserve final greedy target tokens while changing
+draft proposals, acceptance and work. It therefore does not satisfy the fixed
+draft/verify execution policy without additional state reconstruction/proof.
+
+L2 prefetch: dflash_draft_l2_prefetch.py selects only CUDA tensors no larger than
+4MiB from non-Linear modules of each draft layer and final norm, holds strong
+references, constructs a raw-address table, launches on a side stream after a
+head dependency, and joins that stream at the draft graph tail. It does not
+prefetch the large FC/LM-head/Linear weights. Default root model's actual list
+and cache contention are not profiled. It is a possible small H200 cache-hint
+experiment, not evidence of a material fraction or2x. Pointer lifetime/reload
+retirement and capture hook compatibility would be mandatory before enabling.
+
+The ring and prefetch audits do not modify frozen sampler/prologue packages.

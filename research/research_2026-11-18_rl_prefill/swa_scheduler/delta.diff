@@ -1,0 +1,160 @@
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -39,6 +39,7 @@
+ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+ from sglang.srt.runtime_context import (
++    get_disagg,
+     get_exec,
+     get_memory,
+     get_model,
+@@ -47,7 +48,10 @@
+     get_spec,
+ )
+ from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
+-from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
++from sglang.srt.speculative.ragged_verify import (
++    build_ragged_target_verify_geometry,
++    ragged_verify_compact_enabled,
++)
+ from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+ from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
+ from sglang.srt.utils import get_compiler_backend
+@@ -108,6 +112,7 @@
+     swa_out_cache_loc: torch.Tensor = None
+     # Precomputed FA3 scheduler metadata (avoids per-layer prepare_varlen_num_blocks)
+     scheduler_metadata: torch.Tensor = None
++    swa_verify_scheduler: tuple = None
+     # Per-forward-pass cache for the FA4 sheared-bias block schedule.
+     # Created lazily by the first rel_bias layer; lives as long as this metadata
+     # object, which for CUDA-graph captures keeps the buffers owned by the graph.
+@@ -379,6 +384,16 @@
+         self._disable_scheduler_metadata_precompute = (
+             _should_disable_scheduler_metadata_precompute()
+         )
++        self._swa_verify_enabled = (
++            self.fa_impl_ver == 3 and self._get_scheduler_metadata is not None
++            and self.has_swa and self.sliding_window_size >= 0 and not self.use_mla
++            and not self.is_draft_runner and self.topk <= 1 and not self.is_prefill_aware_swa
++            and self.local_attn_builder is None and self._kv_shard_pool is None
++            and not self._disable_scheduler_metadata_precompute and self.attn_cp_size == 1
++            and not get_exec().overlap.enable_two_batch_overlap and not get_disagg().enable_pdmux
++            and not get_exec().graph.enable_torch_compile and not ragged_verify_compact_enabled()
++            and model_runner.spec_algorithm.is_dflash_family()
++        )
+ 
+     def _maybe_init_local_attn_builder(
+         self, model_runner: ModelRunner
+@@ -455,6 +470,78 @@
+             max_seq_len_q=metadata.max_seq_len_q,
+         )
+ 
++    def _prepare_swa_verify_scheduler(self, metadata, forward_batch):
++        """Capture one native local-window plan before the first attention layer."""
++        metadata.swa_verify_scheduler = None
++        if not self._swa_verify_enabled or not forward_batch.forward_mode.is_target_verify():
++            return
++        spec = forward_batch.spec_info
++        b, width = forward_batch.batch_size, metadata.max_seq_len_q
++        table = metadata.swa_page_table if self.use_sliding_window_kv_pool else metadata.page_table
++        lens, cu = metadata.cache_seqlens_int32, metadata.cu_seqlens_q
++        if (spec is None or getattr(spec, "ragged_verify_layout", None) is not None
++                or getattr(spec, "custom_mask", None) is not None
++                or getattr(spec, "num_tokens_per_req", -1) != width
++                or width != self.speculative_num_draft_tokens or width < 2
++                or forward_batch.positions is None or forward_batch.positions.numel() != b * width
++                or forward_batch.encoder_lens is not None or metadata.image_token_ranges is not None
++                or metadata.swa_spec_metadata is not None or table is None or lens is None or cu is None
++                or table.ndim != 2 or table.shape[0] != b
++                or lens.shape != (b,) or cu.shape != (b + 1,)
++                or lens.dtype != torch.int32 or cu.dtype != torch.int32
++                or not lens.is_contiguous() or not cu.is_contiguous()):
++            return
++        max_k = table.shape[1] * self.page_size
++        if self.sliding_window_size >= max_k - 1:
++            # FA3 converts a window covering the entire table to full causal.
++            return
++        window = (self.sliding_window_size, 0)
++        plan = self._get_scheduler_metadata(
++            batch_size=b, max_seqlen_q=width, max_seqlen_k=max_k,
++            num_heads=self.num_attention_heads, num_heads_k=self.num_kv_heads,
++            headdim=self.head_dim, headdim_v=self.head_dim, qkv_dtype=self.kv_cache_dtype,
++            cache_seqlens=lens, cu_seqlens_q=cu, cu_seqlens_k_new=None,
++            max_seqlen_k_new=0, page_size=self.page_size, causal=True,
++            window_size=window, has_softcap=self.has_softcap,
++            num_splits=self.num_splits, pack_gqa=None, sm_margin=0,
++        )
++        # Native allocation (including the semaphore, if required) belongs to
++        # this eager call or recording. Replays execute the recorded preparation.
++        metadata.swa_verify_scheduler = (
++            plan, table, lens, cu, metadata.cu_seqlens_k, b, width, window, self.num_splits,
++        )
++
++    def _swa_verify_scheduler_for_layer(
++        self, metadata, forward_batch, layer, q, key_cache, value_cache, page_table,
++        cache_seqlens, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, window_size, causal,
++        cp_active, use_local_attn, use_cascade_attn, sinks, score_mod, rel_bias,
++    ):
++        entry = metadata.swa_verify_scheduler
++        if entry is None:
++            return None
++        plan, table, lens, cu, cu_k, batch, width, window, splits = entry
++        if (not forward_batch.forward_mode.is_target_verify()
++                or use_local_attn or use_cascade_attn or cp_active or not causal
++                or layer.is_cross_attention or sinks is not None or score_mod is not None
++                or rel_bias is not None or metadata.image_token_ranges is not None
++                or metadata.swa_spec_metadata is not None or window_size != window
++                or max_seqlen_q != width or forward_batch.batch_size != batch
++                or self.num_splits != splits or q.shape[0] != batch * width
++                or q.numel() != batch * width * self.num_attention_heads * self.head_dim
++                or page_table is not table or cache_seqlens is not lens
++                or cu_seqlens_q is not cu or cu_seqlens_k is not cu_k
++                or q.dtype != self.kv_cache_dtype or key_cache.dtype != q.dtype
++                or value_cache.dtype != q.dtype or key_cache.device != q.device
++                or value_cache.device != q.device or lens.device != q.device
++                or key_cache.shape[1:] != (self.page_size, self.num_kv_heads, self.head_dim)
++                or value_cache.shape != key_cache.shape
++                or layer.tp_q_head_num != self.num_attention_heads
++                or layer.tp_k_head_num != self.num_kv_heads
++                or layer.head_dim != self.head_dim or layer.v_head_dim != self.head_dim
++                or bool(layer.logit_cap > 0) != self.has_softcap):
++            return None
++        return plan
++
+     def validate_elastic_cuda_graph_recapture(self) -> None:
+         if self.use_mla and self.fa_impl_ver != 3:
+             raise ValueError(
+@@ -496,7 +583,10 @@
+         )
+ 
+     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
++        if self._swa_verify_enabled and forward_batch.forward_mode.is_target_verify():
++            self._prepare_swa_verify_scheduler(self.forward_metadata, forward_batch)
+         if self._capture_unified_verify_metadata(forward_batch):
++
+             metadata = self.target_verify_metadata[forward_batch.batch_size]
+             translator = self.kv_index_translator
+             swa = translator.space(IdSpaceKind.SLIDING_WINDOW)
+@@ -1405,6 +1495,8 @@
+             metadata.scheduler_metadata = self._compute_verify_scheduler_metadata(
+                 metadata, batch_size
+             )
++            if self._swa_verify_enabled:
++                self._prepare_swa_verify_scheduler(metadata, forward_batch)
+         self.forward_metadata = metadata
+ 
+     def get_paged_mha_kv_cache(
+@@ -1846,6 +1938,12 @@
+                     and bool(layer.logit_cap > 0) == self.has_softcap
+                 ):
+                     sched_meta = metadata.scheduler_metadata
++                elif is_swa_layer and metadata.swa_verify_scheduler is not None:
++                    sched_meta = self._swa_verify_scheduler_for_layer(
++                        metadata, forward_batch, layer, q, key_cache, value_cache, page_table,
++                        cache_seqlens, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, window_size,
++                        causal, cp_active, use_local_attn, use_cascade_attn, sinks, score_mod, rel_bias,
++                    )
+                 result = flash_attn_with_kvcache(
+                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                     k_cache=key_cache,

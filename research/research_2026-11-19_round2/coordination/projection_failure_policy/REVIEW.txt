@@ -1,0 +1,12 @@
+Unapplied cuBLASLt failure-policy amendment
+
+Both row and output-column invoke bridges now return only SUCCESS(0) or NOT_SUPPORTED(15) as normal control flow. All other/unknown statuses raise ProjectionVendorError, including execution/internal/invalid-state/allocation failures. This deliberately conservative policy may abort where a vendor could recover; it never asserts that a device error is harmless. Native numerical descriptors, algorithms, workspaces and kernels are unchanged.
+
+Startup discovery takes a CPU error vote before the existing MIN acceptance vote. Recoverable Torch allocation OOM disables the shape coherently; an unexpected local discovery error aborts all participating ranks and closes successfully created plans. Runtime errors remain fail-stop: they propagate to normal worker termination, without attempting a rank-local native repair. This amendment does not provide distributed worker teardown or detect later asynchronous errors. Existing native synchronization remains required.
+
+Actual amended AST fault-injection checks pass12status cases,12real invoke-method cases and44registration scenarios/132rank outcomes. CPU collectives are threaded mocks with rendezvous and order checking; this is not Gloo/NCCL or poisoned-device testing. All healthy peer plans close after a fatal startup vote, and no acceptance MIN is entered afterward. Unsupported and OOM paths reject coherently; clean paths stay enabled.
+
+A private Git index confirms composition with frozen joint530e, early projection relocation74d63805 and row no_grad07f4c518. No user source/index or queued payload changed. No serving or performance claim. C ABI constructors still expose some preparation failures as no-plan; a fuller diagnostic ABI could distinguish them, but no launched computation is claimed successful by this policy.
+
+Primary API reference: https://docs.nvidia.com/cuda/cublas/index.html#cublasltmatmul
+The API distinguishes unsupported operations from CUDA execution failures. The stricter abort choices above are our engineering policy, not a claim that every nonzero status poisons CUDA.

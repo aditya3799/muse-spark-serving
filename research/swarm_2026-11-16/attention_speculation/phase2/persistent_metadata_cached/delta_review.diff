@@ -1,0 +1,34 @@
+--- persistent_v1/python/sglang/kernels/ops/attention/metadata.py
++++ cached/python/sglang/kernels/ops/attention/metadata.py
+@@ -1,3 +1,4 @@
++from functools import lru_cache
+ from typing import Optional
+ 
+ import torch
+@@ -505,6 +506,14 @@
+     )
+ 
+ 
++
++@lru_cache(maxsize=None)
++def _decode_metadata_sm_count(device_index: int) -> int:
++    # CUDA tensor device indices are explicit; never consult the current device.
++    assert device_index is not None
++    return torch.cuda.get_device_properties(device_index).multi_processor_count
++
++
+ def normal_decode_set_metadata(
+     cache_seqlens_int32: torch.Tensor,
+     cu_seqlens_k: torch.Tensor,
+@@ -554,9 +563,9 @@
+     )
+     column_blocks = triton.cdiv(max_seq_pages, block_cols)
+     if not skip_page_table and batch_size > 0 and seq_lens.device.type == "cuda":
+-        # CUDA properties are cached by PyTorch; no tensor values or host lengths
++        # Hardware count is cached by explicit tensor device; no tensor values or host lengths
+         # are read. Four CTAs per SM bound launch overhead while retaining parallelism.
+-        sm_count = torch.cuda.get_device_properties(seq_lens.device).multi_processor_count
++        sm_count = _decode_metadata_sm_count(seq_lens.device.index)
+         column_blocks = min(column_blocks, max(1, triton.cdiv(4 * sm_count, batch_size)))
+     grid = (1, 1) if skip_page_table or max_seq_pages == 0 else (batch_size, column_blocks)
+     _fused_decode_metadata_kernel[grid](

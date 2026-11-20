@@ -1,0 +1,8 @@
+Upload 11_kaggle_cache_choice.ipynb to Kaggle.
+Select GPU T4, keep defaults and Run All. Only GPU 0 is used.
+No Internet, packages, datasets or weights needed.
+Download v4_cache_choice_*.zip into D:\OpenKernelChallenge\serving\profiling_kaggle\notebook11_results.
+Run export even after a section failure; return the whole ZIP. Stop the GPU session afterward.
+
+Expected: 48 cases, 288 timing rows, 3,168 raw samples, 2,592 changed-input output checks and 288 comparisons, plus correctness gates.
+Compare baseline and both existing cache drafts under static int32-ID/float32-score routing inputs, eager and combined graph execution. A separate gate demonstrates stale two-buffer contents and validates explicit refresh. No active source changes or full-serving/H200 claims.

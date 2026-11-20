@@ -1,0 +1,103 @@
+Output-N DFlash FC candidate -- review packet, not a scored submission request
+
+Measured mechanism:
+  Partition output channels of the existing BF16 FC across TP ranks while
+  retaining every input feature and the full native K reduction. Gather the
+  full output before the unchanged hidden RMS and five distinct rank-owned KV
+  projections. No KV-head mixing, model replacement, lower precision, or draft
+  width/acceptance-policy change.
+
+Local evidence:
+  Pilot: output_shard_5791831/result.json
+  Independent frozen-plan seed: output_shard_9317861/result.json
+  Paired statistics: output_n_reward.json
+  Experiment source binding: output_n_experiment_manifest.json
+  Pilot component gain4.4569x,95%CI[4.3790,4.5203]. Independent partial acceptance
+  gain4.3200x,CI[4.2606,4.3903]. Full acceptance also exact on independent seed.
+  Scope is one timed rank + live virtual peer outputs + charged local concat.
+  These are ideal-transport component bounds, NOT serving or NCCL speedups.
+
+  All eight output shards checked on each changed-input iteration for M8/32/
+  128/256 with actual checkpoint FC weights. Original full output RMS, five
+  rank-owned KV matrices, native K norm/RoPE and full backing pools agree.
+  CUPTI traces show identical native/full-plan/local kernel names and split-K
+  grid-z12/3/8/4. M8 retains the original BF16 split-K reduction kernel. Output
+  tile grid changes only. No universal vendor bitwise guarantee is claimed.
+
+Standalone package:
+  output_n_package/{entry.py,adapter.py,runtime_projection.py,native_build.py,
+                    runtime_lt.cc,__init__.py}
+  source_manifest.json lists each source hash. No binary is part of deployment.
+  create_projection(original_fc,group,mode='qualified',rows=configured_rows,
+                    measure=True) is an explicit collective startup operation.
+  Generic contiguous BF16 matrix geometry; tested topology TP8. Configured row
+  counts are filtered by a declared128MiB calibration allocation estimate,
+  not by benchmark request IDs or challenge concurrency. Unknown rows retain
+  the original FC. Two calibration inputs per shape are released sequentially.
+
+  Runtime full-shape cuBLASLt heuristic order and active native workspace are
+  used; no algorithm IDs are hardcoded. Qualification compares native full FC,
+  full-parent plan, and every output shard on actual loaded weights. Any rank
+  rejection disables that shape globally. Actual startup FC + group.all_gather
+  (including GroupCoordinator's dimension-reassembly copy) must be faster than
+  native on every rank before the shape remains enabled. Startup timing is
+  synthetic-input diagnostic evidence, not production throughput.
+
+  Registration manifest, per-call declarations and global availability gate
+  keep CPU collectives coherent even for empty input or a discovery exception.
+  Once a shape is published, local pointer/version/layout/device/policy/status
+  rejection computes native locally, slices its own columns, and participates
+  in the same gather. Sticky CUDA errors remain fatal; no false recovery claim.
+
+  One native-budget scratch allocation per stream is shared across shapes.
+  Unwarmed capture streams take native slice + gather. Descriptors and scratch
+  outlive dependent graphs. Static checkpoint/math policy is required; weight
+  reload, policy changes, concurrent graph replays sharing captured scratch,
+  or model retirement require a controlled graph lifecycle. Inference tensors
+  have no version counter, so in-place reload cannot be detected by that guard.
+  The intended DFlash context projection is eager outside captured target/draft
+  graphs and normally executes serially on the worker's forward stream.
+
+  Small C++ cuBLASLt bridge builds once under a file lock in a source-hashed
+  SGLang JIT cache, allowing read-only source installs. Versioned-only CUDA
+  wheel SONAMEs are supported. Earlier local build prerequisite failed cleanly
+  because only libcublasLt.so.13 was present; this was fixed before qualification.
+
+Validation receipts:
+  output_n_package_probe.json: first actual-weight package graph/guard check,
+  all8 rank slices, changed replay inputs, pointer/policy/stride/vendor fallback,
+  retirement guard;766MB peak GPU. It is tied to its recorded historical source.
+  output_n_gloo.json: real CPU TP8 Gloo, mocked vendor math; one-rank registration
+  decline/exception/empty, local failure, bad rank shadow, pointer/capture guards.
+  Final-v2 receipts use *_v2.json and carry current package source hashes.
+  Neither virtual peers nor Gloo substitutes for real H200 TP8 NCCL validation.
+
+Integration coordination:
+  Prefill owns shared worker/model hook builder at ../prefill/build_integration.py.
+  Its hook initializes during prewarm_sampling on actual forward stream,
+  before final post_capture_resize. Output-N uses configured decode batches times
+  draft block size; row sharding is independently toggled in the prefill branch.
+  Original shape validation and hidden_norm remain in project_target_hidden.
+  Root alone reviews/launches any unscored H200 check. No scored run is justified
+  until full serving correctness and material frontier gain are established.
+
+Coverage limitation confirmed by worker audit:
+  Context append trims graph padding before FC. For example, a raw753-row tail
+  remains753, rather than its768-row graph bucket. Current N registration derives
+  from configured decode buckets and is selected only on the decode append path;
+  the prefill row adapter requires its own exact shape registration. Therefore no
+  current TTFT gain is claimed for an unseen raw prefill tail. Output-N partition
+  could preserve the exact raw M in principle, but bounded lazy qualification
+  would have to charge its first-use native/shard comparisons, CPU collectives,
+  compilation/heuristic time, extra memory, and graph-capture safeguards. Adding a
+  special753 dispatch would not be a general solution and is not implemented.
+
+Separate attention research, NOT included in this package:
+  precision_attention.py restores both BF16 Q/K boundaries, original FP32 RoPE
+  cache, BF16 attention-output boundary, FP32 softmax denominator, native FP8 P
+  scaling. Minimal SM90a request/flat kernels compile in3.1/4.0s,127/80registers,
+  zero spills. No Hopper execution. CPU softmax mechanism oracle still differs
+  from native-style FP8 by0.13--0.97%L2 because of tile/online-max rounding.
+  Pinned q8GQA8 native uses BlockN128 via use_one_mma_wg, not default160.
+  This source-restored candidate remains unqualified and cannot inherit donor
+  kernel-track results or the output-N experiment's KEEP decision.

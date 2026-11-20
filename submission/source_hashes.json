@@ -1,0 +1,12 @@
+{
+  "python/sglang/kernels/ops/moe/adaptive_marlin_tiles.py": "c65e9cde6b8b03f50ad8bf852c519ff9927e3e552bc38e6dca96bb7e10b567cf",
+  "python/sglang/kernels/ops/moe/moe_align_small_numel.py": "6bbe8978b6dc0da3591f12d7edfaca347f8170aabe1099a6aa3d736b76b798fd",
+  "python/sglang/kernels/ops/moe/muse_spark_humming_scale.py": "1fb726a24a8a3335f6b894b602223ca252783607594aea0d108e3c01637bbddd",
+  "python/sglang/kernels/ops/moe/muse_spark_humming_split.py": "f11fc9ab64c95f7c1d9654de323544ac400f2810538c7fc338812080e6be9f7b",
+  "python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py": "1244e7e0e49c878d51b9ce022e465fe87a105ccdac3275411c9685d865e2a3a4",
+  "python/sglang/srt/layers/attention/flashattention_backend.py": "2a720c8f5ed86437e6ec181cace03ae97fba0460672b1d001549f8df4b71e03c",
+  "python/sglang/srt/layers/communication/muse_spark_gemm_ag.py": "d6b60d95757f6fadae7946885fc5d373d4eae6612ebb48595b12bce10bcbc94e",
+  "python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py": "2c2c78ed504bedf25de7a1016c80c64db74895fb25091a2d7bc48884ade39591",
+  "python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py": "9cc30f7979153550c29317a6b73e4998eea77ff63a8b6eb2f88521b7708cdb0d",
+  "python/sglang/srt/models/muse_spark.py": "255b2ce03ac0ecc500e230c74b8f3966144bf7e8009b99bd77d77dd9a470f0c6"
+}

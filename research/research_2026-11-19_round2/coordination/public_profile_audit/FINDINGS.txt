@@ -1,0 +1,118 @@
+﻿PUBLIC GITHUB SERVING PROFILE AUDIT — 2026-11-19
+
+Conclusion
+Found useful public H200 layer-level profiles, a close 8xH200 serving recipe,
+and public serving diagnostic methodology. Did not find a downloadable,
+verified full-model Muse NVFP4 TP8/EP8 DFlash8 GPU timeline matching our pinned
+SGLang and challenge workload. This is a bounded search result, not proof that
+no such trace exists anywhere. No candidate edits, GPU runs, or submissions.
+The verified 1.2363x release remains the baseline; no new 2x forecast is justified.
+
+Coverage
+GitHub repository searches: "open-kernel-challenge" (53/53 results),
+"openkernelchallenge" (5), "Muse-Spark-Open" serving in:readme (205/205),
+and "okc serve" in:readme (2). Deduplicated metadata: 254 repositories.
+All 53 direct challenge repositories had file inventories inspected; targeted
+profiles, receipts, serving docs and patches were read from the strongest leads.
+254 is discovery coverage, NOT 254 deeply reviewed repositories. Public web
+searches also covered Muse/H200/nsys, trace.json, serving profiles and upstream.
+Searches do not cover private repositories, all branches/history, unindexed gists,
+or every GitHub file. Downloaded third-party source was not executed.
+
+1. Closest serving configuration: SemiAnalysisAI/InferenceX
+Pin: 6ed37742453271fc5851b873fd1c8009f37520b1
+Path: inferencex-e2e/benchmarks/single_node/srt-slurm-recipes/musespark/sglang/h200-fp4-mtp/agentic.yaml
+https://github.com/SemiAnalysisAI/InferenceX/blob/6ed37742453271fc5851b873fd1c8009f37520b1/inferencex-e2e/benchmarks/single_node/srt-slurm-recipes/musespark/sglang/h200-fp4-mtp/agentic.yaml
+Matches 8 H200, model Muse-Spark-Open-816B-A42B-NVFP4, TP8/EP8, ModelOpt FP4,
+Marlin, FA3, FP8 KV, DFlash2 with eight verification tokens, static memory 0.85.
+Differences include HiCache 120GB versus our 160GB setting and a sweep of
+max-running/graph sizes. Runtime revision and workload are not established equal.
+Useful for configuration sanity checks; not a performance result by itself.
+The recipe records a host-memory limit problem with 160GB/rank plus draft pools.
+Do not change our cache size solely from another host's cgroup limit.
+
+Trace-store pin: 9c732dfbae61cf4ea1f6bf79dd5fde179cd54aed
+https://github.com/SemiAnalysisAI/InferenceX-trace-storage/tree/9c732dfbae61cf4ea1f6bf79dd5fde179cd54aed
+Complete recursive tree: 282 entries, 96 trace.json.gz archives, zero Muse-labelled
+paths. Archives for other models/hardware cannot establish Muse time shares.
+The public Profile workflow metadata lists 100 recent runs. Latest two are
+40037376138 (cancelled) and 40028135426 (failed), both Oct23, with zero artifacts
+currently listed. The index HTML is a generic Perfetto relay, not a hidden model
+trace catalog. Other workflows or historical/unlabelled traces remain possible.
+
+Kevin19980730/muse-spark-inferencex publishes an unofficial static copy of
+InferenceX-derived throughput/cache/interactivity points. November19 as-of rows
+still refer to October19 H200 runs. This is aggregate serving data, not a kernel
+timeline, and its cache/input mix is not demonstrated equal to the challenge.
+Do not equate as-of date with a fresh benchmark or use it to score our patch.
+
+2. Actual H200 prefill-layer profiles: AutoclickerI/muse-spark-open-kernels
+Pin: 85aed1fb1365877b615542dd44980646816d6b26
+https://github.com/AutoclickerI/muse-spark-open-kernels/blob/85aed1fb1365877b615542dd44980646816d6b26/docs/serving/prefill_dev/V11_PROFILE.md
+Downloaded raw scored receipt 965a9a816d4744ea, profile text and ranking JSON.
+Receipt explicitly identifies muse_prefill_layer; score 1.366811 is kernel-track,
+NOT full serving. Profile calls are individual invocations, not timing medians.
+The ranking weights layer shapes; it is not an observed complete model timeline.
+For the full-attention shape at 64K prefix, visible attention is 8.431ms of
+18.995ms total, versus dense/router 4.215ms and expert GEMM+dequant 4.823ms.
+This makes long-prefix prefill attention a serious investigation target.
+For shorter turn-1 prefill, expert gate/up dominates its constructed ranking.
+Dense/router and experts both matter in first-turn prefill. Do not optimize only
+MoE or derive the serving fraction of these components from weighted layer sums.
+Tensor-floor ratios in this document are modeled ceilings, not achievable gains.
+
+3. Public decode/DFlash serving diagnostics: same AutoclickerI repository
+https://github.com/AutoclickerI/muse-spark-open-kernels/blob/85aed1fb1365877b615542dd44980646816d6b26/docs/serving/FINDINGS.md
+Detailed nsys/host-step investigations use a tiny SM120 TP1 fixture. Raw capture
+locations mostly refer to that author's local filesystem. They are not an
+8xH200 full-checkpoint serving profile. Corrected measurements saved about0.52ms
+of KV-materialization host work, but did not establish an end-to-end C4 win.
+Useful methodology: distinguish GPU busy-time union from event interval/launch
+gaps; retain exact graph-owned buffer lifetimes; check writer-after-reader
+hazards across draft and target work; measure with and without profiler overhead.
+Local FlashInfer CPU-length behavior does not imply recoverable FA3 H200 cost.
+Serving docs reference an older SGLang pin a55ab7d5, not our297e54fd.
+
+4. Router/verification evidence: Xuefeng-Zhu/open-kernel-challenge
+https://github.com/Xuefeng-Zhu/open-kernel-challenge/blob/main/SERVING_INTEGRATION_AUDIT.md
+An interface audit, explicitly no serving execution. Its router P039 evidence
+reports m8 7.49us vs26.34us and m128 10.15us vs16.24us. These are component
+measurements relevant to verification shapes, not end-to-end speedups.
+Potential integration insight: keep BF16 router input before stock FP32 casting,
+and preserve top8 decisions, correction bias, rank ownership and stream joins.
+Router/pooler overlap can hide the isolated saving. Older engine pin applies.
+
+5. Public MoE serving patch: hariappi/okc-muse-spark-kernels
+Pin: a3ebb0f2f027f07f38b063c6a74ac355a6b38848
+https://github.com/hariappi/okc-muse-spark-kernels/tree/a3ebb0f2f027f07f38b063c6a74ac355a6b38848/serving
+The patch changes routes-per-expert denominator from num_local_experts to
+ global_num_experts for EP. Local project already contains this same mechanism
+in optimization_marlin_tiles_2026-11-15/*/harness_snapshot/package_experiment.py.
+It is corroboration, not a new independent enhancement. Published measurements
+are H100 NVL component benchmarks; no direct H200 serving extrapolation.
+
+6. Other screened leads
+razramon/openkernelchallenge-submission: H200 whole-decoder-layer profiles,
+PDL overlap and layout evidence, already in prior donor audit. Not whole serving.
+joeyhlu/okc-muse-kernels: extensive profile/result inventory, kernel-track scope.
+Kushagrabainsla/muse-spark-open: kernel profiles; warns H100 gains did not carry
+through to H200. infraax timelines and iyerramji pooler traces are kernel-level.
+Aravind0403 has serving patch variants, not matching full-serving traces found.
+tpurtell/cuteafd: changed precision and hardware, unsuitable for direct forecast.
+Stale challenge starters' engine/rules are not authoritative for current work.
+
+Actionable priority without H200
+Decode: inspect verification-size router/projection dispatch and draft graph
+lifetimes, with explicit attention to existing local enhancements and overlap.
+MoE: retain actual expert occupancy and graph-compatible selection; do not count
+already tested divisor changes as new work or revive a regressing expert port.
+Prefill: investigate long-prefix full attention alongside dense projections and
+expert GEMM; guard short/long and full/sliding regimes separately.
+Use the public data to choose experiments, not multiply independent speedups.
+Needed for a confident claim: same candidate hash, full-model TP8/EP8 correctness,
+TTFT and serving metrics, and either an official result or a matching execution.
+
+Saved artifacts
+Search responses, all53direct repository inventories/pins, downloaded source
+notes/receipts, InferenceX configuration and public action metadata are adjacent.
+Partial Git clones remain in the temporary research folder; no code was ported.

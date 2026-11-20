@@ -1,0 +1,17 @@
+﻿Reduce Muse router launches and local expert alignment overhead
+
+Muse's split-BF16 router currently launches two GEMMs on the same input. Pack
+the high and low components into a single GEMM, retain separate FP32 outputs,
+and sum them as before. Keep the registered parameters and packed-cache size
+unchanged, and invalidate the cache on in-place parameter updates.
+
+After expert-parallel mapping, the MoE alignment tables contain local expert
+IDs and -1 sentinels. Size their histograms for local experts and allow the
+existing single-token aligner to handle mapped routes. This preserves active
+route identity and leaves both Marlin GEMMs and collective communication intact.
+
+Validation: local numerical/FP64 router probes and CUDA graph replay; 420 CUDA
+alignment cases; 21 Python adapter routing/shape cases with Marlin arithmetic
+stubbed; syntax, patch-policy and Git checks. H200/PDL and full-model serving
+correctness, peak memory and performance remain pending. No target speedup is
+claimed before those checks.

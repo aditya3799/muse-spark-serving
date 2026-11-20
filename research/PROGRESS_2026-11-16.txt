@@ -1,0 +1,67 @@
+SERVING PROGRESS CHECKPOINT
+Checked and saved: 2026-11-15T20:41:28Z
+Workspace: D:\OpenKernelChallenge\serving
+
+Latest H200 check: 32bcbb190b204dd6
+Live status: queued
+Started: 
+Result: none returned; still waiting for an 8xH200 node.
+This save did not submit another job.
+
+Confirmed scored result
+Job 468701af35b84e07 passed at 1.0111x stock.
+Per-load ratios: 1 user 1.0227x; 4 users 1.0049x; 16/32 users 1.0084x.
+Correctness, later-turn rescoring and memory checks passed.
+The requested 1.5x serving speedup has NOT been achieved.
+
+Current experimental candidate
+research_iteration_2026-11-15/projection_fp32_candidate/candidate.diff
+SHA256: 8b22315e0d4d6e71001cd7a85510a7abb35e228c1a98a93cf8e30399d8cbb791
+Pinned base: 297e54fd105e974cdf401e5b4d20253a22c16f90
+Six files, 23881 bytes. Computes large replicated BF16 projection columns on
+separate TP ranks, requests FP32 intermediate output, converts to BF16, then
+gathers. Stock fallbacks cover unsupported geometry, GPUs, SP, DP/CP and
+explicit deterministic inference. No persistent weight repack.
+
+Validation and limitations
+60 local GPU correctness checks passed, including changed/noncontiguous inputs,
+CUDA graph replay and both BF16 reduction settings. Max relative L2 versus
+baseline: 0.00215036; max absolute difference: 0.03125.
+Real 2/4/8-process CPU Gloo tests validated the unchanged gathering layout.
+GPU tests substitute serial rank calculations for network communication.
+No H200 speedup, multi-GPU NCCL graph behavior or full-model memory result yet.
+Local compute/layout timings do not establish serving performance.
+
+Rejected / superseded branches
+- Smaller prefill MoE tiles regressed most larger/concentrated-routing cases.
+- First projection candidate, check 82482c8c07c2422a, failed an additional local
+  numerical screen under default BF16 reductions. Do not promote it. The FP32
+  intermediate revision above fixes the measured issue without relaxing tests.
+- Direct import of the standalone v139 MoE winner retains too many weight
+  layouts and exceeds the full-model memory allowance. A port needs redesign.
+- Earlier V5/V6 serving candidates remain discarded.
+
+Important workspace distinction
+Active sglang checkout and root patch.diff remain V4 cached mapping.
+Active patch SHA256: cf02617f790e28c9229ac9aec5e517f04344c49491347ef732a352fbaa3aa4a4
+Neither submitted compact32 nor the latest projection candidate is integrated
+into that checkout. Use the explicit candidate path, not root patch.diff.
+
+Resume steps
+1. Check 32bcbb190b204dd6 once; do not duplicate its queued submission.
+   wsl -d Ubuntu -- /mnt/d/OpenKernelChallenge/bin/okc serve status 32bcbb190b204dd6 --json
+2. Save the complete result. Assess correctness, memory, TTFT and measured
+   throughput before promotion. Reject the branch if communication erases gain.
+3. If convincing, validate another load before a scored run. User previously
+   authorized a scored submission when confident; evidence is still pending.
+4. Read live quotas before any new submission. Prior-day quota notes are stale.
+5. Preserve baselines and hashes. Local timings cannot justify a 1.5x claim.
+
+Evidence
+research_iteration_2026-11-15/RESEARCH_REVIEW.txt
+research_iteration_2026-11-15/public_research_sources.json
+research_iteration_2026-11-15/LATEST_STATUS.json
+research_iteration_2026-11-15/projection_fp32_candidate/gpu_validation.json
+research_iteration_2026-11-15/projection_fp32_candidate/gpu_component_timings.json
+research_iteration_2026-11-15/projection_fp32_candidate/check_receipt.json
+research_iteration_2026-11-15/scored_468701af35b84e07.json

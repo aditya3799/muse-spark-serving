@@ -1,0 +1,10 @@
+Upload 08_kaggle_update_overhead.ipynb to Kaggle.
+Select GPU T4. Internet can remain off. No datasets, weights or installations are needed.
+Run All with the default configuration. Only GPU 0 is used.
+Download v4_update_overhead_*.zip from the final export link.
+Place the ZIP in D:\OpenKernelChallenge\serving\profiling_kaggle\notebook08_results and tell me it is ready.
+Stop the GPU session after downloading. If a section fails, run export and return the ZIP.
+
+This experiment isolates checked update API and property/view overhead, using unchanged Notebook 07 source slices. Direct-copy paths are diagnostic controls with prevalidated input and stable storage. They are not production patches.
+Expected full GPU run: lifecycle and contract checks passed, 24 benchmark cases, 504 poisoned-state checks, 168 timing rows, 1,848 raw samples, 192 comparisons.
+No full model, actual fused alignment/GEMMs, scheduler/tokenizer initialization or H200 performance is measured. Both drafts remain unapplied.

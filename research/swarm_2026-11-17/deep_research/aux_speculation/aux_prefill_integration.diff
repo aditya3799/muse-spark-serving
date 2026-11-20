@@ -1,0 +1,455 @@
+--- /dev/null
++++ b/python/sglang/srt/layers/prefill_aux_output.py
+@@ -0,0 +1,179 @@
++"""Research-only owner for captured prefill auxiliary output.
++
++The owner lives outside graph pools. Host leases prevent overlapping producer
++calls; CUDA stream waits order a different producer/consumer stream without a host
++synchronize; the normal same-stream path enqueues no extra events. Event operations are outside captured transformer bodies.
++"""
++from contextlib import contextmanager
++
++import torch
++
++
++class PrefillAuxOutputOwner:
++    def __init__(self, max_tokens, hidden_size, capture_ids, device):
++        self.capture_ids = tuple(capture_ids)
++        self.hidden_size = hidden_size
++        self.buffer = torch.empty(
++            (max_tokens, hidden_size * len(self.capture_ids)),
++            dtype=torch.bfloat16,
++            device=device,
++        )
++        self._state = "idle"
++        self._generation = 0
++        self._producer_stream = None
++        self._consumer_stream = torch.cuda.current_stream(self.buffer.device)
++        self._recorded_streams = {self._consumer_stream}
++
++    def view(self, rows):
++        if not 0 < rows <= self.buffer.shape[0]:
++            raise ValueError("aux output exceeds owner capacity")
++        return self.buffer[:rows]
++
++    def owns(self, output):
++        return (
++            torch.is_tensor(output)
++            and output.ndim == 2
++            and 0 < output.shape[0] <= self.buffer.shape[0]
++            and output.shape[1] == self.buffer.shape[1]
++            and output.dtype == self.buffer.dtype
++            and output.device == self.buffer.device
++            and output.stride() == self.buffer.stride()
++            and output.data_ptr() == self.buffer.data_ptr()
++        )
++
++    def adopt(self, output, rows):
++        if self.owns(output) and output.shape[0] <= rows <= self.buffer.shape[0]:
++            return self.view(rows)
++        return None
++
++    def _track_stream(self, stream):
++        # Retained storage is never reused during serving. Recording each new
++        # stream once also makes eventual allocator reclamation safe at teardown.
++        if self.buffer.is_cuda and stream not in self._recorded_streams:
++            self.buffer.record_stream(stream)
++            self._recorded_streams.add(stream)
++
++    @property
++    def generation(self):
++        return self._generation
++
++    def discard_ready(self, generation):
++        # A worker error before entering consume must not strand a fresh lease.
++        # Never release a pre-existing or newer generation on another call's error.
++        if self._state != "ready" or generation != self._generation:
++            return
++        stream = torch.cuda.current_stream(self.buffer.device)
++        self._track_stream(stream)
++        if stream != self._producer_stream:
++            stream.wait_stream(self._producer_stream)
++        self._consumer_stream = stream
++        self._state = "idle"
++
++    def begin_capture(self):
++        generation = self.begin_produce()
++        self._state = "capturing"
++        return generation
++
++    def end_capture(self, generation, capture_stream):
++        if self._state != "capturing" or generation != self._generation:
++            raise RuntimeError("stale auxiliary capture lease")
++        stream = torch.cuda.current_stream(self.buffer.device)
++        if capture_stream is not None and stream != capture_stream:
++            self._track_stream(capture_stream)
++            stream.wait_stream(capture_stream)
++        self._consumer_stream = stream
++        self._state = "idle"
++
++    def begin_produce(self):
++        if self._state != "idle":
++            raise RuntimeError("prior auxiliary consumer has not released its lease")
++        stream = torch.cuda.current_stream(self.buffer.device)
++        self._track_stream(stream)
++        if self._consumer_stream is not None and stream != self._consumer_stream:
++            stream.wait_stream(self._consumer_stream)
++        self._producer_stream = stream
++        self._state = "producing"
++        self._generation += 1
++        return self._generation
++
++    def end_produce(self, generation, output):
++        if self._state != "producing" or generation != self._generation:
++            raise RuntimeError("stale auxiliary producer lease")
++        if not self.owns(output):
++            raise RuntimeError("captured prefill did not return its owned auxiliary output")
++        # The body and eager tail run on this stream. A cross-stream consumer
++        # inserts its event dependency when it arrives; same-stream needs none.
++        self._producer_stream = torch.cuda.current_stream(self.buffer.device)
++        self._state = "ready"
++
++    def cancel_produce(self, generation):
++        # Preserve ordering of any already-enqueued writes after an exception.
++        if self._state == "producing" and generation == self._generation:
++            self._consumer_stream = torch.cuda.current_stream(self.buffer.device)
++            self._state = "idle"
++
++    @contextmanager
++    def consume(self, output):
++        if not self.owns(output):
++            yield
++            return
++        if self._state != "ready":
++            raise RuntimeError("auxiliary output is not ready for its consumer")
++        stream = torch.cuda.current_stream(self.buffer.device)
++        self._track_stream(stream)
++        if stream != self._producer_stream:
++            stream.wait_stream(self._producer_stream)
++        self._state = "consuming"
++        try:
++            yield
++        finally:
++            self._consumer_stream = stream
++            self._state = "idle"
++
++
++class DirectAuxCapture:
++    """Same FP32-to-BF16 conversion, written into the final feature slices."""
++
++    def __init__(self, buffer, hidden_size, capture_ids):
++        self.buffer = buffer
++        self.hidden_size = hidden_size
++        self.capture_ids = tuple(capture_ids)
++        self.index = 0
++
++    def capture(self, layer_idx, residual):
++        if self.index >= len(self.capture_ids) or layer_idx != self.capture_ids[self.index]:
++            raise RuntimeError("auxiliary capture order changed")
++        if (
++            residual.shape != (self.buffer.shape[0], self.hidden_size)
++            or residual.dtype != torch.float32
++            or residual.device != self.buffer.device
++        ):
++            raise RuntimeError("auxiliary residual metadata changed")
++        start = self.index * self.hidden_size
++        self.buffer[:, start : start + self.hidden_size].copy_(residual)
++        self.index += 1
++
++    def finalize(self):
++        if self.index != len(self.capture_ids):
++            raise RuntimeError("incomplete auxiliary capture")
++        return self.buffer
++
++
++def direct_aux_capture(buffer, residual, capture_ids, operator_dtype, sp_active):
++    ids = tuple(capture_ids)
++    if (
++        buffer is None
++        or sp_active
++        or operator_dtype != torch.bfloat16
++        or residual.dtype != torch.float32
++        or residual.ndim != 2
++        or not ids
++        or any(type(i) is not int or i < 0 for i in ids)
++        or ids != tuple(sorted(set(ids)))
++        or buffer.shape != (residual.shape[0], residual.shape[1] * len(ids))
++        or buffer.dtype != torch.bfloat16
++        or buffer.device != residual.device
++        or not buffer.is_contiguous()
++    ):
++        return None
++    return DirectAuxCapture(buffer, residual.shape[1], ids)
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -50,6 +50,7 @@
+ from sglang.srt.layers import layernorm_sp
+ from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+ from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
++from sglang.srt.layers.prefill_aux_output import direct_aux_capture
+ from sglang.srt.layers.communication.muse_spark_gemm_ag import (
+     gemm_ag,
+     gemm_local,
+@@ -1262,6 +1263,19 @@
+         # Layer indices whose output residual stream feeds the DFLASH draft context.
+         self.layers_to_capture: List[int] = []
+ 
++    def prefill_aux_output_spec(self):
++        ids = tuple(self.layers_to_capture)
++        if (
++            self.operator_dtype != torch.bfloat16
++            or self.residual_dtype != torch.float32
++            or layernorm_sp.layernorm_sp_enabled()
++            or not ids
++            or any(type(i) is not int or not 0 <= i < len(self.layers) for i in ids)
++            or ids != tuple(sorted(set(ids)))
++        ):
++            return None
++        return self.config.hidden_size, ids
++
+     def forward(
+         self,
+         input_ids: torch.Tensor,
+@@ -1280,14 +1294,27 @@
+             hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
+         stream = hidden_states.to(self.residual_dtype)
+         attn_input = self.layers[0].self_attn_input_norm(stream)
++        packed_aux = direct_aux_capture(
++            (forward_batch.aux_hidden_states_buffer
++             if forward_batch.forward_mode.is_extend() else None),
++            stream,
++            self.layers_to_capture,
++            self.operator_dtype,
++            sp_active,
++        )
+         aux_hidden_states = []
+         for layer_idx, layer in enumerate(self.layers):
+             stream, attn_input = layer(positions, stream, attn_input, forward_batch)
+             if layer_idx in self.layers_to_capture:
+                 # Draft context projection reads operator dtype, not residual_dtype.
+-                aux_hidden_states.append(stream.to(self.operator_dtype))
++                if packed_aux is not None:
++                    packed_aux.capture(layer_idx, stream)
++                else:
++                    aux_hidden_states.append(stream.to(self.operator_dtype))
+         norm_input = stream.to(self.operator_dtype)
+         hidden_states = self.norm(norm_input).to(self.operator_dtype)
++        if packed_aux is not None:
++            return hidden_states, packed_aux.finalize()
+         if aux_hidden_states:
+             return hidden_states, aux_hidden_states
+         return hidden_states
+@@ -1304,6 +1331,9 @@
+         return self.language_model(
+             input_ids, positions, forward_batch, input_embeds=input_embeds
+         )
++
++    def prefill_aux_output_spec(self):
++        return self.language_model.prefill_aux_output_spec()
+ 
+     @property
+     def layers(self):
+--- a/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+@@ -74,6 +74,7 @@
+ )
+ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
++from sglang.srt.layers.prefill_aux_output import PrefillAuxOutputOwner
+ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+     CudaGraphBufferRegistry,
+     build_prefill_registry,
+@@ -499,6 +500,7 @@
+         self._prefill_static_buffers: Optional[Dict[str, torch.Tensor]] = None
+         self.static_draft_hidden_states: Optional[torch.Tensor] = None
+         self.layer_model = None
++        self.prefill_aux_output_owner = None
+         self._capture_req_slots = 1
+         # Same rationale: _run_compile_pass runs a dummy _run_forward before
+         # resolve_prefill_backend returns, and that forward reads
+@@ -691,6 +693,10 @@
+                 None,
+             )
+ 
++        # Restrict shared output to a known synchronous DFlash consumer. Other
++        # speculative algorithms and sharded/TBO paths retain existing outputs.
++        self._init_prefill_aux_output_owner()
++
+         # --- aiter chip info pre-warming (AMD) -------------------------
+         maybe_pre_warm_aiter_chip_info()
+ 
+@@ -701,6 +707,35 @@
+ 
+         self.raw_num_tokens = 0
+         self.raw_bs = 0
++
++    def _init_prefill_aux_output_owner(self):
++        spec_fn = getattr(self.layer_model, "prefill_aux_output_spec", None)
++        if (
++            not isinstance(self.backend, BreakableCudaGraphBackend)
++            or self.model_runner.is_draft_worker
++            or not self.model_runner.spec_algorithm.is_dflash()
++            or self.pp_size != 1
++            or get_parallel().attn_dp_enabled
++            or self.enable_cp_bcg_capture
++            or get_exec().overlap.enable_two_batch_overlap
++            or torch.device(self.device).type != "cuda"
++            or spec_fn is None
++        ):
++            return
++        spec = spec_fn()
++        if spec is not None:
++            hidden_size, ids = spec
++            self.prefill_aux_output_owner = PrefillAuxOutputOwner(
++                self.max_num_tokens, hidden_size, ids, self.device
++            )
++
++    def _prefill_aux_output_view(self, num_tokens):
++        owner = self.prefill_aux_output_owner
++        return owner.view(num_tokens) if owner is not None else None
++
++    def adopt_owned_cuda_graph_output(self, output, rows):
++        owner = self.prefill_aux_output_owner
++        return owner.adopt(output, rows) if owner is not None else None
+ 
+     def _is_mamba_track_enabled(self) -> bool:
+         return get_exec().mamba.enable_mamba_extra_buffer and (
+@@ -1651,6 +1686,7 @@
+                 # FULL aux hidden states) captures with the right mode.
+                 # Ported from main #27468.
+                 capture_hidden_mode=self.capture_hidden_mode,
++                aux_hidden_states_buffer=self._prefill_aux_output_view(num_tokens),
+                 num_token_non_padded=self._capture_num_token_non_padded(num_tokens),
+                 global_num_token_non_padded_cpu=num_tokens,
+                 attn_tp_sequence_sharded=self.model_runner.attn_tp_sequence_sharded(
+@@ -1681,8 +1717,14 @@
+         return forward_batch, self.model_runner.attn_backend
+ 
+     def capture(self) -> None:
+-        with self.model_context():
+-            self._capture()
++        owner = self.prefill_aux_output_owner
++        generation = owner.begin_capture() if owner is not None else None
++        try:
++            with self.model_context():
++                self._capture()
++        finally:
++            if owner is not None:
++                owner.end_capture(generation, getattr(self, "stream", None))
+ 
+     def _capture(self) -> None:
+         # Warm up + autotune kernels once before capture (run-once across the
+@@ -2023,6 +2065,7 @@
+             spec_algorithm=forward_batch.spec_algorithm,
+             spec_info=padded_spec_info,
+             capture_hidden_mode=forward_batch.capture_hidden_mode,
++            aux_hidden_states_buffer=self._prefill_aux_output_view(static_num_tokens),
+             num_token_non_padded=num_token_non_padded,
+             global_num_token_non_padded_cpu=forward_batch.global_num_token_non_padded_cpu,
+             attn_tp_sequence_sharded=self.model_runner.attn_tp_sequence_sharded(
+@@ -2347,6 +2390,21 @@
+     def execute(
+         self, forward_batch: ForwardBatch, **kwargs
+     ) -> Optional[Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]]:
++        owner = self.prefill_aux_output_owner
++        if owner is None:
++            return self._execute_with_aux_output(forward_batch, **kwargs)
++        generation = owner.begin_produce()
++        try:
++            output = self._execute_with_aux_output(forward_batch, **kwargs)
++            owner.end_produce(generation, output.hidden_states)
++            return output
++        except BaseException:
++            owner.cancel_produce(generation)
++            raise
++
++    def _execute_with_aux_output(
++        self, forward_batch: ForwardBatch, **kwargs
++    ) -> Optional[Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]]:
+         self._validate_capture_hidden_mode(forward_batch)
+         with self.model_context(), self.backend.replay_session():
+             static_forward_batch, shared_read_ends = self.load_batch(
+--- a/python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py
++++ b/python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py
+@@ -194,6 +194,10 @@
+         if output is None:
+             return None
+         if torch.is_tensor(output):
++            adopt = getattr(self._cuda_graph_runner, "adopt_owned_cuda_graph_output", None)
++            owned = adopt(output, size) if adopt is not None else None
++            if owned is not None:
++                return owned
+             return output.new_empty((size, *output.shape[1:]))
+         if isinstance(output, PPProxyTensors):
+             return PPProxyTensors(
+@@ -232,6 +236,18 @@
+                 f"{type(output)} vs {type(output_buffer)}"
+             )
+         if torch.is_tensor(output) and torch.is_tensor(output_buffer):
++            adopt = getattr(self._cuda_graph_runner, "adopt_owned_cuda_graph_output", None)
++            owned = adopt(output, num_tokens) if adopt is not None else None
++            if (
++                owned is not None
++                and output_buffer.data_ptr() == owned.data_ptr()
++                and output_buffer.stride() == owned.stride()
++                and output_buffer.dtype == owned.dtype
++                and output_buffer.device == owned.device
++                and output_buffer.shape[1:] == owned.shape[1:]
++                and output_buffer.shape[0] >= num_tokens
++            ):
++                return
+             output_buffer[:num_tokens].copy_(output[:num_tokens])
+             return
+         if isinstance(output, PPProxyTensors) and isinstance(
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -1,6 +1,7 @@
+ import logging
+ import math
+ import os
++from contextlib import nullcontext
+ from typing import TYPE_CHECKING, List, Optional, Tuple
+ 
+ import torch
+@@ -1818,7 +1819,20 @@
+         physical ids for a fused draft, the virtual ids for a private one."""
+         return plan.write_ids(self.draft_model_runner.kv_index_translator)
+ 
+-    def _append_target_hidden_to_draft_kv_by_loc(
++    def _append_target_hidden_to_draft_kv_by_loc(self, **kwargs) -> None:
++        runner = self.target_worker.model_runner.prefill_cuda_graph_runner
++        owner = getattr(runner, "prefill_aux_output_owner", None)
++        lease = (
++            owner.consume(kwargs["target_hidden"])
++            if owner is not None
++            else nullcontext()
++        )
++        # Release follows enqueue of the context projection and every KV write.
++        # A later producer stream waits for these reads before overwriting.
++        with lease:
++            self._append_target_hidden_to_draft_kv_by_loc_impl(**kwargs)
++
++    def _append_target_hidden_to_draft_kv_by_loc_impl(
+         self,
+         *,
+         target_hidden: torch.Tensor,
+@@ -2333,7 +2347,18 @@
+     ) -> DFlashDraftInputV2:
+         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
+ 
+-    def forward_batch_generation(
++    def forward_batch_generation(self, *args, **kwargs):
++        runner = self.target_worker.model_runner.prefill_cuda_graph_runner
++        owner = getattr(runner, "prefill_aux_output_owner", None)
++        generation = owner.generation if owner is not None else None
++        try:
++            return self._forward_batch_generation_with_aux_output(*args, **kwargs)
++        except Exception:
++            if owner is not None:
++                owner.discard_ready(generation + 1)
++            raise
++
++    def _forward_batch_generation_with_aux_output(
+         self,
+         batch: ScheduleBatch,
+         on_publish=None,

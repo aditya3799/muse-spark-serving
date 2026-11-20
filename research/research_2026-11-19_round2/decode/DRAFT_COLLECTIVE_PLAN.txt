@@ -1,0 +1,35 @@
+Frozen DFlash duplicate-collective hypothesis, source-derived 2026-11-19
+
+Source: dflash_sources manifest, SGLang297e54fd105e974cdf401e5b4d20253a22c16f90.
+Release patch does not alter these files. _DflashDraftSampler inworker_v2 uses
+the original target denseLMhead, per-rank torch.max, then two all-gathers:
+maxvalues andint64 globalIDs. It selects the FIRST maximum rank with torch.argmax.
+The sampler is already captured inside the draft graph via capture_tail_hooks;
+this is not an opportunity to claim missing graph capture.
+
+Actual activation eligibility: ordinary DFlash, dense head, no addedvocab,
+block_size>1, graphsenabled/sufficientmemory, noDPattn. Selector, LiLiCorr, Domino
+and quantizedhead paths differ. Native Musehead explicitlyquant_config=None at
+candidate_sources/models/muse_spark.py1343, making densehead a relevant sourcepath;
+actual deployment activation/TP layout still needs a real startup log.
+
+Prototype: preserve original logits matmul and localmax/int64arg reduction.
+Pack maxbits (exact16/32bits extended into int64) plus entireint64ID into one
+2N int64 payload. One native all_gather_into_tensor preserves rankorder.
+Unpack by bitcast; select firstNaN rank ifany, otherwise firstnumericmaxrank,
+matching torch.argmax inclties, signedzero and infinities. IDs never pass through
+floatingpoint or narrowerinteger types. TP1 retains originalpath. Storage is
+capacityallocated before capture; each currentN uses compact2N rankchunks.
+
+This saves one collective invocation but grows transported bytes from10N to16N
+forBF16/FP16 values (12N->16N forFP32). Pack/select kernels and extra bytecost
+must be charged. The relevant comparison is native post-localmax selection
+vs pack+select PLUS realcollectives; localcopy or virtualpeer timings do not
+establish NCCL/H200 improvements. No tokenwidth, weights, logits, acceptance,
+sampling algorithm, targetverify behavior or precision changes are proposed.
+
+Required gates: realGloo2/4rank transportexactness inclfullint64IDs and NaNbits;
+CUDAvirtualrank graph replay exactness, uneven/changedN, fulloutputguardzones;
+charged localoverhead native vs packedcontrol underpairedABBA; sourcepatch
+guarded collectivecoherentconstruction and capturebufferlifetimes. A remote
+check is not authorized by this plan, regardless of localpasses.

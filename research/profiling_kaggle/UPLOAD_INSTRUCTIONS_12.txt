@@ -1,0 +1,10 @@
+Upload 12_kaggle_two_buffer_gate.ipynb to Kaggle.
+Select GPU T4, keep defaults and Run All. Only GPU 0 is used.
+No Internet, packages, datasets or model weights required.
+Download v4_two_buffer_gate_*.zip into D:\OpenKernelChallenge\serving\profiling_kaggle\notebook12_results.
+Run export even if a section fails and return the whole ZIP. Stop the GPU session afterward.
+
+This is a correctness gate, not a latency benchmark.
+Expected CUDA run: 1,296 matrix cases / 2,592 output checks (384 metadata-only fused outputs and 2,208 value-checked outputs), 128 graph-update outputs, 48 move/recapture outputs, 25 rejected invalid updates.
+Tests eight expert partitions sequentially on one GPU, not eight-GPU execution.
+The selected two-buffer diff is unchanged and unapplied. Any map edit must refresh lookup before consumption; moves require graph recapture. Actual fused kernels, full serving and H200 behavior remain untested.

@@ -1,0 +1,372 @@
+INFERENCE SOURCE AUDIT - ONGOING
+Bounded broad survey, not exhaustive market coverage; reviewed levels distinguish downloaded READMEs, source audits and actual experiments. No vendor claim is a measured improvement of our serving candidate.
+
+{"unique_repository_strings": 92, "at_least_one_retrieved_file": 77, "with_manual_assessment": 50}
+
+0xmsu/awesome-inference-engineering | discovery catalogue only
+Used to discover projects, not as primary evidence for speedup claims.
+https://github.com/0xmsu/awesome-inference-engineering
+
+AutoGPTQ/AutoGPTQ | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/AutoGPTQ/AutoGPTQ
+
+Dao-AILab/flash-attention | native oracle audit
+Local pinned SM86 SWA mainloop ignores n_offset, unlike Hopper. Independent FP32 controls establish local correctness problem. Do not promote affected timing evidence.
+https://github.com/Dao-AILab/flash-attention
+
+EricLBuehler/mistral.rs | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/EricLBuehler/mistral.rs
+
+FluffyAIcode/Kakeya-LLM-Inference-engine | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/FluffyAIcode/Kakeya-LLM-Inference-engine
+
+GeeeekExplorer/nano-vllm | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/GeeeekExplorer/nano-vllm
+
+HazyResearch/Megakernels | model integration gap
+H100/B200 Llama-oriented persistent machinery; no validated Muse model path. Ideas require precision/lifetime audit.
+https://github.com/HazyResearch/Megakernels
+
+HazyResearch/ThunderKittens | kernel building blocks
+Useful Hopper WGMMA and persistent pipeline primitives; not a complete serving result.
+https://github.com/HazyResearch/ThunderKittens
+
+Infini-AI-Lab/Satori | unavailable/unverified
+Failed guessed or unavailable source retained; do not infer project existence or performance.
+https://github.com/Infini-AI-Lab/Satori
+
+InternLM/lmdeploy | README hardware/model screened
+TurboMind reports MXFP4 gpt-oss acceleration onH800; format/model differ fromMuse NVFP4 group16. PD/FlashMLA/DeepGEMM/DeepEP are not a direct source-only replacement.
+https://github.com/InternLM/lmdeploy
+
+JustVugg/colibri | offload workload mismatch
+Muse GGUF/offload support does not preserve this NVFP4/BF16 H200 serving stack.
+https://github.com/JustVugg/colibri
+
+LMCache/LMCache | primary benchmark screened
+April2026 10x headline is cross-DP shared400GB host KV forQwen235B FP8 on8H100/vLLM0.18.1. MeanTTFT13.6x and decode3.8x vs fragmented per-process offload. Not fixedTP8 Muse; lmcache launchflags fixed. Generic cachepressure insight only.
+https://github.com/LMCache/LMCache
+
+Lightning-AI/litgpt | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/Lightning-AI/litgpt
+
+ModelTC/lightllm | deployment documentation screened
+DeepSeek H200 TP8 and DP8/EP recipes and microbatch overlap are documented. MLA/model differences and replicated-attention memory must be measured before a Muse transfer.
+https://github.com/ModelTC/lightllm
+
+NVIDIA/Megatron-LM | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/NVIDIA/Megatron-LM
+
+NVIDIA/TensorRT-LLM | leaf implementation audit
+NVFP4W4A16 does supportSM80+, but tracedleaf dequantizesactiveexperts into fullBF16W13+W2 allocations (~3.22GB/rank/layer), and folds global scalebeforecoefficientrounding. Directport failsourmemory/arithmeticpremise. Boundedstaged andsharedpacked alternatives independentlyinvestigated.
+https://github.com/NVIDIA/TensorRT-LLM
+
+NVIDIA/cutlass | active Hopper implementation
+Exactjudgeheaders/API adapted; sharedHumminglayout devicecompile reached optimizer thenlocal5GiBVMlimit. NoHopperkernelbinary/runtime. Bounded packedrepack is a distinct fallbackdesign, pendingqualification.
+https://github.com/NVIDIA/cutlass
+
+NVIDIA/dynamo | unavailable/unverified
+Failed guessed or unavailable source retained; do not infer project existence or performance.
+https://github.com/NVIDIA/dynamo
+
+NVIDIA/hyperflare-inference | primary architecture screened
+Local SM103/120/121 prototype; PyTorchCUDA13.2 preparation exportsgraphs toRust. Muse recipeexists, but hardware/dependency/backend differ. Caller-ownedworkspace and completecontinuationstate ideas useful; noHopperclaim.
+https://github.com/NVIDIA/hyperflare-inference
+
+Neroued/ninfer | platform and model gap
+SM120a consumer-GPU implementation; no validated H200 Muse workload.
+https://github.com/Neroued/ninfer
+
+Niko1221/Strata | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/Niko1221/Strata
+
+PaddlePaddle/FastDeploy | resolved README pointer; screened
+RootREADME is only a pointer toREADME_CN.md, now actually retrieved. Paddle engine supports PD/cachetransfer, MTP and several quantization formats; W4AFP8 would lower activationprecision here. No retrieved Muse/H200 exact kernel evidence.
+https://github.com/PaddlePaddle/FastDeploy
+
+Princeton-NLP/SpecInfer | unavailable/unverified
+Failed guessed or unavailable source retained; do not infer project existence or performance.
+https://github.com/Princeton-NLP/SpecInfer
+
+ROCm/ATOM | platform mismatch
+AMD runtime; useful conceptual kernels do not execute on H200.
+https://github.com/ROCm/ATOM
+
+ROCm/aiter | platform mismatch
+AMD kernel library, not a direct NVIDIA implementation.
+https://github.com/ROCm/aiter
+
+Red-Weasel/machx-inference-engine | unavailable/unverified
+Failed guessed or unavailable source retained; do not infer project existence or performance.
+https://github.com/Red-Weasel/machx-inference-engine
+
+RightNow-AI/AutoMegaKernel | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/RightNow-AI/AutoMegaKernel
+
+ScalingIntelligence/hydragen | workload dependence
+Shared-prefix decomposition can save cross-request attention, but92%cachehit does not establish sharedprefix across users; changes reduction order and needs real prefix reuse evidence.
+https://github.com/ScalingIntelligence/hydragen
+
+ScalingIntelligence/tokasaurus | README screened
+Llama3/Qwen2 engine, AsyncTP/Hydragen and predictive admission. No validated Muse NVFP4 path or end-to-end port.
+https://github.com/ScalingIntelligence/tokasaurus
+
+SciSharp/TensorSharp2 | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/SciSharp/TensorSharp2
+
+SyFI-ServingStudio/SSEngine-GLM5.3-Flash | workload mismatch
+PP4 B200 GLM5.3 prefill-only, exactly1output token. HBM/DRAM/SSD admission gain cannot be assigned to multi-turn decode serving. Prior graph staging studied already.
+https://github.com/SyFI-ServingStudio/SSEngine-GLM5.3-Flash
+
+WeightLab/bf16-exponent-compression | negative result screened
+Huffman vs ladder comparison and layout/index improvements; codec benchmark does not establish Muse inference gain.
+https://github.com/WeightLab/bf16-exponent-compression
+
+ai-dynamo/dynamo | corrected source location
+Correct public repository for NVIDIA Dynamo; earlier NVIDIA/dynamo fetch failures retained. Orchestration/PD/cache routing requires same-node applicability, not infrastructure substitution.
+https://github.com/ai-dynamo/dynamo
+
+alibaba/rtp-llm | README screened
+C++ scheduling, PD separation, prefix reuse and FlashAttention/FlashDecoding; no retrieved Muse/H200 exact-weight serving evidence. Quantization paths cannot be substituted.
+https://github.com/alibaba/rtp-llm
+
+aninrusimha/flashformer | resolved repository move
+README explicitly redirects tocheetah-lang/flashformer. Preserveoldretrieval aspointer, notimplementationevidence.
+https://github.com/aninrusimha/flashformer
+
+antgroup/AntLLM | unavailable/unverified
+Failed guessed or unavailable source retained; do not infer project existence or performance.
+https://github.com/antgroup/AntLLM
+
+brianbell-x/weight-compression | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/brianbell-x/weight-compression
+
+cenconq25/Turbo-Lossless | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/cenconq25/Turbo-Lossless
+
+cheetah-lang/flashformer | primary README discovered
+Whole-forwardkernel research built onCheetah; retrievedREADMEveryshort andnoqualifiedMuse implementation. Detailedsource audit remains open.
+https://github.com/cheetah-lang/flashformer
+
+chenweioh/vortex | unavailable/unverified
+Failed guessed or unavailable source retained; do not infer project existence or performance.
+https://github.com/chenweioh/vortex
+
+cloudflareresearch/unweight-kernels | lossless-storage source screened
+Hopper reconstructive BF16 matmul; requires separate preservation of accumulation and runtime boundaries. Storage losslessness alone does not guarantee serving outputs. No benchmark here.
+https://github.com/cloudflareresearch/unweight-kernels
+
+cohere-ai/cohere-megakernel | shape mismatch
+Inspected Hopper implementation assumes d128, small batch and128experts; Muse d64 and256experts need redesign rather than source reuse.
+https://github.com/cohere-ai/cohere-megakernel
+
+dangxingyu/megakernels | unavailable/unverified
+Failed guessed or unavailable source retained; do not infer project existence or performance.
+https://github.com/dangxingyu/megakernels
+
+deepseek-ai/DeepEP | dependency and topology gate
+Current2.5 Hopper support requiresCUDA13.1/NCCL2.32.3; judge NCCL2.30.7 and source-only dependency restriction preclude wholesale upgrade.
+https://github.com/deepseek-ai/DeepEP
+
+deepseek-ai/DeepGEMM | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/deepseek-ai/DeepGEMM
+
+deepseek-ai/DeepInfer | selective donor audit
+DeepSeekV4.1, SM100/Ascend950 and disaggregation; source context producer/cache ideas inspired fixed-width DFlash graph experiment, locally neutral. Not a Hopper drop-in.
+https://github.com/deepseek-ai/DeepInfer
+
+deepseek-ai/FlashMLA | attention/model mismatch
+Latest source dropped Hopper; previous Hopper revision exists but MLA/DSA is not Muse GQA d64. No direct performance attribution.
+https://github.com/deepseek-ai/FlashMLA
+
+dphnAI/nf12 | format and runtime screened
+Lossless12-bit BF16 storage with exact escapes; fixed tile constraints and native CUDA13/PyTorch requirements. Fused GEMM reduction changes need separate qualification; do not call compression arithmetic parity.
+https://github.com/dphnAI/nf12
+
+efeslab/Nanoflow | primary paper and source screened
+Nano-batching overlaps heterogeneous resources; reported1.91x vsTRTLLM onolderLlama/Mixtral suite. Author confirms its asyncCPU scheduler is alreadySGLang default sincev0.4. Intra-GPU overlap still requires resourceinterference measurements.
+https://github.com/efeslab/Nanoflow
+
+exo-explore/exo | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/exo-explore/exo
+
+facebookresearch/sgl-muse-mega | architecture mismatch
+Published2.1x single-user decode is8GB300, CUDA13.1/SM103 and BF16KV, not this8H200 FP8KV four-load task.
+https://github.com/facebookresearch/sgl-muse-mega
+
+flashinfer-ai/MegaMoE | unavailable/unverified
+Failed guessed or unavailable source retained; do not infer project existence or performance.
+https://github.com/flashinfer-ai/MegaMoE
+
+flashinfer-ai/flashinfer | selective kernel audit
+MoE W4A16 platform, weight layout and activation dtype gates reviewed; Blackwell/Rubin kernels are not Hopper NVFP4/BF16 replacements.
+https://github.com/flashinfer-ai/flashinfer
+
+flashinfer-ai/flashinfer-bench | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/flashinfer-ai/flashinfer-bench
+
+flexflow/flexflow-serve | primary README screened
+SpecInfer tree-verification with separate small models and hybridTP/PP; generic1.3-2x claims have different models and baselines. FrozenDFlash cannot be silently replaced.
+https://github.com/flexflow/flexflow-serve
+
+ggml-org/llama.cpp | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/ggml-org/llama.cpp
+
+ggml-org/whisper.cpp | outside target workload
+Audio inference engine, not autoregressive Muse serving.
+https://github.com/ggml-org/whisper.cpp
+
+huggingface/candle | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/huggingface/candle
+
+huggingface/text-generation-inference | README screened
+Continuous batching, optimized attention and generic speculative decoding are already represented in pinnedSGLang. No retrieved exactMuse H2002x evidence.
+https://github.com/huggingface/text-generation-inference
+
+iamwavecut/ninfer-all | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/iamwavecut/ninfer-all
+
+kvcache-ai/Mooncake | cache-system README screened
+KV transport, PD deployment and cache scheduling are useful infrastructure. Fixed single-node serving cannot inherit multi-node disaggregation gains.
+https://github.com/kvcache-ai/Mooncake
+
+kvcache-ai/ktransformers | hardware/workload mismatch
+CPU expert offload and consumer/Ascend deployments target different memory topologies. No direct resident8H200 serving gain established.
+https://github.com/kvcache-ai/ktransformers
+
+lightseekorg/tokenspeed | model and cache source audit
+Muse precision contracts, owned-row projection, typed cache groups and bounded replay reviewed. Current documented NVFP4 Muse path is Blackwell, AMD path MXFP4. Generic lifecycle ideas transferable only with pinned SGLang integration.
+https://github.com/lightseekorg/tokenspeed
+
+ludc/sarathi-serve | unavailable/unverified
+Failed guessed or unavailable source retained; do not infer project existence or performance.
+https://github.com/ludc/sarathi-serve
+
+luongthecong123/smallpond | unavailable/unverified
+Failed guessed or unavailable source retained; do not infer project existence or performance.
+https://github.com/luongthecong123/smallpond
+
+microsoft/DeepSpeed | README mechanism screened
+Training/offload and inference optimization framework; README hardware coverage does not establish a Muse NVFP4/H200 kernel replacement.
+https://github.com/microsoft/DeepSpeed
+
+microsoft/DeepSpeed-MII | README mechanism screened
+FastGen DynamicSplitFuse combines chunked prefill and decoding, with batchedKV and continuousbatching. These mechanisms already exist in the pinned serving baseline; no novel Muse-specific patch established.
+https://github.com/microsoft/DeepSpeed-MII
+
+microsoft/sarathi-serve | corrected source location
+Correct Sarathi-Serve repository. Chunked-prefill/mixed-batch technique already exists in pinned serving; previous mixed-chunk H200 check nearly matched parent.
+https://github.com/microsoft/sarathi-serve
+
+mirage-project/mirage | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/mirage-project/mirage
+
+ml-explore/mlx-lm | platform mismatch
+Apple runtime; no direct H200 source integration.
+https://github.com/ml-explore/mlx-lm
+
+mlc-ai/mlc-llm | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/mlc-ai/mlc-llm
+
+mlsys2025/FlashDecoding++ | unverified guessed repository; paper found
+Guessedrepo notvalidated. Primary MLSys2024 paper describes asynchronoussoftmax, flatGEMM andheuristics; olddense-modelcomparisons do not establish Muse FP8attention equivalence.
+https://github.com/mlsys2025/FlashDecoding++
+
+modular/modular | official supported-model list screened
+MAX supports broadBF16/FP8/FP4 architectures and DFlashKimi/Llama. Retrieved modeltable does not list Muse; compiler/runtimeport is not an inspectable drop-in H200 kernel gain.
+https://github.com/modular/modular
+
+mozilla-ai/llamafile | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/mozilla-ai/llamafile
+
+nvidia/cuda-quantization | unavailable/unverified
+Failed guessed or unavailable source retained; do not infer project existence or performance.
+https://github.com/nvidia/cuda-quantization
+
+ollama/ollama | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/ollama/ollama
+
+parda21/NWC | results and limitations screened
+BF16 entropy coding saves weight bytes; reported RTX/A16 results and open H100 question are not H200 evidence. FP8 conversion path is excluded.
+https://github.com/parda21/NWC
+
+sgl-project/sgl-kernel | unavailable/unverified
+Failed guessed or unavailable source retained; do not infer project existence or performance.
+https://github.com/sgl-project/sgl-kernel
+
+sgl-project/sglang | pinned baseline and current source audit
+Judge is v0.5.23 commit297e54f. Current release marketing often describes features already in the baseline. Source-level selective backport only; no wholesale engine upgrade.
+https://github.com/sgl-project/sglang
+
+tencent/Weaver | unavailable/unverified
+Failed guessed or unavailable source retained; do not infer project existence or performance.
+https://github.com/tencent/Weaver
+
+thu-pacman/chitu | README and model list screened
+Multi-platform inference, FP4-to-BF16/FP8 paths and PD runtime. Retrieved supported-model list does not establish Muse exact-layout implementation.
+https://github.com/thu-pacman/chitu
+
+turboderp-org/exllamav3 | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/turboderp-org/exllamav3
+
+ucb-bar/megakernels | unavailable/unverified
+Failed guessed or unavailable source retained; do not infer project existence or performance.
+https://github.com/ucb-bar/megakernels
+
+uv-genai/gufo-tp | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/uv-genai/gufo-tp
+
+vectorch-ai/ScaleLLM | README lineage screened
+C++ runtime lineage used byxLLM, with customattention/CUDAgraphs/prefixcache/chunkedprefill/speculation. PublicmodelsLlama/Gemma/Phi do not establish this Muse path.
+https://github.com/vectorch-ai/ScaleLLM
+
+vllm-project/aibrix | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/vllm-project/aibrix
+
+vllm-project/llm-compressor | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/vllm-project/llm-compressor
+
+vllm-project/vllm | selective donor audit
+Muse specialized CUDA/CuTe and AMD monokernel sources inspected by MoE lane. Architecture and arithmetic gates required; no measured serving transfer.
+https://github.com/vllm-project/vllm
+
+xLLM-AI/xllm | README screened
+Production C++ runtime optimized for Chinese accelerators, with Mooncake cache. No retrieved Muse/H200 kernel transfer evidence.
+https://github.com/xLLM-AI/xllm
+
+zhongkaifu/TensorSharp | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/zhongkaifu/TensorSharp
+
+zml/zml | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/zml/zml
+
+ztxz16/fastllm | discovery only
+Snapshot retrieval is not a source audit or experimental validation.
+https://github.com/ztxz16/fastllm

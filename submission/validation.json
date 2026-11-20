@@ -1,0 +1,48 @@
+{
+  "validated_utc": "2026-11-20T06:50:31.441968+00:00",
+  "patch_sha256": "8c7547213fb993a318321a26f84e2872db8c87b358ee3d3ea638695702b0dc2b",
+  "bytes": 83849,
+  "limit_bytes": 409600,
+  "max_added_line_chars": 226,
+  "base": "297e54fd105e974cdf401e5b4d20253a22c16f90",
+  "files": [
+    "python/sglang/kernels/ops/moe/adaptive_marlin_tiles.py",
+    "python/sglang/kernels/ops/moe/moe_align_small_numel.py",
+    "python/sglang/kernels/ops/moe/muse_spark_humming_scale.py",
+    "python/sglang/kernels/ops/moe/muse_spark_humming_split.py",
+    "python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py",
+    "python/sglang/srt/layers/attention/flashattention_backend.py",
+    "python/sglang/srt/layers/communication/muse_spark_gemm_ag.py",
+    "python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py",
+    "python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py",
+    "python/sglang/srt/models/muse_spark.py"
+  ],
+  "plain_git_apply": [
+    {
+      "command": [
+        "git",
+        "apply",
+        "--check",
+        "D:\\OpenKernelChallenge\\serving\\final_submission_2026-11-20\\candidate.diff"
+      ],
+      "code": 0,
+      "stderr": ""
+    },
+    {
+      "command": [
+        "git",
+        "apply",
+        "D:\\OpenKernelChallenge\\serving\\final_submission_2026-11-20\\candidate.diff"
+      ],
+      "code": 0,
+      "stderr": ""
+    }
+  ],
+  "source_hashes_match": true,
+  "python_ast_files": 10,
+  "flags": {
+    "--moe-runner-backend": "humming",
+    "--swa-full-tokens-ratio": "0.35"
+  },
+  "source_code_changes_since_best_scored_run": false
+}

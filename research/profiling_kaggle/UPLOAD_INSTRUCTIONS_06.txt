@@ -1,0 +1,11 @@
+Upload only 06_kaggle_replay_schedule.ipynb. Select GPU T4, keep defaults and Run All. Internet can stay off; no installs, credentials or model files are required.
+
+This tests three inference-mode schedules: static maps with K separate graph replays, eager refresh outside capture followed by K replays, and a captured update-plus-K cycle. The source candidate is unchanged and unapplied.
+
+Defaults: 192 input correctness cases; 30 benchmark cases; 360 changed-input schedule checks; 180 timing rows and 1,980 samples. K=1,2,4,8,64 at 32/128 tokens.
+
+Expected: correctness and benchmark passed. Profiler may be partial when graph kernels lack launch correlations; unmatched events are retained.
+
+Run the final export cell even if a section fails. Download v4_replay_schedule_*.zip into profiling_kaggle/notebook06_results, then stop the GPU session.
+
+This measures source-selected prefixes, not full serving, alignment/GEMMs or H200 performance. Map-update frequency in production remains unknown.

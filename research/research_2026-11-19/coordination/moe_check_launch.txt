@@ -1,0 +1,4 @@
+﻿✓ submitted research_2026-11-19/moe/normal_package/candidate.diff as a check run at 16 users  14 files changed · job f038a667401a4d0a
+  flags       --enable-profile-cuda-graph · --moe-runner-backend humming
+
+next  okc serve status f038a667401a4d0a --wait

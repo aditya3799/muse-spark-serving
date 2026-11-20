@@ -1,0 +1,7 @@
+﻿# Window omission with sequence-parallel Humming
+
+The cumulative candidate combines the scored Humming parent, the frozen early target-window omission and the conservative full-row router. The producer owns its five tap tensors per request. An eligible eager DFlash chunk omits them. A captured body can return its captured tuple and the live eager wrapper discards the unused taps before packing or all-gather. This preserves the primary hidden-state gather required for correct request-row logits.
+
+The FULL graph runner copies the live request for its eager tail. The BCG runner creates a fresh ForwardBatch from a fixed field list, losing a dynamic omission flag. The combined candidate creates a private BCG tail view only for a live omission. No flag persists into subsequent requests that require hidden states. The scored job used FULL for eight-query verification. No BCG speed attribution is included.
+
+Run build.py and qualify.py. The resulting candidate.diff has SHA-256 bfd4dba7d9b28435766177b1f3f8e03d8d8b2ad0a248255ad68f1e60f0cebed8. ownership.json covers 32 combinations across live/frozen body, eager/FULL/BCG, input IDs/embeddings, alternating omit/capture, and 753 raw rows padded to 768. The tests execute the actual wrapper, graph branch and SP verdict with a reconstructed TP8 collective, BF16 tap rows, and FP32 primary rows. Real multi-GPU timing and deployment remain unverified.

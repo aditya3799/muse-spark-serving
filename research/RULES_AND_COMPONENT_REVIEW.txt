@@ -1,0 +1,91 @@
+﻿Serving rules and component review - 2026-11-12
+
+Confirmed submission format
+The live rules require a unified diff against SGLang 297e54fd, submitted through
+OKC. They ask for the quality of an SGLang pull request that maintainers could
+review and accept; they do not require opening a GitHub PR. Maintainability,
+other-model/GPU compatibility and generality matter to eligibility.
+Source: https://openkernelchallenge.dev/rules
+Verified from current public page asset /assets/index-DITIunFP.js because the page
+is client-rendered and search results were stale. No code from that asset is used.
+
+Live rules override our earlier init snapshot where they differ:
+- 400 KB patch limit; added lines <=400 characters; source/JSON only under
+  python/sglang; no model_loader changes, renames or binary changes.
+- No lower precision, approximations or skipped work beyond stock SGLang.
+- Extra GPU memory <=2 GB per GPU versus stock, including persistent repacks.
+- Flags can change through the generated flags file except those listed fixed.
+- TTFT <=2x stock at each load. Three checks and one scored run daily.
+- Private serving board; maintainers participate in final review.
+OKC was updated from 0.7.1 to 0.8.2 and serve init was rerun safely: RULES.md is now refreshed and flags exists. The checkout and empty patch were preserved. Checks default to 16 users and accept --users 1|4|32. The refreshed contract requires exactly the token count requested, rather than assuming a hard-coded 220.
+
+Local components reviewed (read-only)
+1. muse_attention_decode:
+   RESUME_NOTES_2026-11-04_ATTENTION.md records a Nov 5 winner at 2.69349x.
+   Useful: complete FP8 paged attention, work balancing, fused gate/norm, shorter
+   reduction chains. Audit each active arithmetic path against stock: source
+   includes FP16 exponential helpers; old kernel acceptance is not serving proof.
+   Latest resident work split is specialized; generalize from actual work, not
+   contest load labels. Whole source is 260290 bytes before diff overhead.
+2. muse_bf16_proj:
+   RESUME_TOMORROW.md preserves the faithful v150 result near 1.585x. Active
+   submission.py is a different 96645-byte composite, so select donors by actual
+   validated file/hash, not the filename alone. Useful: hi/lo router packing,
+   skinny GEMM, lossless layouts, fewer launches. Current SGLang already has
+   CuTe GEMV and two-GEMM hi/lo router; a packed single-GEMM approach merits a
+   compact comparison. Preserve parameter registration and numerical behavior.
+3. muse_moe_w4a16:
+   RESUME_NEXT_SESSION.md preserves v139 near 2.390x; active source includes a
+   later M32 path. Useful: persistent W4A16 pipeline, exact K permutation,
+   routing/gather organization and load balance. Whole source 831543 bytes:
+   extract one mechanism. prepare() creates tiny/m32/larger packed layouts;
+   carrying that duplication across all model layers risks the 2 GB budget.
+   Polynomial-SiLU diagnostics were rejected and are not a donor.
+4. muse_decode_layer:
+   PROGRESS.md protects S081 near 2.261x; recombined standalone wins often lost
+   in the full chain. Useful: vectorized boundaries, dependency scheduling and
+   whole-chain validation. Its 993238-byte monolith cannot be submitted intact;
+   serving must retain real collectives rather than the kernel task's identity
+   all-reduces. Several prepare/kernel_fn overrides also need consolidation.
+5. muse_prefill_layer:
+   GOAL_PROGRESS.md records 210.713 ms scored and 210.067 ms checked, a difference
+   within noise. Useful: lossless K64 packing and measured size-dependent expert
+   tiles; retain FA3 as the stock-quality reference. Source 467943 bytes is also
+   over the new patch limit before diff overhead.
+6. prefill_moe_reference:
+   Reference semantics for per-expert RMSNorm before weighted sum and NVFP4
+   scales. Use to validate adapters; it is not an end-to-end serving solution.
+
+External reference
+https://github.com/gauravjain14/muse-okc-submissions
+Local: references/gauravjain14-muse-okc-submissions
+Reviewed revision: 30a2bcfcee0f0f4b1a10043191a359c725c2f5e1
+Read all five component overview READMEs plus MoE milestone 11, projection
+milestone 11, dead ends and attribution notices. These are kernel-track results,
+not evidence of full-model serving speedup.
+
+Promising transferable ideas:
+- MoE: early first copy, warp-uniform completion polling, lean item transitions,
+  warp-aggregated work claims and wide/narrow tile separation. The final MoE
+  milestone reports 2.6315x in one judge run; it is a donor for study, not a
+  performance promise. Its 639607-byte build also needs substantial extraction.
+- Attention: compact modules and shorter launch/reduction chains, contiguous
+  whole-KV-row loads, shorter cold instruction paths. Rework FP16-softmax or
+  approximate EXPQ paths to match stock; do not import them blindly.
+- Projections: reduce partial-output traffic, avoid load sinking into the tail,
+  one-wave small GEMMs, exact escapes for small coefficients.
+- Prefill: separate wide/narrow expert tiles, account for register contention
+  between WGMMA and unpack work, avoid unsupported prefetch assumptions.
+- Measurements: shared weights in A/B runs, multiple input placements, paired
+  AB/BA timing and nearby shapes. The external dead ends overlap many local
+  rejections; avoid repeating them without a new mechanism.
+
+Implementation direction
+Build a small, readable, default-safe SGLang patch with a stock fallback and
+explicit GPU/layout checks. Start by auditing a compact MoE mechanism, with a
+router-only change as a lower-integration-cost comparison. Choose actual tensor
+geometry/workload features rather than matching concurrency 1/4/16/32. Include
+memory accounting across every layer, correctness and end-to-end measurements.
+Keep borrowed code's SPDX notices and required license/copyright attribution.
+No component incumbents were edited and no judge runs were used in this review.
+

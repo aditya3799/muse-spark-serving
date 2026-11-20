@@ -1,0 +1,86 @@
+--- a/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
++++ b/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
+@@ -111,6 +111,49 @@
+     return group.all_gather(local, dim=0)
+ 
+ 
++def nccl_row_projection_supported(group, partial, weight) -> bool:
++    """Keep the native FP32 custom-reduction regime unchanged.
++
++    Only consider tensors above the communicator's actual custom-AR capacity,
++    and exclude every other specialized all-reduce backend. The baseline then
++    uses NCCL with the same BF16 input/output dtype as this reduce-scatter.
++    """
++    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
++        CustomAllReduceV2,
++    )
++
++    if not prefill_row_projection_supported(group, partial, weight):
++        return False
++    comm = group.ca_comm
++    if not isinstance(comm, CustomAllReduceV2):
++        return False
++    if partial.numel() * partial.element_size() <= comm.max_size:
++        return False
++    if group.pynccl_comm is None or group._fi_workspace_hint is not None:
++        return False
++    for name in (
++        "pcie_ipc_comm", "qr_comm", "pymscclpp_comm", "torch_symm_mem_comm"
++    ):
++        other = getattr(group, name, None)
++        if other is not None and not getattr(other, "disabled", False):
++            return False
++    return True
++
++
++def reduce_scatter_row_projection(group, partial, weight):
++    """Reduce expert row shards before their complete-K replicated projection.
++
++    Caller requires equal contiguous token-row partitions, independent expert
++    contributions and no preceding fused reduction. BF16 collective dtype and
++    FP32 GEMM output preserve the existing arithmetic precision boundaries.
++    """
++    local_input = group.reduce_scatter_along_dim(partial, dim=0)
++    local_fp32 = torch.mm(local_input, weight.t(), out_dtype=torch.float32)
++    local = local_fp32.to(partial.dtype)
++    del local_fp32
++    return group.all_gather(local, dim=0)
++
++
+ def small_projection_supported(group, x, weight) -> bool:
+     """Hopper column shards through an already-reserved multicast workspace."""
+     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -55,6 +55,8 @@
+     gemm_local,
+     prefill_row_projection,
+     prefill_row_projection_supported,
++    reduce_scatter_row_projection,
++    nccl_row_projection_supported,
+     reserve_projection_workspace,
+     small_projection,
+     small_projection_supported,
+@@ -737,6 +739,22 @@
+     def _reduce_and_unpool(
+         self, output: torch.Tensor, *, already_reduced: bool = False
+     ) -> torch.Tensor:
++        # Row-local projection consumes only this rank's reduced token shard.
++        if (
++            not already_reduced
++            and self.tp_size > 1
++            and self.moe_tp_size == 1
++            and self.post_expert_proj is not None
++            and self._can_shard_prefill_row_projection(
++                output, self.post_expert_proj.weight
++            )
++            and nccl_row_projection_supported(
++                get_parallel().tp_group, output, self.post_expert_proj.weight
++            )
++        ):
++            return reduce_scatter_row_projection(
++                get_parallel().tp_group, output, self.post_expert_proj.weight
++            )
+         # Expert TP already reduced across ranks, before its post-expert norm.
+         if (
+             self.tp_size > 1

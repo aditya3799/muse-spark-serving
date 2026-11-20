@@ -1,0 +1,173 @@
+DECODE RESEARCH — 2026-11-19 (ongoing; not a submission recommendation)
+
+Frozen official release remains SHA256
+8c7547213fb993a318321a26f84e2872db8c87b358ee3d3ea638695702b0dc2b,
+official score 1.2363x. No remote checker, scored run or paid GPU was launched.
+None of the evidence below establishes 2x serving speed.
+
+1. A native SM86 sliding-attention defect invalidated earlier attention timings.
+
+Pinned sgl-flash-attn f89bc2306632d1ec5f97b014dded4254f5b4a907 block.h returns
+(n_block_min,n_block_max,n_offset) after subtracting local-window origin from
+the key length. mainloop_fwd_sm80.hpp lines330-335 takes only the first two
+fields. Its loads and masks still use original positions. SM90 consumes the
+offset at mainloop_fwd_sm90_tma_gmma_ws.hpp lines692,747-748,784,1237.
+Thus this is an SM86 diagnostic issue, not evidence of an H200 defect.
+
+attention_oracle_v2.py/json tests 48 controls: full/sliding, heads2/16,
+packed/unpacked GQA, q lengths(8,8)/(1,8), random/zero queries, distinct
+permuted physical pages, original and exact-origin-rebased tables. Full and
+exact-origin SWA agree with explicit FP32 masked softmax: max BF16 error<9e-5,
+LSE error<=1.91e-6. Original SWA differs by~0.02-0.025 and has16-128 nonfinite
+LSE entries. The exact-origin rebase is max(0,L-q_len-2047), not an aligned
+approximation. It makes the ignored offset zero; it does not change H200 code.
+
+Consequences: native_schedule_reward.json's nominal1.0132x/1.0143x and old
+chain_reward.json's nominal1.0077x/1.0028x are baseline-equivalence results for
+the defective local native attention implementation. They cannot be promoted
+as valid attention or broad serving wins. window_1845293's alignment128/1920
+rejection is preserved but cannot prove H200 compact windows impossible.
+
+2. Corrected state-coupled four-block decoder: no confirmed gain.
+
+chain_oracle_v2.py generates a new fixture revision without touching old
+sources or receipts. All arms receive identical exact-origin SWA tables and
+lengths; the same projection/MoE/residual/query/cache functions remain.
+Each graph executes four distinct dense block weights, one shared full-size
+rank-local32-expert bank, native BF16 paged attention, original Humming, and
+changes attention inputs, KV, residuals and routes per replay. Missing TP peers
+and FP8-to-BF16 local attention bridge remain explicit limitations.
+
+chain_oracle_v2_reward.json:
+ seed2187613:1.002657642 CI[1.001567073,1.003610131], KEEP
+ seed3298517:0.999257263 CI[0.998022920,1.000635244], NO-GAIN
+ local_keep=false. Attention outputs, next attention input, FP32 residual and
+global expert IDs match exactly between arms in both seeds. The corrected
+broader result does not reproduce a practically material decode improvement.
+
+3. Same-shape DFlash context CUDA graph: exact, NO-GAIN locally.
+
+dflash_context_graph.py uses the original scored target residual capture/pack
+function and actual full40960->8192 BF16 FC, native RMSNorm,8192->1280 KV FC,
+five-layer norm/RoPE and prefix-valid writes. Candidate caches a CUDA graph at
+the exact B*8 shape, charging copies of changing positions, physical cache
+locations and commit lengths. All intermediate normalized values, KV project
+outputs, and final full physical pools match exactly. Rejected rows are checked.
+No compact GEMM, quantization, altered acceptance or extra speculative writes.
+Target/draft model blocks, TP and real weights remain outside this fixture.
+
+dflash_graph_reward.json seed913785:0.996844452 CI[0.992165103,1.001165447],
+NO-GAIN. Broad full-context FC dominates the SM86 times(~6-15ms). No unchanged
+holdout is warranted. Raw receipt retained; canonical.json only adds the agent
+metadata missing from first emitted receipt.
+
+This is a different region from existing DFlash draft-forward graph capture:
+pinned dflash_worker_v2.py calls _append_target_hidden_to_draft_kv_by_loc after
+_accept_block. DeepInfer's producer-side update_main_cache inspired exploration,
+but this experiment deliberately retains original post-accept prefix writes.
+
+4. Public H200 kernels: source audit finds material numerical incompatibility.
+
+alygg77/okc-muse-spark-kernels@6cae49a639ee6d14b929a5fd4a63c627f96d7dc0
+sources/alygg77/manifest.json captures the155KB attention source, RESULTS,
+NOTICE and detailed positive/negative H200 measurements. Reported attention
+2.653x and layer2.2058x are kernel-track comparisons to stock SGLang, not our
+frozen serving build. The attention file is vjeux f35a41e unchanged except
+attribution; this is not automatically a fresh algorithm.
+
+Concrete gate: its Q/K prologue normalizes/rotates in FP32 then directly
+converts to FP8. Pinned FusedQKNorm rounds to BF16 before rotation and again
+before FP8. It also uses approximate on-the-fly sincos, a changed split merge
+via FP32 atomics, and no BF16 attention boundary before the final norm/gate.
+public_attention_rounding_oracle.py/json isolates only the missing BF16 casts
+while holding norm and trig equal. Of524288 FP8 codes,16088(3.069%) differ in
+full attention and22710(4.332%) in rotary attention; maxabsolute codevalue
+difference0.25. This CPU mechanism oracle is not full GPU kernel validation.
+The donor cannot be imported unchanged as a lossless frozen-parent speedup.
+
+5. Pinned upstream engine mechanisms inspected.
+
+sources/known_manifest.json,followup_manifest.json preserve commits and hashes.
+
+- Cohere cohere-megakernel67d0b9ca22ea3652796b715d1d1863459e0e2c3c:
+  persistent sm90a scheduler, producer/consumer/storer warps, semaphore queues,
+  L2 policies and n8WGMMA. Fixed NorthMiniCode hidden2048,d128,4KV,128experts,
+  BF16 weights/cache. Muse d64,FP8/NVFP4,TP8 and width8 verify require a major
+  port. Four-part K reduction is a different frozen arithmetic path.
+- Tencent hpc-ops96be0af753c4ff0f6e62f5129f45293748c5dee8:
+  native BF16+FP8 decode requires d128; no matching SWA API in read headers.
+  Persistent task map and dynamic64KV-tile scheduler are donors, not direct
+  Muse d64 kernels. vLLM integration initially Hy3-FP8 only.
+- Mirage e801b892ee9b06ba277fb80ca0630c2126c85b1c:
+  persistent worker/scheduler CTAs, host-ring/page allocator, local/remote
+  queues and events. Requires importing/compiling entire execution graph;
+  cannot be treated as a small H200 kernel replacement.
+- DeepInfer a679bb86ce36e883a98a97733492b686e5b9a08e:
+  producer-side merged main-KV projection writes all target rows inside target
+  graph; rejected rows overwritten before read by its own cache contract.
+  DSpark confidence scheduler uses trained confidence head, cumprod proposals,
+  and dynamic perrequest verify budgets, unlike fixed Muse DFlash2 width8.
+  N-2/N-1 scheduling avoids synchronous current proposal dependence. Batch
+  invariant GEMMs define its arithmetic; they do not reproduce our reference.
+- TRT-LLM v1.4.0rc4 PR21356 Muse fast paths: GB300 cluster1-32tokens,
+  TP4/EP4 finalize+AR, FP4 norm quant changes scales/codes. No direct TP8H200
+  benefit established. Draft row picker PR22008 excludes DFlash architecture.
+
+Cached public Qwen tree followup was not run: weights are streamed each call,
+not persisted on Windows or inspected Linux caches; >1GB network would be
+needed. Its 2-BF16-ULP guard is heuristic, not a certified error bound. Earlier
+target/cache batch dependence remains; no repetition can establish exactness.
+
+Pending work is a new mechanism or an explicit architecture gate, not a scored
+submission. Preserve all old positive and negative receipts for audit.
+
+6. Later follow-up: qualified local output-N projection component.
+
+The subsequent output-channel partition retains the original FC's complete K
+reduction and row count, computes one eighth of its output channels per TP
+rank, gathers the full FC output, then preserves native RMS and all five
+rank-owned KV operations. This is distinct from older full-FC retile attempts.
+Public actual FC/KV weights, independent changed activations, partial/full
+accepted lengths, graph replay, and full backing-cache comparisons passed.
+The independently paired component result is 4.3200x, CI[4.2606,4.3903].
+Its timed fixture includes local projection and a charged full gather-copy
+but idealized peer transport; it does not measure NCCL or serving throughput.
+
+PACKAGE_VALIDATION.json and PACKAGE_REVIEW.txt are the authoritative evidence
+index. Frozen output_n_package/source_manifest.json SHA256:
+84d364da30dd5f58eeee17f828827b76129ccab4f7683c6899f22ea2ebea5525.
+Actual TP8 Gloo tests cover coherent startup/fallback controls with mocked
+arithmetic; actual GPU package tests cover native mathematics, stream/lifetime,
+graph changes and fallbacks with virtual peers. Neither substitutes for NCCL.
+The production startup gate requires actual loaded-weight exact qualification
+and local-FC-plus-real-gather median latency beating native on every rank.
+Unknown shapes retain the parent. The configured decode buckets do not cover
+ragged prefill M753, and no TTFT gain is claimed for that tail.
+Parent owns the queued unscored H200 integration check; no scored submission
+has been requested or run by this lane.
+
+7. Precision-restored public attention remains a separate unqualified lead.
+
+precision_attention.py restores BF16 boundaries, cached original FP32 rotary
+values, and native-style FP32 online-softmax denominator/P*256 scaling. The
+SM90a request/flat device instantiations compile, and the small diagnostic C
+ABI builds and passes CPU Params-layout checks. No Hopper kernel was executed.
+ATTENTION_DIAGNOSTIC_REVIEW.json records its source hashes and remaining gates.
+The native reference harness follows the actual FA3 BF16 Q/K -> separate FP8
+cast/cache-store path, not the TRT-only fused FP8 store. The original folded
+Muse scale and reserved padding-slot semantics are preserved in that harness.
+ATTENTION_DIRECTION_FOLLOWUP.txt adds a CPU ablation: reversed native traversal
+versus forward donor traversal can materially affect FP8 probability rounding.
+Preserving operand precision does not establish agreement or a serving gain.
+
+8. Analytical scope prevents extrapolating the component result to 2x.
+
+PROJECTION_SCOPE_ANALYSIS.txt and projection_scope_analysis.json use the
+primary vLLM architecture recipe: all62 decoder layers are MoE, zero dense.
+Actual gated checkpoint configuration and endpoint expert dtypes remain
+unverified. The FC accounts for roughly3.6-5.8% of counted matmul arithmetic,
+depending on projection partitioning assumptions. This is not a time share.
+A uniform Amdahl model requires49.6864% of parent time in the improved
+component to reach2x stock from the frozen1.2363x using a4.32x component gain.
+Work/footprint accounting makes that hypothesis demanding but does not prove
+a runtime bound. Actual H200 full-frontier serving measurements remain needed.

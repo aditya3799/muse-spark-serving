@@ -1,0 +1,15 @@
+SERVING SESSION HANDOFF
+Updated 2026-11-15T02:15:31.790792+05:30 (Asia/Kolkata)
+Read PROGRESS_2026-11-15.txt for detailed findings, validation, artifacts, caveats and preferences.
+
+Active: V4 + selected two-buffer cached mapping. Integrated and submitted.
+Existing job: f1513498e8d84de8, 16-user UNSCORED H200 check, last observed QUEUED.
+Next: inspect this job; do not resubmit it. Full-model results are pending.
+Command: wsl -d Ubuntu -- /mnt/d/OpenKernelChallenge/bin/okc serve status f1513498e8d84de8
+Patch: submission_v4_cached_mapping.diff / patch.diff
+SHA256: cf02617f790e28c9229ac9aec5e517f04344c49491347ef732a352fbaa3aa4a4
+Original submission_v4.diff and pre-integration backup preserved. V5/V6 discarded.
+MoE notebook phase closed after Notebook 14; no Notebook 15 planned.
+Current integration supersedes pre-integration 'active V4 unchanged' wording in historical profiling reports.
+Scheduler/tokenizer initialization remains unprofiled. T4 prefix gains are not full-serving gains.
+No scored run authorized by this save request.

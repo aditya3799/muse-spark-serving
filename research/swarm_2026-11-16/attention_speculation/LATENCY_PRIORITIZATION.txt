@@ -1,0 +1,115 @@
+LATENCY EVIDENCE AND NEXT EXACT MECHANISM - 2026-11-16
+
+Evidence boundaries
+-------------------
+profiling_kaggle/ENVIRONMENT_HISTORY.txt identifies earlier timing runs and
+Notebook14 as Colab Tesla T4. Notebooks12/13 are Kaggle T4 correctness runs.
+The directory/notebook names are not provider provenance. Versions differ:
+recent Colab Torch2.14.1/Triton3.8; Kaggle Torch2.11/Triton3.6.
+
+Notebook01 preflight adapts synthetic expert mapping/sort/count/padding. It
+does not execute native BF16 Marlin on T4, full packed alignment, expert
+GEMMs, attention, communication, tokenizer or scheduler. The measured
+8/128-token diagnostic is about414-427us with weak token-count dependence.
+That motivates fixed-overhead investigation, not an exact host share.
+Its separate instrumented trace has17kernels+3copies/iteration. Annotation
+ranges duplicate accounting; traced kernel sums cannot be subtracted from
+separately measured wall time to calculate host overhead.
+
+Notebook14 source-prefix comparison isolates expert-ID/score conversion and
+mapping. Two-buffer lookup lowers median eager latency30.08%, graph25.73%
+on Colab T4,48/48 wins. Traced prefix goes6->4kernels. This is repeatable
+within-run narrow evidence, not H200/full-serving percentages. The selected
+two-buffer lookup is already present in today's exported compact32/row
+baseline; it is not an independent additional optimization to count again.
+
+Actual serving evidence
+-----------------------
+research_iteration_2026-11-15/scored_468701af35b84e07.json records8GPUs;
+RULES.md specifies the scored8xH200 node. Workload is variable multi-turn
+agentic conversations: recorded first-turn74160tokens, new-per-turn753,
+13turns, mean output220. These characterize the measurement only; no code
+dispatch may depend on them.
+
+Confirmed frontier geometric score1.0111, point ratios by concurrency:
+  1:1.0227; 4:1.0049; 16:1.0084; 32:1.0084.
+Rung acceptance3.9-4.2, cachehit0.92, no truncation/short outputs.
+First-turn TTFTp90 seconds:8.954,21.365,84.069,184.032.
+Later-turn TTFTp90 seconds:0.225,0.250,0.331,3.191.
+These reveal materially different first/later request behavior, but are
+quantiles, not additive stages. Do not subtract them or convert them into
+prefill/decode time shares. Per-user rates/frontier rates also differ in
+aggregation; do not combine their medians into a synthetic breakdown.
+Rung32 summary hasreps1 while frontier reports3pairedreps: preserve fields
+rather than treating every summary as the same population.
+
+Startup331.3s and startup.log record weight loading, graph capture, KV
+allocation and readiness probes. They are not a steady-state CUDA timeline.
+The retained log ends around readiness and contains no representative full
+decode phase. It establishes graphs/backend configuration, not host-launch
+dominance. No trustworthy H200 attention/MoE/projection/host percentages
+were found in these artifacts.
+
+Target arithmetic (illustrative fixed-work latency, not score prediction)
+------------------------------------------------------------------------
+1.6x requires37.5% reduction in total elapsed work. Relative to the confirmed
+1.0111 score, the remaining speed ratio is1.5824 and required time reduction
+is36.80625%. For a single2x component to deliver that remaining reduction,
+it must originally occupy73.6125% of remaining time. A4x component needs
+49.075%; eliminating a component entirely still needs36.80625%.
+The actual score is geometric across frontier loads, so each load's impact
+must be measured rather than applying this as a fitted model.
+
+Priority:
+1. Humming's full expert GEMMs and projection work can affect substantial
+   compute, but their H200 fractions/speedups remain unmeasured. Validate
+   correctness, full-model peak memory and serving gain before counting.
+2. Ready FA3 verify scheduler reuse removes repeated scheduler construction
+   across layers; it is generic and locally validated, but synthetic BF16
+   RTX3050 results cannot establish FP8H200/full-serving share.
+3. Draft metadata glue and mapping reduce small preparation/dispatch work.
+   They cannot plausibly justify1.6x by the existing evidence. Even applying
+   the measured T4 mapping reduction25.73% to ALL time would only yield
+   1.346x; it actually covers a small prefix and is already integrated.
+4. Block6 remains independent tuning, not exact replay of the same proposal
+   computation. Average accepted length alone cannot predict its win; do
+   not reduce draft precision or change released weights to chase acceptance.
+
+One additional exact-computation prototype worth testing
+-------------------------------------------------------
+Vectorize the sequence-length prefix calculation in
+sglang/python/sglang/kernels/ops/attention/metadata.py:
+_fused_decode_metadata_kernel, lines~239-249.
+
+Current pid_b==0,pid_c==0 executes a runtime for idx in range(B), loading one
+sequence length and advancing acc serially for every request. It writes
+cache_seqlens and exclusive cu_seqlens in the same metadata launch used by
+normal decode and target verification. This is a concrete source dependency
+chain, not an observed H200 bottleneck.
+
+Candidate algorithm: a shape-derived power-of-two BATCH_BLOCK, masked vector
+load of seq_lens, cast each seq+delta to int32 exactly as today, masked zeros,
+tl.cumsum of valid values, vector writes of lengths/exclusive prefix and one
+write of final sum. Retain the current page-table construction unchanged.
+For large unsupported scan sizes retain original loop; no data-dependent
+workload dispatch, host tensor reads, persistent input cache or changed
+attention arithmetic. The batch shape is static per graph bucket.
+
+Correctness contract: preserve every live cu_seqlens entry including0/B,
+int32 conversion/overflow semantics, noncontiguous input/output strides,
+B=1/non-power-of-two batches, positive/zero delta, and padding rows. Updating
+request sequence lengths in graph replay must update all results. Reject
+negative/invalid lengths only if existing API does; do not add new contract
+restrictions. Masked lanes must never contribute delta. Preserve original
+behavior for B=0 (no launched grid) and unusually largeB via fallback.
+
+Decisive tests once GPU returns: exact old/new kernel output comparison for
+B=1,3,4,7,8,17,32,65 and strided buffers across page1/16/256; sentinels outside
+the live write region; changing-input replay across buckets; source-level
+precision equality; paired A/A then A/B events with routing/attention absent
+to isolate metadata, plus whole metadata+attention chain to bound benefit.
+Native CPU can validate layout bounds/AST/dispatch now, but cannot validate
+Triton compilation or GPU scan semantics; keep prototype unsubmitted until
+these pass. Expected impact incremental, not a stand-alone1.6x mechanism.
+
+No existing candidate export changed. No new WSL/GPU launch performed.

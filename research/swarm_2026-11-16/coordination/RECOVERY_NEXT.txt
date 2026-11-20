@@ -1,0 +1,59 @@
+SERVING RESEARCH SWARM - LATEST CHECKPOINT 2026-11-16
+Workspace: D:\OpenKernelChallenge\serving
+
+This checkpoint supersedes the recovery-only handoff. The user clarified that
+ongoing optimization research was intended, and all three specialists resumed.
+A new research cycle implemented and tested three mechanisms.
+
+Best confirmed scored serving result remains e399c79bb1994630: 1.2237x.
+Target1.6x is NOT achieved. No new serving score or submission this cycle.
+Latest evidence: swarm_2026-11-16/coordination/research_resumed/RESEARCH_STATUS.json
+
+RESEARCH RESULTS
+Router reconstruction fusion:66 component and90 model-path bitwise checks pass;
+SM90 PDL compile passes. Eligible local full-router ratios1.0066/1.0244/1.0483.
+Original GEMM preserved; model architecture eligibility simulated onSM86.
+SWA scheduler reuse:768 nativeBF16 output/metadata checks,24graph captures,
+6timing controls pass. Four-layer local speedups1.0166..1.0868.
+H200FP8, actual model head geometry and Hopper reset costs still need evaluation.
+MoE scale+SiLU:92pair,158fullchain,16export bitwise checks pass; SM90compile
+passes. Active fullchain timings near parity; kept separate, not in main patch.
+Flag-only generic LayerNorm-SP rejected: incompatible with current Humming path.
+All component percentages are local diagnostics, not serving gains.
+
+READY EXPERIMENTAL PATCHES
+Paths below are under swarm_2026-11-16/coordination/research_resumed/.
+All require --moe-runner-backend=humming.
+- norm_glue_router/candidate.diff (conservative combined,82354bytes,13files)
+  SHA256 8a958aa4e6f56cbd9470046858049b24722f63a12256f984479f843c6b7d766e
+- norm_glue_router_swa/candidate.diff (optional SWA,91064bytes,14files)
+  SHA256 c7f372726d5e80b7da314fecabb12a8c55d36e9aef9a5dca567aaa3f80448dab
+- router_candidate/candidate.diff (isolated router overlay)
+  SHA256 88e96591db345c5ee9fe1f116466a6770e843dac46816afc1b8ae1a8bf7837c8
+- swa_candidate/candidate.diff (isolated SWA overlay)
+  SHA256 e3f70490dd68ee850820d800e75e061fac041e35dab70752fcecaa1c137e4cb7
+- moe_scale_activation/candidate.diff (lower-priority separate experiment)
+  SHA256 4b142f5fc007957648ffea650c18ede879fd10306de9c0ef13b41b39659ce6d5
+Clean patch round-trip, syntax, whitespace and file/size gates pass for all.
+Combined sources independently reviewed; no composed full-model runtime claim.
+The pre_utf8 optional draft is superseded and must not be submitted.
+
+REMOTE AND NEXT GATES
+Existing fa0d2a0fcf584339 and6570fbd9e1b64ce4 remain queued; do not duplicate.
+Earlier row check9689b3114c2a45ab passed, indicative1.054 at16users.
+Fresh quota receipt:0checks,0scored, reset17Nov00:00UTC/05:30IST.
+Re-read live quota and existing jobs before any new submission.
+Next stage is integratedH200 validation of conservative combined candidate;
+compare optionalSWA/isolated mechanisms only as quota and evidence justify.
+Check correctness, later-turns, TTFT, memory, graph capture and throughput before
+promotion or scored use. No scheduled background polling/automation exists.
+
+RUNTIME AND PRESERVATION
+User explicitly approved fullWSLrestart includingDocker; completed successfully.
+Ubuntu andDockerDesktop running; Docker server27.4.0 verified.
+All GPU/compiler tests complete; specialist agents finished this research cycle.
+Idle Ubuntu keeper execsession43935 remains, but runs no research/test work.
+Active checkout/rootpatch and scored1.2237baseline remain unchanged.
+Rootpatch SHA256cf02617f790e28c9229ac9aec5e517f04344c49491347ef732a352fbaa3aa4a4.
+All failed/partial runs and exact executed sources retained. Export-only LF/UTF8
+fixes were AST-checked; no numerical thresholds were weakened.

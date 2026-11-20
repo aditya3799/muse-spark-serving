@@ -1,0 +1,9 @@
+.gitignore
+LICENSE
+README.md
+results/ranking-history.md
+results/source_hashes.json
+results/v18.json
+results/v18_shapes.csv
+submission.py
+tools/expand_source.py

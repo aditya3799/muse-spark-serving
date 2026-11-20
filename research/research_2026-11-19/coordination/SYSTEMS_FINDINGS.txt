@@ -1,0 +1,49 @@
+SYSTEMS AND PRECISION AUDIT, ongoing 2026-11-19
+
+1. Cache: the unchanged scored release with --swa-full-tokens-ratio0.35 has been launched as UNSCORED check f464d5f09f534363 at32users. At the last status read it was queued. Same .85 memory fraction; no arithmetic changes. See CACHE_CHECK_PLAN.txt. Older Hopper check0afdc0b191dd4b42 also remains queued. No scored launch.
+
+2. TokenSpeed: source pinned c24bc5545f4956183ba3ad0e30a189e47fcd34b9. Its capacity model explicitly accounts for overlapped decode reservations, draft windows, partial-page handover and copy-in reserve. This reinforces why window-size-only sizing is insufficient. The reviewed Muse owned-row replicated projection path is CDNA4-specific; its docs' NVFP4 Muse launch is Blackwell TRT-LLM. Existing frozen SGLang already enables Muse gather-norm fusion. Do not claim these as novel drop-in gains.
+
+3. Public kernel sources: alygg77 and vjeux lineage was already collected on Nov15. Current public code can have incremental deltas, so compare active source hashes rather than assuming identical. Headline kernel-track gains use different baselines and tolerance contracts. Decode lane found skipped BF16 rounding, approximated trig and quantized softmax denominator in the public attention donor; these require actual correction before considering a port.
+
+4. Draft distribution correction: eight global draft KV heads mean each TP8 rank owns one distinct head. A simple all-gather of one head's packed KV is WRONG. Prefill lane invalidated that proposal. Safe current design gathers full FC projection output and retains original full-M RMS plus each rank's original KV. Alternative all-head local projection plus all-to-all would require extra weights,8separate unchanged-width GEMMs and independent ownership validation.
+
+5. Lossless BF16 storage: Unweight, NF12, NWC and exponent-compression sources reviewed. Exact decoding of weights does not prove the GEMM's arithmetic or model outputs. Native full-decompression before original GEMM preserves weight bits but adds read/write traffic, so codec speed is not serving speed. Existing public H200 negative results already show12-bit decode loses atM128+ on several projections. NVFP4 coefficient entropy is close to4bits, so dense BF16 claims cannot be assigned to expert coefficients.
+
+6. Commercial sources: FireAttentionV2 primary report (2024) compares Qwen/Mixtral, H100, vLLM0.5.0 and different precisions; its12x headline is not a Muse/H200 result. FireAttentionV3 is AMD-specific. Baseten describes fusion, PDL and speculation, including live draft training on separate infrastructure; new training/quantization cannot be silently substituted for the frozen draft. Together's modern engine claims emphasize Blackwell/FP4; no inspectable exact H200 Muse2x implementation was recovered. Modal's public low-latency recipe uses SGLang plus speculation; baseline already has DFlash.
+
+7. Cache-pressure paper: Basin (arXiv2611.02543) studies surges and PD deployments, lends idle decode memory and sheds excess demand. Its goodput ratios are not this closed-loop single-node benchmark; every requested token here must still be returned. Generic cache-working-set insight motivates a same-budget cache diagnostic only.
+
+8. H200 profiling route: pinned decode_cuda_graph_runner.py _init_profile_context_and_memory_record / _post_process_after_profile (around1003-1087) supports --enable-profile-cuda-graph and prints top10 CUDA/CPU key averages grouped byinputshape to startup log. Source confirms log accessibility. Capture inputs/routing/context are dummy, not production distributions. Use for dispatch/shape/resource evidence, never to assign measured full-serving phase shares. Projection check f43fa02892254879 and MoE check f038a667401a4d0a now include this profiling flag; see final check plans.
+
+Primary links:
+https://github.com/lightseekorg/tokenspeed
+https://github.com/cloudflareresearch/unweight-kernels
+https://github.com/dphnAI/nf12
+https://github.com/parda21/NWC
+https://github.com/WeightLab/bf16-exponent-compression
+https://fireworks.ai/research/fireattention-v2-long-context-inference
+https://fireworks.ai/blog/fireattention-v3
+https://www.baseten.co/blog/live-draft-model-training-for-speculative-decoding/
+https://www.baseten.co/resources/guide/the-baseten-inference-stack
+https://www.together.ai/blog/fastest-inference-for-the-top-open-source-models
+https://modal.com/blog/achieve-sota-specdec
+https://arxiv.org/html/2611.02543v1
+
+9. LMCache primary April3,2026 benchmark: shared400GB hostcache acrossDP workers on8H100,Qwen235BFP8,vLLM0.18.1. Its10x headline concerns TTFT versus fragmented hostoffload; mean decode37.47vs9.81tok/s is a separate metric. FixedTP8 and fixed*lmcache* launch flags preclude direct substitution. Source:https://blog.lmcache.ai/en/2026/04/03/lmcaches-new-architecture-boosts-moe-inference-performance-by-10x/
+
+10. Additional primary sources: NanoFlow nano-batching/compute-network overlap is real, but its asynchronous CPU scheduler is already SGLang's default sincev0.4 per the author's report. FlexFlow/SpecInfer uses different tree-draft models. NVIDIA Hyperflare has a Muse recipe but targetsSM103/120/121, newerCUDA/PyTorch andFlashInfer/b12x; noHopperclaim. FlashFormer moved tocheetah-lang/flashformer; README retrieval alone is not a source audit. FastDeploy rootREADME was only a pointer; actualREADME_CN retrieved and screened. UpdatedSOURCE_AUDIT now records92repository strings,77with at least one retrievedfile,50manual assessments. This is not77validated engines or exhaustive market coverage.
+
+11. DFlash projection evidence: output-N sharding passed real-weight pairedpilot and frozen-planholdout with local component gains4.4569x and4.3200x. NCCL and both transformers excluded. Row-ownedprefill likewise passed realweight/caches under independentinputs. These are alternative distributions of the SAME FC and must not be multiplied. ActualH200 per-rank nativeFC+localFC+gather startup measurements are being added. component_budget.json shows even4.32x would need that component to occupy~49.7%of totalparenttime to uniformly lift1.2363to2x; actualfraction is unmeasured.
+
+12. Startup memory ordering correction: scheduler initializes initialKVpools, captures graphs, calls prewarm_sampling onforwardstream, then post_capture_resize_kv_pool whereactive. Projection qualification is therefore after initialallocation and before finalresize. Twofull16384x40960BF16 calibration tensors exceed+2GB; newprefillhelper reusesonebuffer, releasesinputbeforegather, boundsestimatedpeak below1.8GB, andlogsallocated/reservedpeaks. GroupCoordinator.all_gather dim0 reshapesviews; dim-1 additionallymaterializeslayout, whichstartupmeasurementmustcharge.
+
+13. Localresourceincident: CUDAcicc optimizerabort produced a3,923,668,984-byte WSLcrashdump at09:13:58UTC. It droveCfree to~86MBandblocked normalexec. Rootverifiedexactownpath, timestamp,size, savedmetadata(reclaimed_compiler_dump.json), andremovedonlythatdump. Cfree recoveredto4.02GB. Allweights, source, logs anduserfilespreserved. Furthercompilerprobes need perchild boundedmemory andminimalcoredumppayload.
+
+14. Newpacked-MoEdesign: complexsharedHumming CuTelayout compiledthroughAPIchecks butexceededlocal5GiBcompilerVMcap. A materiallydifferent NORMALpackedlayout compiledagainstexactjudgeheaders at09:32UTC, withsm90acubin254976bytes. Temporaryper-layerrepack scratch canretaincanonicalHummingweights andfallback whileavoidinganall-layerduplicateresidentlayout. BoundedM4096chunks withbothpackedstagebuffersreuse couldkeeppeakbelow2GB; thisisbeingpackaged/qualified, notanH200speedresult. DenseBF16staging remainslocallyslower evenwhereexact, andsingle-expertdensecases overestimate realrouteutilization.
+
+15. Final reviewed MoE check uses 2048-row chunks, not the earlier4096/3072 proposals. Nominal Torch arena is1,321,355,776 bytes plus counted CABI storage; the owned cap is1.38GB and full candidate qualification bound1.749GB. Native reference and candidate phases are separated, preventing their transient buffers from coexisting. Actual H200 peaks are still unmeasured. Submitted SHA80db9ce3... remains immutable. A separate UNSUBMITTED compiler-launch amendment8b788495... removes the Python preexec callback; its original potential deadlock is outside the communicate timeout. See normal_package_launcher_fix/ERRATUM.txt.
+
+16. Native pipeline/residency search was actually run locally with full frozen split policy and changed routes. InitialM32 lead1.073x did not reproduce under warmed graph measurements, duplicate-parent control and confidence intervals. All fourM choices retain parent. The noise floor is still wide; no H200 conclusion follows. See native_config_readout.json.
+
+17. Architecture accounting from the primary vLLM Muse recipe uses62MoE layers; target config retrieval remains401. Endpoint precision is not assumed. FC is only3.6-5.8% of the considered matmulFLOPs, not time. Unique-weight-footprint and routing assumptions are explicit in decode/PROJECTION_SCOPE_ANALYSIS.txt; none replace real H200 phase measurement.

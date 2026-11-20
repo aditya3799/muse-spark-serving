@@ -1,0 +1,62 @@
+Pinned DFlash runtime audit, 2026-11-19 round2
+
+Baseline297e54fd105e974cdf401e5b4d20253a22c16f90; all line references below use
+the frozen files in dflash_sources/ or sync_sources/, not a moving checkout.
+
+Collective work:
+- Draft dense greedy sampler has two adjacent all-gathers for local max and
+  associated int64 ID (worker203-204). Frozen separate sampler package replaces
+  this with a metadata-bounded8-byte payload, preserving max bits and ID. Its
+  scope is the already-captured ordinary draft head. Tests are local/Gloo, not
+  measured NCCL/H200 service. Eager fallback worker1800-1801 retains two gathers;
+  widening scope to added-vocab/quantized/uncovered graphs is not assumed safe.
+- Target deferred_argmax already has ONE packed float32 gather (LP1117), not
+  the same duplicate-payload opportunity. Its following generic greedy
+  broadcast at worker2230 is value-redundant only under exact producer/group
+  provenance. Separate disabled proof is in DEFERRED_SYNC_READOUT.txt.
+- Selector/sample/target-bonus sync sites cover RNG or independent logits.
+  No permission to remove those follows from greedy producer equivalence.
+
+CPU/GPU synchronization:
+- Worker786/796 synchronize during startup prewarm/diagnostics, not per-step.
+- Worker1164 mask.any().item and1187 lengths.max().item belong to the legacy
+  compact-rebuild fallback. Default CUDA constructor606 enables Triton rebuild.
+  They are not evidence of normal-path per-step host stalls.
+- Worker2618 seq_lens_cpu.sum().item is explicitly a CPU tensor; planning bounds
+  are maintained on CPU. Converting this to a GPU scalar would introduce work.
+- Worker2481 record_stream protects lifetime after the overlap scheduler's
+  stream usage. It is not a blocking host synchronization and cannot be removed
+  as if it were one. Only Mamba clones preverify sequence lengths at2837; ordinary
+  Muse does not execute that clone.
+- Native per-step preparation is already fused by default; fallback chains
+  activate after a recorded Triton failure. Optimizing hypothetical fallback
+  work without evidence of activation would not improve the ordinary path.
+
+Graph and scheduler boundaries:
+- The ordinary draft sampler is already a capture-tail hook. Moving that same
+  work into another graph is not a new optimization.
+- decode_cuda_graph_runner.py1980+ resolves backend-declared shared read end:
+  PRE_REPLAY, IN_REPLAY or POST_REPLAY; it publishes the corresponding event.
+  scheduler.py2012 consumes this event, falling back to a coarse forward-stream
+  fence only if no narrow event exists. This fence protects shared-buffer writes
+  during result processing, including requests still active in normal/decode
+  mode. It cannot simply be delayed using the PD-prefill WAR recipe.
+- Round1 exact same-width DFlash aux graph was neutral locally. It did not test
+  side-stream overlap, and no unchanged timing rerun is justified.
+
+Fresh source comparison (latest_dflash/manifest.json): current upstream
+a735253e8433d5fc57bf585b3eef93e4b4cfa885 adds ordinary aux graph/side-stream
+overlap at worker2731+ and2910+, draft KV ring ownership, and megakernel tail
+capture. The ordinary aux overlap is explicitly disabled with HiCache, unified
+memory or non-overlap scheduling. Official parent has HiCache attached, so it
+is not a directly eligible gain. TP-split FC runs on main to preserve collective
+order. The tail additionally requires KDA/MLA megakernel facilities, absent from
+Muse; porting it verbatim would change the model/backend rather than just launch
+orchestration. Ring ownership requires a separate backend/storage/numerical
+audit and is not yet an eligible candidate.
+
+The Nov1 GLM5.3 H200 report illustrates block drafting versus serial MTP; native
+Muse DFlash already uses block drafting and context projection. Its PD-specific
+WAR scheduling and KDA state work are not drop-ins. No reported cross-model
+speedup is carried into this research reward.
+https://www.lmsys.org/blog/2026-11-01-glm53-h200-pd/

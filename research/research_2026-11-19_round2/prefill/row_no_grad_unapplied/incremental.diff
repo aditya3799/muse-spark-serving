@@ -1,0 +1,10 @@
+--- a/python/sglang/srt/speculative/dflash_projection_row.py
++++ b/python/sglang/srt/speculative/dflash_projection_row.py
+@@ -282,6 +282,7 @@
+                 samples=records,medians={name:statistics.median(values) for name,values in records.items()})
+ 
+ 
++@torch.no_grad()
+ def create_prefill_projection(model,group,capture_rows,*,ordinary_tp,measure=True):
+     """Collective startup qualification; unsupported or failed shapes stay native.
+ 

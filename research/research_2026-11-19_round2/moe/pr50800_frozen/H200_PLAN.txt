@@ -1,0 +1,69 @@
+Disabled next H200 validation plan for grouped50800 derivatives
+
+This is a future plan only. No loader, model hook, runtime dispatch, cubin loader,
+remote job or scored-submission authorization is supplied. Existing frozen WGS
+validation plan remains unchanged; this adds a separate grouped-kernel family.
+
+Variants must remain distinct:
+A. Exact scoredHumming parent8c754721...: required whole-FFN/serving baseline.
+B. Original public50800 donor81502f...: source-reference control, with exponent
+   offset/global/SwiGLU differences explicitly disclosed. Not a productiondefault.
+C. Boundary-restored source90d99adc...: localSM90a compile+staticchecker only;
+   upstream normalized-scale layout retains zero-scale signed-zero loss.
+D. Raw-original-scale sourcef98a3080...: CPU byte roundtrip/finitecoefficientproof
+   ONLY; no compiler, GPU, static-hazard or runtime result. This is the preferred
+   storage-feasibility starting point because every original code/scale survives.
+
+Mandatory prerequisites before execution:
+- Build exact approved judge headers/toolchain, preserve Apache/MIT notices and
+  readable source/line limits. Re-run exact register-lifetime checker on the final
+  compiled binary; a pass on another variant does not transfer.
+- Supply a reviewed custom Muse raw-route adapter. Preserve canonical gatecolumn0
+  global policy and W2global, with explicit BF16 GEMM then BF16 post-scale; ordinary
+  SiLU*up rounding; existing per-expert postRMSNorm BEFORE route-weighted combine.
+  The generic combined-output API is not valid for Muse.
+- Define one persistent canonical packed layout, reversible preprocessing and one
+  bounded process-owned transient arena. Prove fullmodel startup, calibration,
+  capture and traffic peaks under baseline+2GB with mem_fraction_static0.85.
+  Count joint projection/attention candidates and all capture retained buffers.
+  The raw op's3.22GB at16K is not automatically extra: compare actual parentliveness.
+- Integrate a canonical immutable-weight owner lease and finite raw-SF certificate.
+  NaN payload behavior is unqualified. Invalidate graphs/leases before reload or
+  any raw/.data mutation; exacttensor_version alone does not detect such writes.
+- Raw-scale576B-unit scanner must use the correct512code/64scale layout; existing
+  WGS9216B-unit scanner cannot be reused unchanged. No such scanner is implemented.
+- Compile must precede capture; every launch uses actual current stream; reject or
+  safely serialize TBO/SBO/concurrent calls. Plan/metadata, scratch, TMA descriptors
+  and output lifetimes must survive capture and replay with changing routes.
+
+Numerical/ownership gates:
+- All4,064 finite signed E4M3/FP4pairs plus zero/subnormal boundaries on actualSM90.
+  Separately test unsupported NaN scales cause coherent fallback before capture.
+- Actual checkpoint weights/scales from several distinctlayers, not only one
+  synthetic layer; compare bothGEMMs, activatedintermediate, rawLIVEroutes and final
+  Muse output against scoredHumming. Record error statistics/reduction-order changes
+  honestly; do not invent tolerance merely to activate the candidate.
+- M8/32/128/256 plus512/2048/4096/4097/8193/16384; real captured route holdouts,
+  skew/hot/empty/remote profiles, first/lastlocalexpert, partialtile and chunkedges.
+- BothsingleCTA andpairedcluster paths; changing global->local route maps and
+  nonlocal zeroing; all ranks must participate in communication coherently.
+
+Liveness/compiler gates:
+- Mixedshapes, changedinput/routing capturedreplays, capturewarmup/currentstream,
+  interleavednative/candidatecalls, ownerreload/retire, and no-localroute cases.
+- Bound an external-kernel occupancy/progress stress and asynchronousTMA visibility
+  check on Hopper. CPU FIFO progressmodel is not a substitute for these.
+- Validate cluster2 support and220160dynamicshared bytes plusstatic1472/1440,
+  register redistribution232consumer/40helper, exactloadedkernel and occupancy.
+
+Performance/serving gates:
+- CompleteFFN including repack ifrequired, routeplanning/gather, bothGEMMs,
+  postnorm/combine and synchronization against scoredHumming. Include duplicate
+  parentcontrols, symmetricpaired order, cold/changingweights and independentseed.
+- Decode and prefill remain separate. An improvement atM4096 does not promoteM128.
+  Originaldonor's DeepSeek/Humming claims are not our control or speed result.
+- Only after componentgates pass: actualeightH200 cold+hitC1/4/16/32 tokenquality,
+  TTFT/TPOT, memory and officialfrontier. No weighted kernel score may bypass any
+  failedshape, memory, progress or token gate. Quota is currently exhausted.
+
+Currentdecision:HOLD. Conclusive2x evidence:false. Submissionauthorization:false.

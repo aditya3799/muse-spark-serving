@@ -1,0 +1,59 @@
+OPEN KERNEL CHALLENGE SERVING - RESEARCH CHECKPOINT, 2026-11-17
+Status: Research checkpoint saved; serving target not reached.
+Duration: 2.009 hours, 2026-11-17T08:13:44.456797+00:00 to 2026-11-17T10:14:17.525688+00:00.
+No background GPU work remains; no automatic continuation is scheduled.
+
+USER AUTHORIZATION AND CONSTRAINTS
+Continue the swarm and study the prior handoff; investigate the user screenshot's 3.813x result. Do not submit anything. No new remote checks, scored jobs, or paid GPU rentals were launched. Read-only status of yesterday's existing check remains queued.
+Four agents total: root systems/integration, expert_partition, hopper_moe, aux_speculation. Only one local GPU/compiler lease at a time.
+
+BASELINE TO RESUME
+Confirmed full-serving score: 1.2237x, job e399c79bb1994630.
+Scored source: swarm_2026-11-16/coordination/round5_humming_adaptive_fused/candidate.diff
+SHA256: 8b3ed81e053e4ccb2a043afd25cb94bb49017995ece517bb35aeb6e1b79e026b
+Root patch.diff is an older V4 artifact; do not mistake it for the scored source.
+Root patch.diff SHA256: cf02617f790e28c9229ac9aec5e517f04344c49491347ef732a352fbaa3aa4a4
+Pinned SGLang commit: 297e54fd105e974cdf401e5b4d20253a22c16f90.
+The screenshot reports c1/c4/c16/c32 = 3.708/3.784/3.934/3.829x; its settings/provenance are unavailable. It is a target, not evidence that this implementation has reached it.
+
+EVIDENCE BOUNDARIES
+Local GPU is RTX3050 Laptop SM86, 6GB, 20 SMs, 1.5MiB L2. Real judge hardware is 8 H200. Local runtime results and offline SM90 compilation must remain distinct.
+All experimental edits are isolated under swarm_2026-11-17/deep_research. Existing serving code and submission files were preserved. No component ratios should be multiplied into a claimed serving score.
+Use JSON receipts and retained failed attempts as primary evidence. Source-only checks, emulated collectives, synthetic fixtures, CPU timing, and real graph/backend tests each have different scopes.
+
+EXPERT PARTITION LANE
+Large-prefill partition now preserves both block-K and warp-K reduction geometry. A default-off export preserves the original <=4096-route behavior and only enables the new larger range through an explicit layer flag.
+Three independently generated native-width expert layers pass 189 bitwise checks. All18 warm/cache-swept A/A controls pass; local M768 uniform component ratio2.704x and M1024 uniform1.769x are useful leads, not H200/serving claims. Hot-rank cases can be near parity.
+Full-helper memcheck and global initcheck completed cleanly. Full-helper shared-memory racecheck remains incomplete: dense setup OOM, scoped timeout, and sparse timeout are all preserved. Metadata-only racecheck cannot cover GEMM instantiations.
+Small-M K repair passes its fixed-heavy arithmetic reference, but differs from the scored original at raw intermediates; retain FAILED original raw gates. Final normalized tolerance passing does not authorize promotion. Cutoff factor2 helps some SM86 shapes and regresses others; Hopper tile sizes differ, so no unconditional transfer.
+Primary files: expert_partition/EVIDENCE_SUMMARY.json, COLD_WORKINGSET_REVIEW.json, SMALL_K_INVARIANCE_REVIEW.json, RAW_GATE_SCALE_REVIEW.json, SANITIZER_COMPLETENESS_REVIEW.json and LANE_CHECKPOINT.json.
+
+HOPPER KERNEL LANE
+69 new offline SM90 builds completed. Virtual-K serializes original independent FP32 accumulator banks into fewer physical warpgroups while retaining the original reduction grouping and FADD.FTZ mode. Compile/SASS evidence is promising but does not establish runtime correctness or speed.
+Two fused W13 epilogue builds preserve native MMA, have no spills, and use85/199 registers versus85/198 controls. Both include1024 bytes of static shared memory beyond dynamic SMEM_SIZE.
+Reject unsafe non-warp-specialized multicast, spilling M256 warp-N64 variants, and volatile-load ordering as an overlap fix.
+Important corrections: native WGMMA hardware M64 is the weight/output dimension, not64 token padding; residency policy reaches adaptive light rows through M112; include static shared memory in occupancy; finite-add commutation does not prove NaN payload equivalence.
+Primary files: hopper_moe/LANE_CHECKPOINT.txt, DEEP_RESEARCH_CHECKPOINT.json, H200_VIRTUAL_K_GATE_PLAN.json, H200_W13_FUSED_GATE_PLAN.json, W13_FUSED_SM90_SASS_AUDIT.json. Both H200 gates are prepared but unexecuted.
+
+AUXILIARY OUTPUT LANE
+Prefill owner and fused norm-residual tap store preserve exact BF16 features and work with actual segmented graph/dedup machinery. Native decode/verify graph wiring reuses the existing canonical auxiliary buffer and leaves verification width8 unchanged.
+The original decode variants are HELD after finding that in-place Tensor.data/resize_/stride/dtype mutation can evade a live-Tensor identity check. Separate hot variant stores an immutable capture-time fingerprint, rejects mutation, and retains lease/generation/recovery checks. Corrected hot fused graph retest passes60 CUDA contracts and17 native/BCG comparisons; original overlays remain HELD. Hot direct was not separately rerun on GPU.
+Matched synthetic CPU-wrapper timing: original bookkeeping adds15.17us, hot variant9.53us;5.61us absolute reduction, baseline A/A0.992. This is not actual target decode latency.
+Scored-baseline source composition roundtrips: direct90,666 bytes/16files; fused134,872 bytes/19files; max added line226. Only overlap with scored sources is muse_spark.py. Full-model and H200 validation remain outstanding.
+Primary files: aux_speculation/AUX_RESEARCH_REPORT.json and decode_extension reports/manifests.
+
+ROOT SYSTEMS AND FUSION LANE
+Selector communication: pack float scores and exact float32-representable IDs into one all-gather, keep original global torch.topk. Passes CPU and emulated-GPU rank checks and real2rank Gloo source-method checks. Actual NCCL/symmetric-memory/CUDA-graph and full-model validation remain pending. Isolated1080-byte selector_pack.diff is not submission-ready.
+Draft context FC: native8192x40960 BF16 is replicated. Sharding changes cuBLAS kernels/reduction order and fails strict bitwise comparisons for several shapes. Disabling reduced-precision reduction changes the reference too, so it is not a repair. Draft-only changes may still be mathematically lossless under target verification, but require actual full-model validation; no precision flag was changed in serving.
+Attention audit: target defaults to FA3, draft explicitly uses FA4. Pinned FA3 already packs GQA in the512 tested source-policy cases. Host split counts are upper bounds; device varlen scheduling can differ. Pinned FA4 does not support target FP8 KV on SM90 as a simple backend switch.
+W13 fusion: interleave canonical gate/up weight and group-scale rows before repacking. The epilogue reads the existing rounded BF16 shared outputs, applies explicit non-FTZ FP32 scale multiplication, rounds to BF16, uses stock SiLU arithmetic, and stores four activations per uint2. Original MMA/K reduction is unchanged. An explicit eighteenth argument supplies scales; no unrelated argument is repurposed. The custom research driver checks the smaller N/2 output contract.
+First actual fusion pass:180 bitwise checks. Subsequent projection/finalizer pass:315 bitwise checks, with distinct expert scales and inactive-row sentinels. First timing run has power-state transition concerns and is diagnostic. Native32-expert follow-up passes189 bitwise comparisons with three changed-route generations and18/18 A/A groups. Cache-swept uniform W13-component ratios are1.0042x at M8,1.0228x at M768 and1.0308x at M1024. These modest gains do not establish a serving improvement. M8 uses an unsplit reference, not the complete scored adaptive path. W2/finalizer checks are eager after graph-produced activations; whole-chain graph replay remains pending.
+Structural allocation estimate only: removing W13 temporary reduces expert scratch by1GiB at M16384/top8/H=I4096. Startup peak, one-canonical-weight lifecycle, adaptive split integration, graph aliasing and real serving peak are not yet measured.
+Primary files: coordination/W13_FUSION_RESEARCH.json, W13 experiment receipts, SELECTOR_PACK_MANIFEST.json, DRAFT_FC_SHARDING_FINDINGS.json, FA3_POLICY_AUDIT.json, SYSTEMS_BASELINE_REVIEW.json.
+
+NEXT EXPERIMENTS, IN ORDER
+1. Read EXPERIMENT_INDEX.json. Finite/subnormal stress passes84 checks; empty-rank boundary passes42. All root run receipts and key lane reports are hashed. No new runs were submitted.
+2. On authorized H200 hardware, run isolated numerical gates before timing: virtual-K, fused W13, and large-prefill partition. Preserve native output/precision and graph behavior.
+3. Validate the corrected auxiliary owner through actual full model and both graph systems; measure host overhead and peak memory.
+4. Profile the full target/draft/communication path under real serving loads. Choose combinations using measured bottleneck fractions, not component ratios.
+5. Only after explicit future authorization, consider a challenge check/submission. This session authorizes none.

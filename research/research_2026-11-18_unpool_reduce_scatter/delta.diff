@@ -1,0 +1,51 @@
+diff --git a/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py b/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
+--- a/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
++++ b/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
+@@ -103,10 +103,19 @@
+     """
+     m_local = x.shape[0] // group.world_size
+     start = group.rank_in_group * m_local
+-    local_fp32 = torch.mm(
+-        x[start : start + m_local], weight.t(), out_dtype=torch.float32
+-    )
+-    local = local_fp32.to(x.dtype)
++    return _project_and_gather_rows(group, x[start : start + m_local], weight)
++
++
++def reduce_scatter_prefill_row_projection(group, partials, weight):
++    """Reduce contiguous rank-owned rows before applying the replicated weight."""
++    local = partials.new_empty((partials.shape[0] // group.world_size, partials.shape[1]))
++    group.reduce_scatter_tensor(local, partials)
++    return _project_and_gather_rows(group, local, weight)
++
++
++def _project_and_gather_rows(group, rows, weight):
++    local_fp32 = torch.mm(rows, weight.t(), out_dtype=torch.float32)
++    local = local_fp32.to(rows.dtype)
+     del local_fp32
+     return group.all_gather(local, dim=0)
+ 
+diff --git a/python/sglang/srt/models/muse_spark.py b/python/sglang/srt/models/muse_spark.py
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -55,6 +55,7 @@
+     gemm_local,
+     prefill_row_projection,
+     prefill_row_projection_supported,
++    reduce_scatter_prefill_row_projection,
+     reserve_projection_workspace,
+     small_projection,
+     small_projection_supported,
+@@ -744,6 +745,12 @@
+             and not getattr(get_forward(), "sp_active", False)
+             and not already_reduced
+         ):
++            if self.post_expert_proj is not None and output.is_contiguous():
++                weight = self.post_expert_proj.weight
++                if self._can_shard_prefill_row_projection(output, weight):
++                    group = get_parallel().tp_group
++                    if not gemm_ag_supported(group.ca_comm, output, weight):
++                        return reduce_scatter_prefill_row_projection(group, output, weight)
+             output = tensor_model_parallel_all_reduce(output)
+         if self.post_expert_proj is not None:
+             if _is_cpu:

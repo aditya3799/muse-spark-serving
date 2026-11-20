@@ -1,0 +1,218 @@
+diff --git a/python/sglang/kernels/ops/attention/metadata.py b/python/sglang/kernels/ops/attention/metadata.py
+--- a/python/sglang/kernels/ops/attention/metadata.py
++++ b/python/sglang/kernels/ops/attention/metadata.py
+@@ -223,6 +223,7 @@
+     BLOCK_COLS: tl.constexpr,
+     SKIP_PAGE_TABLE: tl.constexpr,
+     ZERO_TAIL: tl.constexpr,
++    SWA_SUFFIX_TOKENS: tl.constexpr = 0,
+ ):
+     pid_b = tl.program_id(0)
+     pid_c = tl.program_id(1)
+@@ -273,6 +274,12 @@
+         cache_modifier=".cg",
+     )
+     if swa_page_table is not None:
++        if SWA_SUFFIX_TOKENS:
++            # Keep a complete boundary CTA. Every full-attention page and all
++            # sequence lengths are still rewritten before reaching this branch.
++            first_token = seq_len + SEQ_LEN_DELTA - SWA_SUFFIX_TOKENS
++            if (col_start + BLOCK_COLS) * PAGE_SIZE <= first_token:
++                return
+         swa_pages = _resolve_metadata_page_ids(
+             token_ids,
+             live_mask,
+@@ -518,6 +525,7 @@
+     full_v2p: Optional[torch.Tensor] = None,
+     swa_v2p: Optional[torch.Tensor] = None,
+     zero_tail: bool = False,
++    swa_suffix_tokens: int = 0,
+ ):
+     """Fill sequence lengths, their prefix sum and page tables in one launch.
+ 
+@@ -541,11 +549,31 @@
+             "SWA output requires exactly one token-slot or page mapping"
+         )
+ 
++    if swa_suffix_tokens:
++        assert swa_suffix_tokens > 0 and not zero_tail and not skip_page_table
++        assert swa_page_table is not None and full_to_swa_index_mapping is not None
++    if (
++        swa_suffix_tokens and page_size == 1 and max_seq_pages > 0
++        and full_v2p is None and swa_v2p is None
++        and cache_seqlens_int32.numel() > 0 and req_to_token.dtype == torch.int32
++        and all(t.is_contiguous() for t in (
++            cache_seqlens_int32, cu_seqlens_k, seq_lens, req_pool_indices,
++            full_to_swa_index_mapping,
++        ))
++        and all(t.stride(1) == 1 for t in (page_table, req_to_token, swa_page_table))
++    ):
++        from sglang.kernels.ops.attention.muse_fa3_page_snapshot import snapshot
++        return snapshot(
++            cache_seqlens_int32, cu_seqlens_k, page_table, req_to_token, req_pool_indices,
++            max_seq_pages, seq_lens, seq_len_delta, page_size, swa_page_table,
++            full_to_swa_index_mapping, swa_suffix_tokens=swa_suffix_tokens,
++            full_block=2048, warps=4,
++        )
+     batch_size = cache_seqlens_int32.shape[0]
+     # Lengths-only/unmapped token gathers use 256 columns, other gathers 128.
+     block_cols = (
+         256
+-        if skip_page_table
++        if skip_page_table or swa_suffix_tokens
+         or (page_size == 1 and swa_page_table is None and full_v2p is None)
+         else 128
+     )
+@@ -587,6 +615,7 @@
+         BLOCK_COLS=block_cols,
+         SKIP_PAGE_TABLE=skip_page_table,
+         ZERO_TAIL=zero_tail,
++        SWA_SUFFIX_TOKENS=swa_suffix_tokens,
+         num_warps=block_cols // 32,
+         num_stages=3,
+     )
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -182,7 +182,7 @@
+         self.device = model_runner.device
+         self.decode_cuda_graph_metadata = {}
+         self.target_verify_metadata = {}
+-        # Pool refs — captured at construction so they survive deletion of the
++        # Pool refs â€” captured at construction so they survive deletion of the
+         # corresponding ForwardBatch fields.
+         self.req_to_token_pool = model_runner.req_to_token_pool
+         self.token_to_kv_pool = model_runner.token_to_kv_pool
+@@ -191,6 +191,15 @@
+         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
+         self.kv_cache_is_mxfp8 = self.kv_cache_dtype_str == "mxfp8"
+         self.page_size = model_runner.page_size
++        # The pinned Hopper FA3 local mainloop rebases paged reads to at
++        # least seqlen_k - seqlen_q - window_left. Muse has no sink tokens.
++        self._muse_fa3_window_pages = (
++            fa_impl_ver == 3 and not model_runner.is_draft_worker
++            and getattr(model_runner.model_config.hf_config, "model_type", "") in
++                ("muse_spark", "muse_spark_text")
++            and self.kv_cache_dtype == torch.float8_e4m3fn and self.page_size == 1
++            and torch.cuda.get_device_capability(self.device)[0] == 9
++        )
+         # Static page-table width (upper bound). The device-side page-table build
+         # sizes to this constant, so no runtime host max is needed.
+         self.max_num_pages = (
+@@ -784,7 +793,7 @@
+         - all tensors live in dedicated preallocated buffers (the captured
+           kernels hold their addresses; refilled in place each replay);
+         - cu_seqlens_q always gets its own buffer (the eager no-prefix path
+-          aliases it to cu_seqlens_k — under capture that would permanently
++          aliases it to cu_seqlens_k â€” under capture that would permanently
+           weld q to the k buffer and break prefix replays);
+         - max_seq_len_q / max_seq_len_k are baked at capture as upper bounds
+           (the bucket's num_tokens / max_context_len): the kernel reads real
+@@ -2191,7 +2200,7 @@
+ 
+         # When Spec Decode enabled, forward_decode would be called with two mode:
+         # 1. DRAFT_DECODE: we enable cascade attention when top_k > 1
+-        # 2. IDLE: we don’t need cascade attention, spec_info will be none in this case
++        # 2. IDLE: we donâ€™t need cascade attention, spec_info will be none in this case
+         use_cascade_attn = forward_batch.spec_info is not None and self.topk > 1
+ 
+         # Calculate window size (can be moved to metadata if layer properties don't change)
+@@ -3024,6 +3033,8 @@
+         req_pool_indices: torch.Tensor,
+         seq_lens: torch.Tensor,
+         seq_len_delta: int,
++        *,
++        window_query_length: int = 0,
+     ) -> None:
+         """Fill `cache_seqlens_int32`, `cu_seqlens_k` and the page table(s).
+ 
+@@ -3048,6 +3059,15 @@
+                 else None
+             ),
+             skip_page_table=translated,
++            swa_suffix_tokens=(
++                window_query_length + self.sliding_window_size
++                if window_query_length and self._muse_fa3_window_pages
++                and self.use_sliding_window_kv_pool and not translated
++                and self.topk <= 1 and self._kv_shard_pool is None
++                and self.local_attn_builder is None and not self.is_prefill_aware_swa
++                and self.sliding_window_size is not None and self.sliding_window_size > 0
++                else 0
++            ),
+         )
+         if translated:
+             # The plan's table reaches `cache_seqlens_int32`, which the kernels
+@@ -3209,6 +3229,7 @@
+                         req_pool_indices,
+                         seq_lens,
+                         self._spec_read_seq_len_delta(forward_mode, spec_info),
++                        window_query_length=1,
+                     )
+ 
+                 if self.local_attn_builder is not None:
+@@ -3255,7 +3276,8 @@
+                 # Both attention and its scheduler use the page-table capacity;
+                 # live lengths remain device data and need no host maximum.
+                 self._set_decode_page_metadata(
+-                    plan, metadata, req_pool_indices, verify_lens, verify_delta
++                    plan, metadata, req_pool_indices, verify_lens, verify_delta,
++                    window_query_length=verify_delta if ragged_layout is None else 0,
+                 )
+                 if metadata.scheduler_metadata is not None:
+                     sched = self._compute_verify_scheduler_metadata(metadata, bs)
+diff --git a/python/sglang/kernels/ops/attention/muse_fa3_page_snapshot.py b/python/sglang/kernels/ops/attention/muse_fa3_page_snapshot.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/kernels/ops/attention/muse_fa3_page_snapshot.py
+@@ -0,0 +1,51 @@
++"""Materialize private full and sliding page tables before the early scheduler event."""
++import triton
++import triton.language as tl
++
++@triton.jit
++def _snapshot(lengths, cumulative, full, source, request, seq, sliding, mapping,
++              STRIDE_SOURCE:tl.constexpr, STRIDE_FULL:tl.constexpr, STRIDE_SWA:tl.constexpr,
++              LIMIT:tl.constexpr, B:tl.constexpr, ROUND_B:tl.constexpr, DELTA:tl.constexpr,
++              WINDOW:tl.constexpr, FULL_BLOCK:tl.constexpr, SWA_BLOCK:tl.constexpr, FULL_TILES:tl.constexpr):
++    tile=tl.program_id(0)
++    row=tl.program_id(1)
++    if tile==0 and row==0:
++        idx=tl.arange(0,ROUND_B)
++        valid=idx<B
++        vals=tl.load(seq+idx,mask=valid,other=0).to(tl.int32)
++        vals=tl.where(valid,vals+DELTA,0)
++        ends=tl.cumsum(vals,0)
++        tl.store(lengths+idx,vals,mask=valid)
++        tl.store(cumulative+idx,ends-vals,mask=valid)
++        tl.store(cumulative+B,tl.sum(vals,0))
++    length=tl.minimum(LIMIT,tl.load(seq+row).to(tl.int32)+DELTA)
++    req=tl.load(request+row).to(tl.int64)
++    if tile<FULL_TILES:
++        first=tile*FULL_BLOCK
++        if first<length:
++            cols=first+tl.arange(0,FULL_BLOCK)
++            slot=tl.load(source+req*STRIDE_SOURCE+cols,mask=cols<length,other=0)
++            tl.store(full+row*STRIDE_FULL+cols,slot,mask=cols<length)
++    else:
++        # Align the first (possibly partially reachable) suffix tile. All live
++        # output columns stay at their absolute logical positions for native FA3.
++        start=tl.maximum(0,tl.load(seq+row)+DELTA-WINDOW)
++        first=(start//SWA_BLOCK+tile-FULL_TILES)*SWA_BLOCK
++        if first<length:
++            cols=first+tl.arange(0,SWA_BLOCK)
++            slot=tl.load(source+req*STRIDE_SOURCE+cols,mask=cols<length,other=0)
++            value=tl.load(mapping+slot.to(tl.int64),mask=cols<length,other=0)
++            tl.store(sliding+row*STRIDE_SWA+cols,value,mask=cols<length)
++
++def snapshot(lengths,cumulative,full,source,request,limit,seq,delta,page_size,
++             sliding,mapping,*,swa_suffix_tokens,full_block=2048,swa_block=256,warps=4):
++    """Pinned static token map, owned contiguous output columns and a bounded SWA suffix."""
++    assert page_size==1 and swa_suffix_tokens>0 and limit>0
++    assert all(t.is_contiguous() for t in (lengths,cumulative,request,seq,mapping))
++    assert all(t.stride(1)==1 for t in (source,full,sliding))
++    batch=seq.numel()
++    full_tiles=triton.cdiv(limit,full_block)
++    tiles=full_tiles+min(triton.cdiv(limit,swa_block),triton.cdiv(swa_suffix_tokens,swa_block)+1)
++    _snapshot[(tiles,batch)](lengths,cumulative,full,source,request,seq,sliding,mapping,
++        source.stride(0),full.stride(0),sliding.stride(0),limit,batch,triton.next_power_of_2(batch),
++        delta,swa_suffix_tokens,full_block,swa_block,full_tiles,num_warps=warps)

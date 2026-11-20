@@ -1,0 +1,29 @@
+﻿Constructor ownership cleanup, UNAPPLIED
+
+Patch a9aa8a95ad06b9a28dc9592343771811891aca491302b8dc2ca27883523f6a57
+1514bytes. Relative to frozen joint530e, rootfailurepolicy71f6152c,
+early-registration74d63805 and row-no_grad07f4c518.
+
+A prepared CABI handle transfers ownership only after RowPlan.__init__ completes.
+If scratch allocation (or any other Python constructor step) raises, the caller
+destroys that handle once and rethrows the original exception. Normal successful
+construction and later discover cleanup are unchanged. The obsolete comment that
+unexpected discovery errors fall back now correctly describes fatal all-rank abort
+versus recoverable acceptance voting. No numerical or GPU source change.
+
+CPU actual RowPlan/discover AST fault injection passes5 cases: constructor OOM,
+constructor unexpected error, later discovery OOM, clean no-plan, accepted plan.
+Each created handle is destroyed exactly once; injected exceptions are rethrown
+by identity; accepted plan remains live until explicit close and secondclose is
+idempotent. Tensor/allocator/vendor calls are mocks, no GPU or real CABI execution.
+An initial success-control stub lacked checked_vendor_status and was corrected;
+the final receipt is cpu_constructor_faults.json, not those incomplete attempts.
+
+Private-index composition passes7 steps: pinnedreadtree, joint, failurepolicy,
+early, no_grad, thiscleanup, diff--check. No user index/worktree or frozen payload
+changed. composition_validation.json records exact commands and warning scope.
+
+Residual failure policy remains explicit: fatal row startup timing dispatch may
+abort before gather; peers rely on normal worker/process teardown. This is fail-stop,
+not a claim of synchronous distributed recovery or safe repair after CUDA failure.
+Future reload/recapture/global-memory admission requirements are unchanged.

@@ -1,0 +1,43 @@
+HOPPER / MOE LANE CHECKPOINT
+No submissions, remote checks, paid resources, or active/scored checkout edits. No running process or hardware/compiler lease. Available for follow-up.
+
+TESTED
+- 69 new offline SM90 cases with durable receipts and source hashes. These establish compilation/resources, not Hopper numerics or speed.
+- Virtual K: 4 geometries plus 1 control compile; all zero spills. Original K64 fragments, independent FP32 banks, and the original four-bank tree (p0+p2)+(p1+p3) retained. Explicit-branch SASS audit verifies FADD.FTZ grouping, with operand commutation allowed only for finite-addition reasoning. CPU mapping, hazard-negative, ELF/thread metadata checks pass.
+- W13 fused legacy epilogue: independent 8448 vector-address checks; 2 SM90 builds with 85/199 registers and zero spills. Native HGMMA opcode counts and all numeric ELF geometry/shared/thread metadata match original controls. SASS writes STG.E.64. Parent owns runtime/full-chain evidence.
+- Exact residency controls, W13 warp-N64 eligible subsets, and 13 total small/large K-repair configs compile. K-repair changes prior light arithmetic; it is not an unchanged-scored-baseline claim.
+- Local SM86 grid pilot: raw/final bitwise and changed-graph checks passed. This is not H200 evidence.
+
+REJECTED / LIMITED
+- Reduced persistent grid strongly regresses locally; 2x grid has no convincing gain. Pinned launcher was already persistent.
+- Non-warp-specialized multicast has no cross-CTA stage-release protocol: fail closed.
+- W13/W2 M256 warp-N64 policies spill: reject these shapes.
+- Split issue/wait does not reliably move LDS into the WGMMA pending window. Volatile LDS control also fails to force that overlap. No timing claims.
+
+PENDING
+- Every promising Hopper modification needs real H200 numerical and sanitizer gates, then isolated full-helper / graph validation, then matched cold A/B timing.
+- virtual_k_gate_sm90.py refuses SM86, H100, and B200 before launcher import or compilation. It tests four fixed geometries with shared canonical weights, 192 finite direct/graph cases by default, inactive-row sentinels, and separately labelled NaN/Inf diagnostics. CPU guard/route audit passes; H200 execution has not occurred.
+- No benchmark target is claimed achieved. No serving candidate was promoted.
+
+REPRODUCIBLE H200 COMMANDS (inside this lane directory, compatible pinned environment, fresh output paths)
+MAX_JOBS=1 HUMMING_DISABLE_PARALLEL_BUILD=1 python virtual_k_gate_sm90.py --out h200_virtual_k_gate
+MAX_JOBS=1 HUMMING_DISABLE_PARALLEL_BUILD=1 compute-sanitizer --tool memcheck --error-exitcode 99 python virtual_k_gate_sm90.py --seeds 1 --out h200_virtual_k_memcheck
+MAX_JOBS=1 HUMMING_DISABLE_PARALLEL_BUILD=1 compute-sanitizer --tool racecheck --error-exitcode 99 python virtual_k_gate_sm90.py --seeds 1 --out h200_virtual_k_racecheck
+MAX_JOBS=1 HUMMING_DISABLE_PARALLEL_BUILD=1 compute-sanitizer --tool initcheck --error-exitcode 99 python virtual_k_gate_sm90.py --seeds 1 --out h200_virtual_k_initcheck
+These are prepared local-H200 commands, not authorization to provision resources or submit anything.
+
+AUTHORITATIVE INDEX
+DEEP_RESEARCH_CHECKPOINT.json links receipts and hashes.
+H200_VIRTUAL_K_GATE_PLAN.json documents the numerical contract and scope limits.
+CUDA_ELF_RESOURCE_AUDIT.json includes the extra 1024-byte static shared allocation.
+RESIDENCY_ADAPTIVE_COVERAGE_CORRECTION.json fixes the adaptive scope through M112.
+W13_FUSED_SM90_SASS_AUDIT.json records the final two builds.
+
+FOLLOW-UP: H200 FUSED W13 GATE PREPARED
+w13_fused_gate_h200.py uses only the two compiled cp.async SM90 W13 configurations through w13_h200_precompiled.py, inheriting the root explicit18-argument wrapper. The root SM86 runtime guard remains unchanged. H200 model/SM, exact configuration, tensor metadata, source hashes, and cubin hashes fail closed. No TMA fallback exists.
+Default coverage: 72 finite cases, 648 bitwise comparisons across raw/scaled W13, SiLU, fused activation, scaled W2, finalizer, and graph replay after changing routes, scales, scores and inputs. Inactive fused rows retain sentinels. W2 uses fixed cp.async controls.
+W13_H200_GATE_CPU_AUDIT.json: 2 valid configs, 33 rejected mutations/device cases, explicit18-argument ABI and architecture-before-bootstrap checks pass. No Torch import, compiler work, CUDA context or GPU execution was performed during preparation.
+Commands and limits: H200_W13_FUSED_GATE_PLAN.json. First future local-H200 command:
+MAX_JOBS=1 HUMMING_DISABLE_PARALLEL_BUILD=1 python w13_fused_gate_h200.py --out h200_w13_fused_gate
+
+CORRECTION: HOLD_WRITER_OWNERSHIP_BUG. The original virtual-K epilogue suppresses required output writers after physical K-warps collapse. Its H200 gate is blocked before CUDA import. Old compilation/resource/SASS tree receipts are preserved but are not complete-kernel correctness evidence. See VIRTUAL_K_WRITER_CORRECTION.json.

@@ -1,0 +1,49 @@
+DRAFT METADATA GLUE - 2026-11-16
+
+Candidate SHA256 b108812fb264933237b0e92accbe943b5bd5ae3b5ae12d5d5dc3f341f3afaae1
+Delta1671bytes; one method added to FlashAttentionBackend. This candidate is
+separate from the FA3 target-verification scheduler candidate.
+Frozen experimental source; do not combine with ready scheduler by accident.
+
+Selective opt-in only: DFLASH draft runner, FA4, topk<=1, fixed query width,
+nontranslated KV pool, no SWA pool, no MLA/local attention, no encoder-decoder,
+no KV sharding, no CPU sequence-length requirement, no prefill-aware SWA,
+no attention DP or CP. Existing runner additionally requires static ragged
+mode, no batch padding, no two-batch overlap/pdmux/LoRA. The global DFlash
+metadata-glue guard is unchanged.
+
+Why this differs from unsafe DFlash global capture:
+The selected FA4 path calls normal_decode_set_metadata with runner-owned
+request/sequence tensors and a persistent req_to_token pool. It never reads
+KVLocPlan's step-owned translated tables or host-written FA planning values.
+The original MetadataGlueGraph reinstalls each key's forward_metadata before
+replaying device updates. topk<=1 leaves expanded metadata None throughout.
+
+Validation passed:14 guard cases;40 mutable metadata cases across batch1/4/8,
+31 actual glue graph replays. Exact exported backend methods and original
+MetadataGlueGraph/Triton normal_decode_set_metadata executed. Request IDs,
+sequence lengths, pool mappings, host mirrors and fresh plan objects changed
+each step. Every live cache length, prefix sum and page-table entry matched
+independently constructed expected values. No timing was collected under
+concurrent agents. This does not validate draft attention, accepted lengths
+or full-model serving performance.
+
+Expanded test_glue.py now explicitly sets released ordinary-pool SWA
+configuration (has_swa=True, window2048, lengths crossing that boundary).
+That rerun stalled during host RAM pressure and was cancelled before output;
+validation.json remains the prior40-case/31-replay report, not this expanded
+fixture. Source inspection shows topk<=1 does not read has_swa in metadata
+prep, but do not claim the expanded fixture executed successfully.
+See ELIGIBILITY_REVIEW.txt for public config/source evidence establishing
+ordinary MHA pool, nontranslated IDs and fresh runner on production recapture.
+
+Expected scope is small: this FA4 path already has one fused metadata kernel.
+Glue primarily reduces Python/Triton dispatch overhead, not attention FLOPs.
+Do not spend a scarce serving check solely on this without stronger evidence.
+
+Backend toggle audit:
+Do not simply set speculative-draft-attention-backend=fa3. Stock DFlash+FA4
+gets compute-dtype BF16 KV; other backends inherit target FP8. That would
+silently lower draft KV precision. The draft KV dtype flag is fixed by the
+serving contract. Preserving BF16 would require an explicit separately
+reviewed implementation/allocation change. Keep defaultFA4 for now.

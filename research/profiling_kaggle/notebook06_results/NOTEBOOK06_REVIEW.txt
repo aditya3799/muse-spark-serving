@@ -1,0 +1,40 @@
+NOTEBOOK 06: VERIFIED REPLAY-SCHEDULE REVIEW
+Run: 20261114T162822Z_f05f16
+
+VALIDATION
+All nine file checksums and source provenance matched. Recomputed 180 event/wall medians from 1,980 samples; verified 90 comparisons. All 192 inference-mode input cases, 30 benchmark cases and 360 changed-input schedule checks passed.
+GPU trace: 228 kernels + 12 copies, all assigned. Annotation spans excluded.
+
+SCHEDULE RESULTS: median within-trial latency reduction (%)
+Scenario | Replays/update-cycle | Wins/6 | Median | Range
+static | 1 | 6/6 | 16.87% | 13.60% to 18.08%
+static | 2 | 6/6 | 15.50% | 12.61% to 18.81%
+static | 4 | 6/6 | 17.74% | 14.37% to 20.82%
+static | 8 | 6/6 | 17.13% | 15.38% to 19.06%
+static | 64 | 6/6 | 17.80% | 15.60% to 19.78%
+external | 1 | 0/6 | -141.63% | -204.39% to -51.34%
+external | 2 | 0/6 | -102.27% | -157.94% to -31.59%
+external | 4 | 1/6 | -34.02% | -66.22% to 2.66%
+external | 8 | 3/6 | 0.15% | -13.15% to 10.43%
+external | 64 | 6/6 | 15.06% | 13.31% to 17.01%
+captured | 1 | 6/6 | 5.25% | 0.79% to 7.07%
+captured | 2 | 6/6 | 11.04% | 9.25% to 12.12%
+captured | 4 | 6/6 | 14.83% | 12.80% to 17.40%
+captured | 8 | 6/6 | 15.98% | 13.73% to 18.89%
+captured | 64 | 6/6 | 17.86% | 14.83% to 20.72%
+Negative reductions mean slower candidate latency. Static has no update; captured combines update plus K prefixes in a single graph; external updates eagerly then launches K existing graphs.
+
+FINDINGS
+Static maps: 30/30 wins, median reduction 16.58%. The cached mapping itself continues to help.
+External refresh: K=1 was 141.63% slower at the median (roughly 2.4x baseline latency); K=2 was 102.27% slower; K=4 was 34.02% slower. K=8 was effectively mixed (3/6 wins, median +0.15% reduction). K=64 won 6/6 with a 15.06% median reduction.
+These are descriptive matched configuration/trial medians, not confidence intervals or a universal crossover. Incoming maps already resided on GPU; no CPU data preparation or host-to-device input transfer was timed.
+Captured update cycles won all 30 comparisons, but remove host update dispatch from replay. They cannot be substituted for the external-update schedule when assessing real refresh overhead.
+At K=4 the external trace showed baseline 32 kernels + one copy per cycle, versus candidate 25 kernels + two copies. The candidate saves mapping kernels but adds a fill/copy refresh path and host API work. Trace durations cannot be subtracted from benchmark timings to assign exact CPU/GPU percentages.
+Clock/host variability remains visible across trials; avoid comparing absolute times between notebooks.
+
+DECISION AND NEXT EXPERIMENT
+Keep the two-buffer draft restricted to static or sufficiently reused maps pending integration evidence. Do not refresh it on every forward or promote it as universally faster.
+Notebook 07 introduces a second, unapplied draft with a single owning lookup buffer. _expert_map becomes a property view into lookup[1:]. The same forward arithmetic is retained; updates copy into the view once, with no separate refresh. Direct in-place map writes should also update lookup contents immediately.
+Compare baseline, prior two-buffer cache and new single-owner cache within the same run, under static and external-update schedules at K=1/2/4/8/64. Verify aliasing, device moves, direct-write graph visibility, rejected attribute replacement, checkpoint exclusion and ownership bytes.
+Compatibility limits: _expert_map is no longer a registered buffer, so framework-wide introspection needs review. Its data pointer starts four bytes into the owning lookup; actual fused-kernel correctness/performance must still be validated on supported hardware. This notebook checks only source slices and branch metadata.
+Active V4 and the earlier draft remain unchanged. No full-serving/H200 gain, real alignment/GEMM validation or startup profile has been established.

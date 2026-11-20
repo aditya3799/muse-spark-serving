@@ -1,0 +1,171 @@
+RESEARCH DECISION -- 19 November 2026
+
+No scored submission is justified yet. The best official serving result remains
+1.2363x, job 317c88a5fd474cd2. No experiment in this session establishes 2x
+serving speed. The scored slot has not been used.
+
+The session ran from 08:15:59 to 10:28:47 UTC, about 132.8 minutes.
+The last remote status and exact elapsed time are recorded in SESSION_STATE.json. Three specialists investigated decode,
+MoE and prefill; root reviewed systems, provenance, integration and controls.
+
+What the evidence establishes
+
+Decode: distributing the draft projection's output columns preserves the full
+native reduction, full-output normalization and each rank's distinct KV heads.
+Actual checkpoint weights passed all eight serial shard checks with changed
+inputs, cache comparisons and an independent frozen-plan seed. Paired local
+component results were 4.4569x (95% interval 4.3790-4.5203) and 4.3200x
+(4.2606-4.3903). These timings exclude real NCCL transport and both transformers.
+They are component bounds on an RTX 3050, not H200 or serving speedups.
+
+Prefill: owned-row projection passed actual-weight FC, normalization and
+five-layer KV/cache checks at large shapes. The integrated candidate preserves
+native math policy, uses coherent rank fallback, and enables a shape only if
+actual local FC plus real all-gather beats native on every rank. Local package
+qualification peaked at 1.687 GB allocated / 1.713 GB reserved. Raw ragged tails
+such as 753 rows remain native; no later-turn TTFT gain is claimed for them.
+
+MoE: a native fixed-cycle loop passed two small positive local whole-FFN trials
+(1.0164x and 1.0098x), but has no measured H200 advantage. A more substantial
+Hopper grouped-WGMMA candidate retains the original packed weights and repacks
+one layer at a time into bounded scratch. Its standalone device kernel compiled
+against exact judge headers. Shipped packing, routing, changed-input graph
+replay, output ownership and BF16 restoration tests passed. Final 2048-row
+chunks bound qualification to 1.749 GB conservatively, with native reference
+work in separate memory phases. Actual Hopper execution remains unverified.
+
+Results that did not survive controls
+
+- The previous local FA3 sliding-window baseline ignored an offset on SM86.
+  An independent FP32 oracle exposed this. Corrected controls pass, but the
+  optimization's independent chain result is about 0.9993x, so it is rejected.
+- Full draft-window repair preserves cache values but loses on interior forks:
+  two aggregate trials are about 0.918x and 0.913x. Rejected.
+- Same-shape DFlash context graph capture is approximately 0.997x. No useful gain.
+- Direct MoE scale-layout access is about 0.912x. Dense BF16 staging is about
+  0.911x / 0.878x at large M; full expert dequantization also exceeds the budget.
+- A first native configuration sweep suggested a 1.073x M32 gain. Warmed graph
+  replays, an explicit duplicate baseline and bootstrap intervals did not
+  reproduce it. All M8/32/128/256 policies retained the frozen parent. Duplicate
+  baseline uncertainty remains wide, so this is non-promotion, not a universal
+  claim that those configurations cannot help on Hopper.
+- Public attention donors omit native BF16 boundaries and use different trig,
+  softmax and traversal paths. Restored source and its diagnostic C ABI compile
+  for SM90, but CPU arithmetic studies still find differences from traversal
+  order. Nothing from that donor is integrated into a serving candidate.
+
+Why the projection result does not establish 2x
+
+Under a uniform Amdahl illustration, a 4.32x component would need to account for
+about 49.7% of parent runtime to lift 1.2363x stock to 2x stock. That time share
+has not been measured. Primary architecture accounting puts FC at roughly
+3.6-5.8% of a limited matmul FLOP total; this is not a runtime percentage because
+operators use different formats and achieve different efficiencies. It makes
+projection alone a demanding hypothesis, not an impossibility proof.
+
+Row and output-column variants accelerate the same FC at different shapes.
+Their gains must not be multiplied. Cache gains and avoided recomputation must
+also not be counted again as kernel gains. Combined patches require a fresh
+peak-memory and full-workload review.
+
+Breadth and source quality
+
+The source ledger contains 92 distinct repository strings, 77 with at least
+one retrieved file, and 50 manual assessments. These are discovery/audit counts,
+not 77 validated engines or exhaustive coverage of everything on the market.
+Pinned commits, hashes, failed retrievals and review levels are retained.
+
+Reviewed families include SGLang, vLLM, TensorRT-LLM, FlashInfer, FlashAttention,
+Humming, DeepInfer, TokenSpeed, persistent/megakernel engines, lossless weight
+codecs, cache systems and commercial inference reports. Several headline gains
+use Blackwell/CDNA, different precision or drafts, prefill-only measurements,
+DP host-cache deployments, or much older baselines. They are not direct H200
+Muse serving evidence. SYSTEMS_FINDINGS.txt and SOURCE_AUDIT.json give sources
+and the specific applicability decisions.
+
+Unscored H200 checks submitted
+
+1. f464d5f09f534363, C32: unchanged release with SWA/full cache ratio 0.35.
+   Same 0.85 memory fraction. Tests cache capacity, not altered arithmetic.
+2. f43fa02892254879, C4: joint row/output-column draft projection.
+   SHA 530e9ccc160398e82386f6e455cdbf80fa4d40f43ec1209b1de7290a5276a8c6.
+   Actual transport and per-rank activation logs accompany the serving check.
+3. f038a667401a4d0a, C16: standalone bounded packed MoE candidate.
+   SHA 80db9ce3d958c58e31be4b64f06442d0ef152493221c3927ad9c43deab68319f.
+   Includes native decode graph profiling; the new MoE path targets prefill.
+
+Older check 0afdc0b191dd4b42 was also still queued at the last read. It is not
+counted as a new launch. The one-shot refresh_checks.py reads these jobs without
+submitting anything. Last statuses are retained in *_check_status.json.
+
+Material remaining gaps
+
+The MoE host C ABI build hit the local compiler memory cap although its device
+kernel compiled. A compiler warning indicates WGMMA serialization and spills;
+these may erase the expected gain. Exact finite startup checks and a conservative
+speed gate may correctly retain native Humming. Such fallback is not a gain.
+A late review also identified a preexec_fn deadlock risk in the submitted build
+launcher. That risk arose after launch; the frozen submission is preserved and
+a separate, tested launcher amendment is saved under
+moe/normal_package_launcher_fix (unsubmitted SHA 8b78849532277aef92994e1e00697c04d00fcd13fed7eafbe19350e8a5b898ab). The subprocess communication timeout
+does not cover a deadlock before Popen returns.
+
+H200 startup, full-model correctness, actual memory peaks, accepted tokens,
+TTFT eligibility and normalized serving throughput remain decisive. Dummy
+CUDA-graph profiles establish dispatch and shapes, not real workload time shares;
+the eager draft FC needs its own logs. One load cannot establish the official
+four-load frontier. No scored request follows from the current evidence.
+
+Resume from the saved state
+
+Read SESSION_STATE.json, the latest check receipts and the three *_CHECK_PLAN
+files. If any job completed, inspect actual activation/fallback, correctness,
+peak memory and performance before doing another local optimization. Preserve
+the frozen release SHA 8c7547213fb993a318321a26f84e2872db8c87b358ee3d3ea638695702b0dc2b.
+Do not substitute the older working patch.diff. New candidates are unapplied
+research artifacts; the original four modified SGLang files were preserved.
+
+Detailed evidence
+
+Decode: PACKAGE_REVIEW.txt, PACKAGE_VALIDATION.json, output_n_reward.json,
+PROJECTION_SCOPE_ANALYSIS.txt, ATTENTION_DIAGNOSTIC_REVIEW.json.
+Prefill: FINAL_AUDIT.json, STARTUP_REVIEW.txt, INTEGRATION.md.
+MoE: normal_package/READINESS.txt, package.json, source_manifest.json,
+coefficient_memory_audit.json, preprocessing_boundary_2048.json.
+Root: native_config_readout.json, component_budget.json, SOURCE_AUDIT.json,
+SYSTEMS_FINDINGS.txt and the submission/status receipts.
+
+Conditional next architecture, not a new result
+
+moe/HYBRID_WGS_FUTURE_PLAN.txt describes retaining the existing native decode
+WGS weights and converting one layer at a time into shared prefill workspace.
+It could avoid both duplicate resident weights and the old 43-chunk prefill
+path. It requires a reversible layout converter, prepared Humming fallback
+metadata, new peak/capture checks, and actual evidence from both queued MoE
+jobs. The extra repack traffic is about1.81GB per converted layer before GEMM
+reads. Nothing is implemented or promoted by this plan.
+
+Final decode follow-up: locally retained, no serving integration
+
+The native18-head FA3 prologue fusion keeps native Q/K normalization, BF16
+rounding, RoPE and cache ownership, and leaves FA3 attention unchanged. It
+passed all65,536 BF16-to-FP8 bit patterns against actual CUDA conversion and
+all12 full/sliding cases at M8/32/56/57/128/256, including complete backing
+buffers, reserved slot0, changing positions and graph-replayed inputs.
+
+The initial timing pilot was noisy and is retained as rejected. Two controlled
+runs with64 calls per timing graph used the unchanged existing scorer:
+2.649638x [2.634968,2.664080] and2.629033x [2.616138,2.642110], both localKEEP.
+One M32 sliding duplicate-control cell remains noisy and was not excluded.
+Aggregate control intervals pass the prefrozen criterion. Interim statements
+that it was unpromoted preceded this final scoring pass; there is still NO
+serving promotion or integration.
+
+This is a refinement of yesterday's fusion scope, not a wholly new mechanism.
+SM86 software conversion, synthetic QKV and isolated norm/cast/store timing
+are explicit limits; historical wider-chain neutrality remains relevant.
+See decode/FA3_PROLOGUE_READOUT.txt, fa3_prologue_reward.json and the bound
+experiment manifest. Do not multiply this gain with FC, attention or MoE gains.
+
+Local experiments and owned helper processes have stopped. Remote checks may
+continue in the service queue. No automatic local monitoring was started.

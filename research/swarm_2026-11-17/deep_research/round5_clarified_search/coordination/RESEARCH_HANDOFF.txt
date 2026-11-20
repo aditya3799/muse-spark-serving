@@ -1,0 +1,92 @@
+RESUMED SWARM RESEARCH -- CLARIFIED RULES PASS
+
+Outcome
+Four lanes produced isolated, default-off prototypes and local component evidence.
+The confirmed serving result remains 1.2237x (job e399c79bb1994630).
+The unsubmitted combined speedup is unknown. 2.5x has not been demonstrated.
+No submission, remote serving check, paid compute or active serving source edit occurred.
+
+1. Expert replicas: a concrete new path through the optimized kernel
+The current helper treats local expert count as both logical ownership and physical
+capacity. Adding one spare expert slot (32 -> 33) originally fails divisibility
+admission and falls off the fast path. The isolated overlay separates these counts.
+A native local GPU probe executed physical33/logical32 with actual Humming packing,
+adaptive helper and scored finalizer. All28 strict copy-equivalence gates passed;
+46 comparisons were finite and38 bitwise equal. Eight emulated EP-sum comparisons
+showed differences up to0.0078125 from regrouping/rounding; these are diagnostics,
+not proof of multi-rank serving correctness. Two changed weight/scale/input
+generations, five route cases, independent CUDA graphs and output poisoning ran.
+Peak torch allocation was10,015,232 bytes in a H=I256 fixture. This is not the real
+4096-size model, total-device memory qualification, or a timing measurement.
+Publication review also caught a failed-copy rollback hazard: after overwriting
+live bytes, metadata rollback alone cannot recover. The prototype now poisons that
+state until rebuilt. Actual distributed publication remains unimplemented.
+
+2. Prompt lookup: own-request provenance and GPU history
+CPU candidate/verifier tests used the stock acceptance implementation; fixed8
+worker-fragment checks preserve target verification and required cache preparation.
+GPU V2 exercised native acceptance and changed graph replays with bounded resident
+history, request epochs, overflow and stale/OOB-slot rejection. A separate frontier
+variant passed12 valid-commit/duplicate-replay cycles and wrong-anchor checks.
+The frontier must describe the PRE-verification prefix and anchor in the same row
+order. Slot ownership, stream ordering and rank-coherent payload publication remain
+integration requirements. The source overlay currently falls back for TP>1.
+A synthetic B4 x74,176-token scan took59.655us locally; it excludes model execution,
+collectives and host decisions and cannot be converted into serving speedup.
+
+3. Score-driven shorter verification: reliable export, uncalibrated policy
+The real greedy draft q is one-hot, so it is not a confidence measure. The prototype
+exports selected-versus-alternative margins along the actual selector path.
+The local GPU fixture passed82 checks and6 negative controls across16 changed
+captured replays, preserving baseline proposals and q bitwise. Reduced feature
+fixtures and mocked upstream top-k were used. CPU tests cover193 score checks and
+28 bridge checks, plus negative controls. A review fixed rank divergence after
+local fallback by requiring a second collective admission. Real collectives and
+worker integration are still held. No margin threshold is calibrated against
+actual target acceptance. The first GPU attempt timed out without a result; its
+receipt is retained alongside the successful retry. No cause is asserted.
+
+4. FA3 split counts: guarded plumbing ready for native testing
+The20,297-byte isolated overlay passes76 CPU contract checks. It keeps policy
+immutable through metadata construction and graph capture, handles decode/verify
+scheduler consistency, and preserves default-off behavior for generic runners.
+Enabled unreviewed prefill graph paths fail closed. An H200-only sweep includes
+changed Q/K/V and pages, key coverage, global/SWA cases and FP64 error diagnostics.
+Exact source precision correspondence was inspected, but the installed H200 binary
+has not been audited or executed. No split count or speedup winner was selected.
+
+Composition is NOT qualified
+Lookup hits skip DFlash and therefore have no fresh DFlash score to drive a cutoff.
+A stale score must not select lookup width. Width-specific target graphs must get
+FA3 policy before capture. Expert copies, graph pools and all auxiliary buffers share
+one +2GB-per-GPU total-device budget; individual torch peaks do not prove compliance.
+An illustrative62 expert-layer copies plus three width states already exceeds a
+conservative decimal2GB before graph workspaces/fragmentation. No combined patch
+was installed, and component timings must not be multiplied.
+
+Preservation and environment
+All four baseline file hashes and three normalized FA3 source hashes match.
+The same13 preexisting dirty repository entries remain. The frozen scored candidate
+SHA256 is8b3ed81e053e4ccb2a043afd25cb94bb49017995ece517bb35aeb6e1b79e026b.
+All owned probe supervisors/children completed. Final independent Linux process
+inventory was unavailable due WSL CreateInstance timeout; Windows inventory found
+no owned WSL processes. No unrelated processes were changed.
+TTS was not stopped, restarted or reconfigured. Its previously observed exit remains
+unresolved; this report does not assert it is running.
+
+Evidence and next steps
+See RESEARCH_FINDINGS.json, PRESERVATION_AUDIT.json, COMPOSITION_AND_MEMORY_AUDIT.json
+and EVIDENCE_INDEX.json in this directory. Lane receipts retain failures as well as
+passes. The next decisive work is complete request/cache/collective integration and
+real unchanged-model acceptance calibration, followed by full-size H200/TP8 timing
+and total-device accounting when available and authorized. Local component passes
+alone do not support a projected2.5x score.
+
+Final FA3 review addendum
+Independent review found no new decisive blocker in the held component scope.
+The future native fixture allocation cap was changed conservatively to decimal
+2,000,000,000 bytes; this does not measure total-device overhead or settle GB/GiB
+enforcement units. Windows syntax and exact inverse-change source-hash checks
+passed. Historical 76-check CPU/preflight receipts remain pre-cap evidence. A WSL
+CPU repeat hung before output and was interrupted; recorded NOT_COMPLETED, with
+no new CUDA/native execution. See the final lane checkpoint for exact provenance.

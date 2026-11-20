@@ -1,0 +1,9 @@
+Upload only 07_kaggle_single_owner.ipynb. Select GPU T4, keep defaults and Run All. Internet can remain off. No installs or model files are needed.
+
+This compares baseline, prior two-buffer cache and a new single-owner cache under static maps and eager updates outside existing CUDA graphs. The new map is a view into lookup storage; no separate refresh copy is needed. Both drafts remain unapplied.
+
+Expected: lifecycle and benchmark passed. Profiler may be partial if graph correlation is unavailable. Defaults: 192 input configurations / 576 outputs, 30 benchmark cases, 360 changed-input schedule checks, 180 timing rows and 1,980 samples.
+
+Compatibility caveats are tested/documented: _expert_map becomes a property, not a named buffer; replacing the attribute is unsupported; the map view starts four bytes into the owner. Actual alignment/GEMMs/full-model buffer handling and H200 performance are not tested.
+
+Run the final export even if a section fails. Download v4_single_owner_*.zip into profiling_kaggle/notebook07_results and stop the GPU session.

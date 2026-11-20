@@ -1,0 +1,29 @@
+Round2 ragged DFlash projection: conditional mechanism, NOT PROMOTED.
+
+ragged_n_pilot.json proves one local synthetic-input seed with the recovered real
+FC/norm/five rank-owned KV weights: twelve geometries, all eight full-K output-N
+shards, unchanged full-M RMS and complete sparse KV backing pools, changed inputs
+and graph replay. No native precision change. M3011/3012 exceed the proposed
+128MiB calibration bound and are numerical-only. Local measured maximum bound
+admits M<=1960 at the measured workspace; it is not a workload whitelist.
+
+M753 first native FC measured32.100ms. The paired warmed whole-chain measurement
+is33.007ms native vs5.695ms simulated
+single-rank shard+copy+original tail. Additional qualification costs39.854ms.
+NCCL/CPU rank coordination are absent, so this is not a serving speedup. The first
+M512 incurred81.653ms of additional cold qualification and must not be discarded.
+
+A warmed shape can amortize qualification, but753 is average prompt length,
+not a known repeated exact M. Thirteen turns do not imply thirteen repeated M.
+The bounded sightings-policy model charges failed and unpublished qualification.
+For416 synthetic visits, shuffled two-hit/four-hit distributions regress even
+without NCCL. A high admission threshold avoids many cold shapes but also loses
+when a shape stops at exactly that threshold. Hot-shape/Zipf cases can improve;
+the real exact-M distribution is unknown. The model is a sensitivity study,
+not a request trace or H200 prediction; its interpolation conservatively treats
+the first512 cold cost as a shape cost, rather than modelling warm library state.
+
+Root explicitly vetoed further independent GPU holdout or production adapter
+until an activation policy is justified by real request-shape evidence. Keep the
+pilot as a numerical screen, not two KEEP rewards. Frozen joint530e remains
+unchanged. No scored or unscored submission proposed by this lane.

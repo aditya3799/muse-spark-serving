@@ -1,0 +1,17 @@
+diff --git a/python/sglang/srt/managers/scheduler_components/request_receiver.py b/python/sglang/srt/managers/scheduler_components/request_receiver.py
+index cb2b76c..490a6a7 100644
+--- a/python/sglang/srt/managers/scheduler_components/request_receiver.py
++++ b/python/sglang/srt/managers/scheduler_components/request_receiver.py
+@@ -203,6 +203,12 @@ class SchedulerRequestReceiver:
+                 recv_reqs = [*recv_reqs, *local_reqs]
+             if get_parallel().tp_size != 1:
+                 tp_group = get_parallel().tp_group
++                queue = tp_group.mq_broadcaster
++                # An empty poll on a single host can use the existing TP ring.
++                # Preserve the ordinary payload protocol for all arrivals.
++                if queue is not None and queue.handle.remote_subscribe_port is None:
++                    if not queue.broadcast_object(bool(recv_reqs)):
++                        return []
+                 recv_reqs = broadcast_pyobj(
+                     recv_reqs,
+                     tp_group.rank,

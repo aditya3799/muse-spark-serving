@@ -1,0 +1,1 @@
+Runreviewedupstreamchecker8f74684againstexistingofflineSASS, noGPUexecution/sourcechange. Eachprocess1.5GiBAS/90stimeout/coreoff. Requirepositiveinstruction/RScoverage, completefixpoint andzeroissues; incompleteanalysis isnotpass. FirstfixturewrappermistakenlyrequiredRS>0forintentionalSSaccumulatorhazard; correctedtoexactupstreamassertions, originalreceiptretained.

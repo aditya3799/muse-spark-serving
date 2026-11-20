@@ -1,0 +1,94 @@
+OPTIONAL COMBINED ATTENTION EXPORT - 2026-11-16
+
+This directory is a separately named, unsubmitted future option. It does not
+replace scheduler, draft_glue, prefix_scan, submitted packages or root round3.
+Rebuild with ../build_combined_attention.py; test with test_native.py.
+
+Canonical source: UTF-8, LF, no BOM, all source lines <=400characters.
+flashattention_backend.py SHA256:
+0b0d0d4288e7bab6c7c4fa3ec9c1068c75e52ddd019ff9eebf24cb3790b50b9e
+metadata.py SHA256:
+300cb9428d6281c10812be0a302e88d82dff9f81baf5cab1087730fe8bc6df3c
+Combined diff11548bytes, SHA256:
+c83704a0544bca79448f3944e77604bd3cdef73f160683b412543841b48fbd16
+
+Provenance and conflict resolution
+----------------------------------
+1. Start from frozen scheduler2a720c8f source, not a stale original checkout.
+2. Insert ONLY the exact glue_draft_metadata method from frozen glueb108812f.
+3. Copy exact frozen prefix-scan metadata300cb942 source as the second file.
+No textual or semantic overlap conflict was found. Scheduler and glue modify
+the same class but different methods. Removing inserted glue from combined
+AST reproduces the ENTIRE frozen scheduler AST, including meaningful literals
+and docstrings. Extracted glue AST equals its frozen source exactly. Prefix
+file is byte-for-byte identical to frozen prefix export. Input hashes are
+checked before assembly, so stale or silently edited inputs fail the build.
+
+Prior scheduler fixes preserved
+-------------------------------
+- MaximumK comes from page-table capacity*page_size, not a short live host max.
+- Dedicated verify scheduler buffer and stable bucket slices remain intact.
+- Replay refresh, shape assertion, ragged upper bounds and geometry guards
+  are unchanged. Existing60case BF16 GPU report applies to the scheduler
+  component before combination; it is not a combined-GPU validation result.
+- UTF8 encoding repair is retained. The old66ff export/runtime AST parity
+  evidence remains in its original directory; no obsolete mojibake file used.
+
+Interaction audit
+-----------------
+FA3 target can use scheduler reuse and parallel prefix metadata; its backend
+does not opt into FA4 draft glue. FA4 draft may opt into narrow glue, but
+_get_scheduler_metadata is None, so no FA3 scheduling is introduced there.
+Prefix kernel is shared by their metadata builder. Capturing glue would now
+capture the modified prefix kernel; that new combination needs actual GPU
+compilation/replay validation. Translated/SWA-pool/local/CPU-host-plan cases
+retain glue fallback. Ordinary MHA-storage sliding attention remains eligible.
+
+Native tests
+------------
+guard_validation.json:18glue guards,187scheduler geometry/guard cases,
+18exact forward consumer guards,2exact metadata-forwarding cases passed.
+Tests execute exact extracted methods/guard AST with native call spies. They
+check capacity-basedK, BF16/FP8 dtype forwarding, softcap, page1/16/256,
+batch1/3/4/8/32, widths1/4/8, FA3target-vsFA4draft separation, and translator
+fallback. Native Python has no Torch; these are control/contract checks,
+not tensor arithmetic, model attention or CUDA graph execution.
+
+test_native.py also reruns the full prefix test_cpu.py against the COMBINED
+metadata path, writing its cpu_validation.json here without touching frozen
+reports. combined_validation.json records both completed passing suites:
+850prefix cases,63mutable-buffer cases,21non-owner checks.
+
+GPU correctness validation - RTX3050 6GB Laptop GPU
+-------------------------------------------------
+gpu_validation.json reports passed against both exact combined source hashes:
+-80prefix cases compare original and exported kernels plus independent int32
+ modular arithmetic. B0/1/non-power-of-two through2049, int32/int64 inputs,
+ extreme integer values/deltas and strided output storage are covered.
+-54changing-input graph comparisons cover alternating batch buckets1/3/8/17,
+ page1/16/256, normal/static-SWA/translated-v2p page layouts, request-ID
+ changes, sequence growth/shrinkage and zero-tail behavior.
+-40ordinary-MHA-storage SWA2048 metadata cases and31actual MetadataGlueGraph
+ replays pass. Fixture reads the exact combined backend methods and exact
+ combined metadata kernel, changes requests/lengths/pool mappings/host-plan
+ objects and checks live output metadata. This is not FA4 attention execution.
+
+Initial combined fixture failure was AttributeError: its SimpleNamespace
+metadata lacked scheduler_metadata=None, which real FlashAttentionMetadata
+already declares. Failure report is preserved as
+gpu_validation_failed_fixture_missing_scheduler.json. Fixed only the test
+fixture to match the real dataclass default; source exports did not change.
+The corrected bounded rerun took42.74s inside the test and exited0 cleanly.
+No timing collected. GPU slot was handed directly to MoE after process exit.
+
+Validation gaps / do not submit yet
+----------------------------------
+- No timing, FP8H200 attention, full target/draft model acceptance,
+  whole-model memory or serving result. Scheduler+prefix+actual attention
+  together has not been measured; separate kernel/metadata parity is proved.
+- Prefix scan compiled and executed on SM86, not H200 or XPU. Its
+  positive-stride guards do not establish arbitrary cross-tensor nonaliasing;
+  actual inspected serving callers use separate input/cache/prefix buffers.
+- Prefix code also reaches XPU backend; native proof is not XPU validation.
+- No source changes or new submission occurred. No GPU processes remain
+  owned by this agent after the clean handoff.

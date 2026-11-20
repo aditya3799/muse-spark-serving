@@ -1,0 +1,87 @@
+﻿Terminal FFN liveness audit of SGLang #50924 for Muse+DFlash
+
+Upstream: https://github.com/sgl-project/sglang/pull/50924
+Open, head2a310acd7770a0bdbe8f99b4aa7a640a2474512f; selected immutable source
+files and PR metadata in sources/nov19_refresh. No upstream gain is transferred.
+Its implemented scope is unquantized dense Qwen2/Qwen3/Llama, TP/PP/CP1, at most
+four finishing-prefill requests and measured graph buckets. It excludes all
+speculation/aux capture. Muse uses a custom residual and expert path and TP8.
+
+Actual liveness finding: a narrow Muse opportunity DOES remain
+Public draft config at the same recovered checkpoint revision46c90f412549... has
+num_target_layers62 and target_layer_ids=[1,16,30,44,59]. The target's terminal
+layer61 is not among those five. Do not incorrectly infer that DFlash FULL capture
+needs final-layer FFN outputs for every prompt position.
+MuseSpark1xModel.forward captures stream AFTER each selected layer, then continues.
+Those five full auxiliary tensors are already materialized before layer61.
+LogitsProcessor._get_hidden_states_to_store(FULL) returns packed auxiliary states
+when present; it does not replace them with the terminal layer's full hidden.
+DFLASH target prefill requests FULL capture and consumes these full auxiliary
+rows to materialize draft context. Those rows must remain unchanged and unpruned.
+
+For ordinary EXTEND without input logprobs, _get_pruned_states selects cumsum of
+extend_seq_lens minus1 for each request. Thus only final new rows of terminal
+hidden are used for next-token logits. TARGET_VERIFY instead uses hidden_states
+unpruned: ALL8 target positions per request remain live and cannot be skipped.
+A separate keep_last_hidden_states feature returns full terminal hidden under
+capture-only mode. It is not enabled merely by ordinary DFlash: the field derives
+from aux_hidden_state_capture, resolved by enable-return-aux-hidden-states, which
+turns speculative execution off and rejects a supplied draft. Nonetheless the
+runtime predicate must explicitly veto that feature and every requested hidden,
+embedding, prompt-logprob, pooling/multimodal or other all-row consumer.
+Actual source AST tests in terminal_ffn_liveness_cpu.json pass6 extend/verify
+cases, full auxiliary preservation and both last-hidden feature branches.
+These are row-identity CPU surrogates, not model execution or numerical parity.
+
+Preserved operator chain
+Complete layer61 attention, Q/K/V writes, o_norm/gate and o_proj on all rows;
+future tokens still need final-layer KV. The _fused_attn_boundary combines the
+attention branch with the residual and creates FFN/router input. All three of
+ffn_input, residual stream and optional FP32 router_input must be selected at the
+same per-request indices; retaining only one operand would be wrong.
+The selected FFN then runs original per-expert norm, weighted sum, post-expert
+projection/collective, post_feedforward_layernorm and norm-preserving residual
+GATE. Muse's residual is not plain add: do not import upstream plain-residual
+handoff. The terminal layer has no next-attention fused boundary; it returns
+post_feedforward_residual_gate(stream,post_feedforward_layernorm(ffn_output)).
+The model's final norm must operate on selected terminal rows, while all five
+auxiliary matrices keep full prompt extent. The logits processor needs an
+explicit validated compact-row mapping so it does not apply old full-row indices
+to a compact tensor. No fake final row or benchmark-specific token shortcut.
+
+Remaining barriers
+- TP8 participants must select identical row order/count and enter all existing
+  collectives, including native fallback when small selectedM cannot use a
+  projection shard guard. Do not reuse the single-GPU PR's assumptions.
+- BCG graph-owned compact index/output buffers and selected-row graph variants
+  require actual capture/replay and mixed final/non-final chunk controls. No host
+  value-based decision inside a captured segment. New graph memory must be counted.
+- Changing GEMM M and routed-expert distribution can change native algorithms,
+  tiles and FP32 accumulation. Tokenwise mathematical liveness is not bit parity.
+  Real target outputs and full auxiliary/KV backing require H200 qualification.
+- DFlash verify remains fully native. Intermediate chunks could in principle omit
+  final outputs that no caller consumes, but current worker still samples an
+  output; do not generalize beyond a proven finishing-prefill consumer contract.
+- Target checkpoint config was unavailable401 in the root's pinned receipt.
+  Endpoint quantization/dtype and actual layer61 latency are not established.
+  Do not infer it has the same cost as another layer or a1/62 wall-time share.
+
+Quantitative ceiling, with honest unknowns
+Only ONE terminal FFN plus its tokenwise boundary/final-norm tail can be removed
+for nonselected positions. All62 attention stages, earlier FFNs and DFlash context
+remain. Letf be the measured fraction of relevant latency spent in that removable
+tail, r=selected_rows/real_rows and h=added_overhead/old_latency. Best speedup is
+  1 / (1 - f*(1-r) + h).
+No actual serving f is known. Even zero-cost removal gives only1.0101x atf1%,
+1.0204x atf2%,1.0526x atf5%,1.1111x atf10%. A2x improvement from this alone needs
+f>=50% with r,h nearzero. To take a1.2363x scored parent to2x would require this
+one tail to account for at least38.185% of the remaining score-weighted latency,
+under the same idealized assumption; this is algebra, not a measured forecast.
+This is a legitimate future liveness optimization, not a current2x lead.
+
+No activation patch, GPU run, score request or graph-memory claim is made.
+Next gate, if a real stage profile justifies it: source-integrated TP8 finishing
+prefill selected-tail parity with original Muse residual semantics, unchanged
+auxiliary state/cache, all8 verify rows retained, capture/replay/mixed/fallback
+controls, then charged full-layer timing and memory. Keep the generic consumer
+predicate; never gate on challenge prompts or specific request IDs.

@@ -1,0 +1,1421 @@
+diff --git a/python/sglang/kernels/ops/moe/adaptive_marlin_tiles.py b/python/sglang/kernels/ops/moe/adaptive_marlin_tiles.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9fb40e44ecb525e505e16b74347f3d18b5197e14
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/adaptive_marlin_tiles.py
+@@ -0,0 +1,106 @@
++"""Select sparse EP tiles on-device while preserving the dense Marlin path.
++
++The caller supplies sorted, already-local routing tables with inactive
++blocks first, caller-owned output buffers, and masked inactive output
++consumers. The selector preserves every active route and disables the
++unused projection with a zero padded count; it never reads back to CPU.
++This experimental helper is used only by the Muse Spark Marlin path.
++"""
++
++import triton
++
++
++import triton.language as tl
++
++
++@triton.jit
++def _select_and_compact(
++    IDS,
++    BIG_TOKENS,
++    BIG_COUNT,
++    SMALL_TOKENS,
++    SMALL_EXPERTS,
++    SMALL_COUNT,
++    N: tl.constexpr,
++    E: tl.constexpr,
++    BIG: tl.constexpr,
++    SMALL: tl.constexpr,
++    NP: tl.constexpr,
++    NB: tl.constexpr,
++):
++    offsets = tl.arange(0, NP)
++    ids = tl.load(IDS + offsets, offsets < N, other=-1)
++    # Mask padding out of the histogram: it is not a real inactive route.
++    ids = tl.where(offsets < N, ids + 1, NB)
++    counts = tl.histogram(ids, NB)
++    buckets = tl.arange(0, NB)
++    active = (buckets > 0) & (buckets <= E) & (counts > 0)
++    use_small = tl.max(tl.where(active, counts, 0), 0) <= SMALL
++    big_blocks = (counts + BIG - 1) // BIG
++    big_starts = tl.cumsum(big_blocks, 0) - big_blocks
++    small_starts = tl.cumsum(active.to(tl.int32), 0) - active.to(tl.int32)
++    rows = tl.arange(0, SMALL)
++    tokens = tl.load(
++        BIG_TOKENS + big_starts[:, None] * BIG + rows[None, :],
++        use_small & active[:, None],
++        other=N,
++    )
++    tl.store(
++        SMALL_TOKENS + small_starts[:, None] * SMALL + rows[None, :],
++        tokens,
++        use_small & active[:, None],
++    )
++    tl.store(SMALL_EXPERTS + small_starts, buckets - 1, use_small & active)
++    total = tl.load(BIG_COUNT)
++    tl.store(BIG_COUNT, tl.where(use_small, 0, total))
++    tl.store(
++        SMALL_COUNT, tl.where(use_small, tl.sum(active.to(tl.int32), 0) * SMALL, 0)
++    )
++
++
++def prepare_adaptive_alignment(
++    local_ids, big_block, local_experts, big_count, is_ep, big_sorted, small_block=16
++):
++    if (
++        not is_ep
++        or big_block <= small_block
++        or local_ids.numel() > 8192
++        or local_experts > 128
++    ):
++        return None
++    import torch
++
++    small = (
++        torch.empty(
++            local_experts * small_block, dtype=torch.int32, device=local_ids.device
++        ),
++        torch.empty(local_experts, dtype=torch.int32, device=local_ids.device),
++        torch.empty(1, dtype=torch.int32, device=local_ids.device),
++    )
++    _select_and_compact[(1,)](
++        local_ids,
++        big_sorted,
++        big_count,
++        *small,
++        local_ids.numel(),
++        local_experts,
++        big_block,
++        small_block,
++        triton.next_power_of_2(local_ids.numel()),
++        triton.next_power_of_2(local_experts + 1),
++    )
++    return small
++
++
++def adaptive_gemm(*args, adaptive_tables=None, adaptive_block=16, **kwargs):
++    from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
++
++    output = moe_wna16_marlin_gemm(*args, **kwargs)
++    if adaptive_tables is None:
++        return output
++    alternate = list(args)
++    # The public positional API: c at 1; sorted IDs, block IDs, padded count at 10:13.
++    assert alternate[1] is not None
++    alternate[10:13] = adaptive_tables
++    kwargs = dict(kwargs, moe_block_size=adaptive_block)
++    return moe_wna16_marlin_gemm(*alternate, **kwargs)
+diff --git a/python/sglang/kernels/ops/moe/moe_align_small_numel.py b/python/sglang/kernels/ops/moe/moe_align_small_numel.py
+index c1a2d5f909bf224d5b3dfa8c4d47e3700751f63b..e47baec530b82abe4659eccfb8ac3d27a3c78ba2 100644
+--- a/python/sglang/kernels/ops/moe/moe_align_small_numel.py
++++ b/python/sglang/kernels/ops/moe/moe_align_small_numel.py
+@@ -28,6 +28,9 @@ def _moe_align_small_numel_kernel(
+     num_experts,  # E + 1 (the "+1 offset" convention's bucket count)
+     block_size,
+     numel,
++    expert_map_ptr,
++    local_ids_ptr,
++    HAS_EXPERT_MAP: tl.constexpr,
+     NP: tl.constexpr,  # power-of-2 >= numel
+     NB: tl.constexpr,  # power-of-2 >= max blocks used
+     USE_GDC: tl.constexpr = False,
+@@ -60,6 +63,11 @@ def _moe_align_small_numel_kernel(
+     offs_p = tl.arange(0, NP)
+     mask_p = offs_p < numel
+     ids = tl.load(topk_ids_ptr + offs_p, mask=mask_p, other=-2)
++    if HAS_EXPERT_MAP:
++        ids = tl.load(
++            expert_map_ptr + tl.maximum(ids, 0), mask=mask_p & (ids >= 0), other=-1
++        )
++        tl.store(local_ids_ptr + offs_p, ids.to(tl.int32), mask=mask_p)
+     # Padded lanes get an out-of-range bucket and are masked out everywhere.
+     bucket = tl.where(mask_p, (ids + 1).to(tl.int32), num_experts)
+ 
+@@ -126,6 +134,8 @@ def moe_align_small_numel(
+     num_tokens_post_pad: torch.Tensor,
+     *,
+     write_inactive_prefix_count: bool = False,
++    expert_map: torch.Tensor | None = None,
++    local_topk_ids: torch.Tensor | None = None,
+ ) -> None:
+     """Align and sort expert token ids into block-padded buffers, in one launch.
+ 
+@@ -133,11 +143,19 @@ def moe_align_small_numel(
+     (minus its ``cumsum_buffer``, which a single CTA does not need):
+     ``num_experts`` is the bucket count ``E + 1`` under the "+1 offset"
+     convention, and the three output buffers are written in place.
++    With expert_map, map global IDs and publish local_topk_ids in the same
++    launch. Negative IDs remain inactive; original route slots are preserved.
+ 
+     Callers gate on ``topk_ids.numel() <= SMALL_NUMEL_LIMIT``; the kernel stays
+     correct above it, but its pairwise tensors spill and it stops being faster
+     than the two-kernel path.
+     """
++    if expert_map is not None:
++        assert topk_ids.is_contiguous() and expert_map.is_contiguous()
++        assert local_topk_ids is not None
++        assert local_topk_ids.shape == topk_ids.shape
++        assert local_topk_ids.dtype == torch.int32 and local_topk_ids.is_contiguous()
++        assert local_topk_ids.device == topk_ids.device == expert_map.device
+     if write_inactive_prefix_count:
+         assert num_tokens_post_pad.shape == (2,)
+         assert num_tokens_post_pad.dtype == torch.int32
+@@ -154,6 +172,9 @@ def moe_align_small_numel(
+         num_experts,
+         block_size,
+         numel,
++        expert_map if expert_map is not None else topk_ids,
++        local_topk_ids if local_topk_ids is not None else topk_ids,
++        HAS_EXPERT_MAP=expert_map is not None,
+         NP=triton.next_power_of_2(max(numel, 2)),
+         NB=triton.next_power_of_2(max(expert_ids.numel(), 2)),
+         WRITE_INACTIVE_PREFIX_COUNT=write_inactive_prefix_count,
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_humming_scale.py b/python/sglang/kernels/ops/moe/muse_spark_humming_scale.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8e16f792e2d4517c0e649939d9f2e9df88785765
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/muse_spark_humming_scale.py
+@@ -0,0 +1,42 @@
++"""Exact BF16 global scaling, skipping non-local expert routes."""
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _scale_rows_kernel(x_ptr, ids_ptr, scale_ptr, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
++    row = tl.program_id(0)
++    expert = tl.load(ids_ptr + row)
++    if expert >= 0:
++        offset = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++        value = tl.load(x_ptr + row * WIDTH + offset, mask=offset < WIDTH, other=0).to(tl.float32)
++        scale = tl.load(scale_ptr + expert).to(tl.float32)
++        # Preserve the separate BF16 multiplication after the BF16 GEMM output.
++        result = (value * scale).to(x_ptr.dtype.element_ty)
++        tl.store(x_ptr + row * WIDTH + offset, result, mask=offset < WIDTH)
++
++
++def scale_active_rows(output, local_ids, scales):
++    if output.ndim != 2 or scales.ndim != 1:
++        raise ValueError("Expected a matrix output and one scale per expert")
++    if output.dtype != torch.bfloat16 or scales.dtype != torch.bfloat16:
++        raise TypeError("Global scaling requires BF16 output and scales")
++    if local_ids.dtype not in (torch.int32, torch.int64):
++        raise TypeError("Local expert IDs must be integer tensors")
++    if not output.is_cuda or not output.device == local_ids.device == scales.device:
++        raise ValueError("Output, IDs and scales must share one CUDA device")
++    if not all(t.is_contiguous() for t in (output, local_ids, scales)):
++        raise ValueError("Output, IDs and scales must be contiguous")
++    if output.shape[0] != local_ids.numel() or scales.numel() == 0:
++        raise ValueError("Expected one local ID per output row and nonempty scales")
++    width = output.shape[1]
++    if width == 0:
++        raise ValueError("Output width must be positive")
++    if output.shape[0] == 0:
++        return
++    block = min(8192, triton.next_power_of_2(width))
++    _scale_rows_kernel[(output.shape[0], triton.cdiv(width, block))](
++        output, local_ids, scales, WIDTH=width, BLOCK=block,
++        num_warps=8 if block >= 8192 else 4,
++    )
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_humming_split.py b/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..51f90fd5cc5b0b7673167fb0a5c7f18fe1b4a93d
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
+@@ -0,0 +1,135 @@
++"""Histogram-selected expert partitions sharing canonical outputs.
++
++Unsupported inputs retain the original helper. Both up GEMMs must finish before any down GEMM because
++cache13 aliases their outputs. This module has no host reads of route values.
++"""
++import torch
++import triton
++import triton.language as tl
++from copy import deepcopy
++
++
++def select_ep_config(intervals, actual_routes, local_experts, global_experts):
++    tune_m = (actual_routes * local_experts + global_experts - 1) // global_experts
++    config = next((deepcopy(c) for lo, hi, c in intervals if lo < tune_m <= hi), None)
++    if config is None or config.get("use_stream_k") is not False or config.get("use_f16_accum") is not False:
++        return None
++    return {"tune_m": tune_m, "valid_shape_m": actual_routes, "config": config}
++
++
++
++@triton.jit
++def _partition_kernel(ids_ptr, light_ptr, heavy_ptr, count_ptr,
++                      ROUTES: tl.constexpr, EXPERTS: tl.constexpr,
++                      CUTOFF: tl.constexpr, BLOCK: tl.constexpr, BINS: tl.constexpr):
++    offsets = tl.arange(0, BLOCK)
++    ids = tl.load(ids_ptr + offsets, mask=offsets < ROUTES, other=-1)
++    valid = (offsets < ROUTES) & (ids >= 0) & (ids < EXPERTS)
++    buckets = tl.where(valid, ids, BINS - 1).to(tl.int32)
++    counts = tl.histogram(buckets, BINS)
++    safe_ids = tl.where(valid, ids, 0).to(tl.int32)
++    route_counts = tl.gather(counts, safe_ids, 0)
++    light = valid & (route_counts <= CUTOFF)
++    heavy = valid & (route_counts > CUTOFF)
++    tl.store(light_ptr + offsets, tl.where(light, ids, -1), mask=offsets < ROUTES)
++    tl.store(heavy_ptr + offsets, tl.where(heavy, ids, -1), mask=offsets < ROUTES)
++    expert_offsets = tl.arange(0, BINS)
++    tl.store(count_ptr + expert_offsets, counts, mask=expert_offsets < EXPERTS)
++
++
++def partition_routes(local_ids, experts, cutoff):
++    routes = local_ids.numel()
++    if not (0 < routes <= 4096 and 0 < experts <= 256 and cutoff > 0):
++        raise ValueError('Partitioning supports 1..4096 routes and 1..256 experts')
++    if not local_ids.is_cuda or not local_ids.is_contiguous() or local_ids.dtype not in (torch.int32, torch.int64):
++        raise ValueError('Expected contiguous CUDA integer route IDs')
++    light = torch.empty(local_ids.shape, dtype=torch.int32, device=local_ids.device)
++    heavy = torch.empty_like(light)
++    counts = torch.empty((experts,), dtype=torch.int32, device=local_ids.device)
++    _partition_kernel[(1,)](local_ids, light, heavy, counts,
++                           ROUTES=routes, EXPERTS=experts, CUTOFF=cutoff,
++                           BLOCK=triton.next_power_of_2(routes),
++                           BINS=triton.next_power_of_2(experts + 1),
++                           num_warps=8 if routes > 1024 else 4)
++    return light, heavy, counts
++
++
++def choose_partition_configs(layer, actual_routes, global_experts):
++    experts = layer.w13_post_scale.numel()
++    default = {s:next(c for lo,hi,c in intervals if lo < actual_routes <= hi)
++               for s,intervals in layer.fp32_configs.items()}
++    selections = {s:select_ep_config(intervals,actual_routes,experts,global_experts)
++                  for s,intervals in layer.fp32_configs.items()}
++    if any(value is None for value in selections.values()):
++        return None
++    light = {stage:value['config'] for stage,value in selections.items()}
++    if not all(c.get('use_f16_accum') is False and c.get('use_stream_k') is False
++               for c in list(default.values()) + list(light.values())):
++        return None
++    # Only explore pairs where expected-local tuning uses no larger row tile.
++    distinct = any(light[s] != default[s] for s in default)
++    smaller = all(light[s]['block_shape'][0] <= default[s]['block_shape'][0] for s in default)
++    if not distinct or not smaller:
++        return None
++    cutoff = min(c['block_shape'][0] for c in light.values())
++    return {'light':light,'heavy':default,'cutoff':cutoff}
++
++
++def split_expert_outputs(original_helper, layer, x, local_ids, torch, global_experts=None,
++                         *, retain=False, defer_downscale=False):
++    from humming.layer import HummingMethod
++    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
++    from sglang.kernels.ops.activation.activation import silu_and_mul
++    from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
++    def fallback():
++        return original_helper(layer,x,local_ids,torch,retain=retain,
++                               defer_downscale=defer_downscale)
++    if (x.ndim != 2 or local_ids.ndim != 2 or x.dtype != torch.bfloat16
++            or local_ids.dtype not in (torch.int32,torch.int64)
++            or not x.is_cuda or x.device != local_ids.device
++            or not x.is_contiguous() or not local_ids.is_contiguous()
++            or local_ids.shape[0] != x.shape[0]):
++        return fallback()
++    valid = local_ids.numel()
++    experts = layer.w13_post_scale.numel()
++    if (valid == 0 or valid > 4096 or not 0 < experts <= 256
++            or not isinstance(global_experts,int) or isinstance(global_experts,bool)
++            or global_experts < experts or global_experts % experts
++            or layer.w2_post_scale.numel() != experts):
++        return fallback()
++    plan = choose_partition_configs(layer,valid,global_experts)
++    if plan is None:
++        return fallback()
++    light_ids,heavy_ids,counts = partition_routes(local_ids,experts,plan['cutoff'])
++    partitions = [('light',light_ids),('heavy',heavy_ids)]
++    aligned = {}
++    def alignment(name,ids,block):
++        key = (name,block)
++        if key not in aligned:
++            aligned[key] = moe_align_block_size(ids,block,experts,ignore_invalid_expert=True)
++        return aligned[key]
++    m,k = x.shape
++    topk = local_ids.shape[1]
++    intermediate = layer.humming_metas['w2'].shape_k
++    cache13 = torch.empty((m*topk*max(2*intermediate,k),),device=x.device,dtype=x.dtype)
++    cache1 = cache13[:m*topk*2*intermediate].view(m*topk,2*intermediate)
++    for name,ids in partitions:
++        config = plan[name]['w13']
++        sorted_ids,expert_ids,padded = alignment(name,ids,config['block_shape'][0])
++        HummingMethod.forward_layer(layer,inputs=x,outputs=cache1,top_k=topk,sublayer_name='w13',
++            tuning_config=config,sorted_ids=sorted_ids,expert_ids=expert_ids,num_tokens_padded=padded,
++            valid_shape_m=valid,compute_config={'gemm_type':'indexed','use_f16_accum':False})
++    # Both up partitions are complete before scaling/activation or down-buffer reuse.
++    scale_active_rows(cache1,local_ids,layer.w13_post_scale)
++    cache2 = torch.empty((m*topk,intermediate),device=x.device,dtype=x.dtype)
++    silu_and_mul(cache1,cache2,expert_ids=local_ids.flatten(),expert_step=1)
++    cache3 = cache13[:m*topk*k].view(m*topk,k)
++    for name,ids in partitions:
++        config = plan[name]['w2']
++        sorted_ids,expert_ids,padded = alignment(name,ids,config['block_shape'][0])
++        HummingMethod.forward_layer(layer,inputs=cache2,outputs=cache3,top_k=1,sublayer_name='w2',
++            tuning_config=config,sorted_ids=sorted_ids,expert_ids=expert_ids,num_tokens_padded=padded,
++            valid_shape_m=valid,compute_config={'gemm_type':'indexed','use_f16_accum':False})
++    if not defer_downscale:
++        scale_active_rows(cache3,local_ids,layer.w2_post_scale)
++    return cache3.view(m,topk,k),local_ids
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py b/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py
+index ed451fd01bacc814c3060f20c5879fcdc367da79..5cc1fd7f77f69c8890a87e5ccbfd41325738bb98 100644
+--- a/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py
++++ b/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py
+@@ -14,6 +14,8 @@ def _post_expert_norm_weighted_sum_kernel(
+     s_ptr,
+     out_ptr,
+     ids_ptr,
++    scale_ptr,
++    HAS_SCALE: tl.constexpr,
+     TOPK: tl.constexpr,
+     H: tl.constexpr,
+     eps,
+@@ -36,10 +38,16 @@ def _post_expert_norm_weighted_sum_kernel(
+     for k in tl.static_range(TOPK):
+         base = (tok * TOPK + k) * H
+         live = True
++        expert_id = -1
+         if HAS_IDS:
+-            live = tl.load(ids_ptr + tok * TOPK + k) >= 0
++            expert_id = tl.load(ids_ptr + tok * TOPK + k)
++            live = expert_id >= 0
+         if live:
+             x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
++            if HAS_SCALE:
++                scale = tl.load(scale_ptr + expert_id).to(tl.float32)
++                # Preserve BF16 multiplication before FP32 norm/reduction.
++                x = (x * scale).to(tl.bfloat16).to(tl.float32)
+ 
+             if APPLY_NORM:
+                 if HAS_WEIGHT and WEIGHT_FIRST:
+@@ -64,6 +72,90 @@ def _post_expert_norm_weighted_sum_kernel(
+     tl.store(out_ptr + tok * H + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+ 
+ 
++# Two-phase work decomposition inspired by muse-okc-submissions' MoE bs1
++# redesign (github.com/gauravjain14/muse-okc-submissions) and our standalone
++# decode work: parallelize independent expert
++# reductions, then distribute the combine over output tiles. No weight repack
++# or change to the precision / ordering of the per-slot weighted sum is needed.
++@triton.jit
++def _post_expert_inv_rms_kernel(
++    x_ptr,
++    w_ptr,
++    ids_ptr,
++    inv_ptr,
++    scale_ptr,
++    HAS_SCALE: tl.constexpr,
++    TOPK: tl.constexpr,
++    H: tl.constexpr,
++    eps,
++    HAS_WEIGHT: tl.constexpr,
++    WEIGHT_FIRST: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++):
++    slot = tl.program_id(0)
++    expert_id = tl.load(ids_ptr + slot)
++    live = expert_id >= 0
++    inv = 0.0
++    if live:
++        offs = tl.arange(0, BLOCK_H)
++        x = tl.load(x_ptr + slot * H + offs, mask=offs < H, other=0.0).to(tl.float32)
++        if HAS_SCALE:
++            scale = tl.load(scale_ptr + expert_id).to(tl.float32)
++            # Preserve BF16 multiplication before FP32 norm/reduction.
++            x = (x * scale).to(tl.bfloat16).to(tl.float32)
++        if HAS_WEIGHT and WEIGHT_FIRST:
++            w = tl.load(w_ptr + offs, mask=offs < H, other=0.0).to(tl.float32)
++            x = x * w
++        var = tl.sum(x * x, axis=0) / H
++        inv = tl.rsqrt(var + eps)
++    tl.store(inv_ptr + slot, inv)
++
++
++@triton.jit
++def _post_expert_tiled_combine_kernel(
++    x_ptr,
++    w_ptr,
++    s_ptr,
++    ids_ptr,
++    inv_ptr,
++    out_ptr,
++    scale_ptr,
++    HAS_SCALE: tl.constexpr,
++    TOPK: tl.constexpr,
++    H: tl.constexpr,
++    HAS_WEIGHT: tl.constexpr,
++    WEIGHT_FIRST: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    tok = tl.program_id(0)
++    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    if HAS_WEIGHT:
++        w = tl.load(w_ptr + offs, mask=offs < H, other=0.0).to(tl.float32)
++    acc = tl.zeros([BLOCK], tl.float32)
++    for k in tl.static_range(TOPK):
++        slot = tok * TOPK + k
++        expert_id = tl.load(ids_ptr + slot)
++        live = expert_id >= 0
++        if live:
++            x = tl.load(x_ptr + slot * H + offs, mask=offs < H, other=0.0).to(
++                tl.float32
++            )
++            if HAS_SCALE:
++                scale = tl.load(scale_ptr + expert_id).to(tl.float32)
++                # Preserve BF16 multiplication before FP32 norm/reduction.
++                x = (x * scale).to(tl.bfloat16).to(tl.float32)
++            inv = tl.load(inv_ptr + slot)
++            if HAS_WEIGHT and WEIGHT_FIRST:
++                y = (x * w) * inv
++            elif HAS_WEIGHT:
++                y = (x * inv) * w
++            else:
++                y = x * inv
++            score = tl.load(s_ptr + slot).to(tl.float32)
++            acc += y * score
++    tl.store(out_ptr + tok * H + offs, acc.to(out_ptr.dtype.element_ty), mask=offs < H)
++
++
+ def fused_post_expert_norm_weighted_sum(
+     expert_output: torch.Tensor,
+     topk_scores: torch.Tensor,
+@@ -73,6 +165,7 @@ def fused_post_expert_norm_weighted_sum(
+     apply_norm: bool = True,
+     slot_expert_ids: Optional[torch.Tensor] = None,
+     round_product: bool = False,
++    expert_output_scale: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """Normalize and combine experts without reading inactive slots.
+ 
+@@ -81,6 +174,21 @@ def fused_post_expert_norm_weighted_sum(
+     """
+     x = expert_output.contiguous()
+     tokens, topk, hidden = x.shape
++    if expert_output_scale is not None:
++        if slot_expert_ids is None:
++            raise ValueError("Expert output scales require local slot IDs")
++        if x.dtype != torch.bfloat16 or expert_output_scale.dtype != torch.bfloat16:
++            raise TypeError("Fused expert output scaling requires BF16 tensors")
++        if expert_output_scale.ndim != 1 or expert_output_scale.numel() == 0:
++            raise ValueError("Expected a nonempty scale vector")
++        if not expert_output_scale.is_contiguous():
++            raise ValueError("Expert output scales must be contiguous")
++        if slot_expert_ids.dtype not in (torch.int32, torch.int64):
++            raise TypeError("Local expert IDs must be integer tensors")
++        if slot_expert_ids.numel() != tokens * topk:
++            raise ValueError("Expected one local expert ID per output slot")
++        if not x.is_cuda or not x.device == slot_expert_ids.device == expert_output_scale.device:
++            raise ValueError("Outputs, local IDs and scales must share one CUDA device")
+     out = torch.empty((tokens, hidden), dtype=x.dtype, device=x.device)
+     if tokens == 0:
+         return out
+@@ -103,12 +211,62 @@ def fused_post_expert_norm_weighted_sum(
+         return y.sum(dim=1).to(x.dtype)
+ 
+     block_h = triton.next_power_of_2(hidden)
++    # The one-CTA-per-token kernel serializes TOPK full-width reductions and
++    # leaves most SMs idle for small routed batches. Keep its path for larger
++    # batches and uncommon arithmetic modes, where an extra launch may lose.
++    if (
++        x.is_cuda
++        and 2 <= tokens <= 8
++        and 2 <= topk <= 32
++        and 1024 <= hidden <= 16384
++        and slot_expert_ids is not None
++        and apply_norm
++        and not round_product
++    ):
++        ids = slot_expert_ids.contiguous()
++        weight = norm_weight.contiguous() if norm_weight is not None else x
++        inv = torch.empty((tokens * topk,), device=x.device, dtype=torch.float32)
++        _post_expert_inv_rms_kernel[(tokens * topk,)](
++            x,
++            weight,
++            ids,
++            inv,
++            expert_output_scale if expert_output_scale is not None else x,
++            HAS_SCALE=expert_output_scale is not None,
++            TOPK=topk,
++            H=hidden,
++            eps=eps,
++            HAS_WEIGHT=norm_weight is not None,
++            WEIGHT_FIRST=weight_first,
++            BLOCK_H=block_h,
++            num_warps=8 if block_h >= 4096 else 4,
++            num_stages=2,
++        )
++        _post_expert_tiled_combine_kernel[(tokens, triton.cdiv(hidden, 256))](
++            x,
++            weight,
++            topk_scores.contiguous(),
++            ids,
++            inv,
++            out,
++            expert_output_scale if expert_output_scale is not None else x,
++            HAS_SCALE=expert_output_scale is not None,
++            TOPK=topk,
++            H=hidden,
++            HAS_WEIGHT=norm_weight is not None,
++            WEIGHT_FIRST=weight_first,
++            BLOCK=256,
++            num_warps=4,
++        )
++        return out
+     _post_expert_norm_weighted_sum_kernel[(tokens,)](
+         x,
+         norm_weight.contiguous() if norm_weight is not None else x,
+         topk_scores.contiguous(),
+         out,
+         slot_expert_ids.contiguous() if slot_expert_ids is not None else x,
++        expert_output_scale if expert_output_scale is not None else x,
++        HAS_SCALE=expert_output_scale is not None,
+         TOPK=topk,
+         H=hidden,
+         eps=eps,
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+index 0b4ecf1884edfbcaffe9d95d7a0ae89d7ee95ccf..62d76d7ebf71cbb06de5a0b996463b2ee7aa0c64 100644
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -407,9 +407,10 @@ class FlashAttentionBackend(AttentionBackend):
+         )
+ 
+     def _compute_scheduler_metadata(
+-        self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
++        self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q,
++        max_seq_len_q=1,
+     ):
+-        """Compute FA3 scheduler metadata for decode.
++        """Compute FA3 scheduler metadata for causal full attention.
+ 
+         Returns the scheduler_metadata tensor, or None if not applicable.
+         """
+@@ -421,7 +422,7 @@ class FlashAttentionBackend(AttentionBackend):
+         # consumed by non-SWA layers (SWA layers skip it in forward_decode).
+         return self._get_scheduler_metadata(
+             batch_size=batch_size,
+-            max_seqlen_q=1,
++            max_seqlen_q=max_seq_len_q,
+             max_seqlen_k=max_seq_len_k,
+             num_heads=self.num_attention_heads,
+             num_heads_k=self.num_kv_heads,
+@@ -435,6 +436,56 @@ class FlashAttentionBackend(AttentionBackend):
+             num_splits=self.num_splits,
+         )
+ 
++    def _compute_verify_scheduler_metadata(self, metadata, batch_size):
++        # Local and distributed attention can change the effective geometry.
++        # Retain their per-layer scheduler path.
++        if (
++            self.local_attn_builder is not None
++            or self._kv_shard_pool is not None
++            or self.topk > 1
++        ):
++            return None
++        return self._compute_scheduler_metadata(
++            batch_size,
++            # FA3 derives its maximum K extent from this same paged-table
++            # capacity. A shorter live host bound can change metadata shape.
++            metadata.page_table.shape[1] * self.page_size,
++            metadata.cache_seqlens_int32,
++            metadata.cu_seqlens_q,
++            max_seq_len_q=metadata.max_seq_len_q,
++        )
++
++    def glue_draft_metadata(self) -> str:
++        # Only this fixed-width FA4 path reads runner slots and persistent
++        # pool tensors exclusively. In particular, a translated KVLocPlan can
++        # cache step-owned tables and must keep running its Python planner.
++        if not (
++            self.is_draft_runner
++            and SpeculativeAlgorithm.from_string(
++                get_spec().speculative_algorithm
++            ).is_dflash()
++            and self.fa_impl_ver == 4
++            and self.topk <= 1
++            and self.speculative_num_draft_tokens is not None
++        ):
++            return "not a fixed-width FA4 DFlash draft"
++        if (
++            self.is_encoder_decoder
++            or self.use_mla
++            or self.local_attn_builder is not None
++            or self.use_sliding_window_kv_pool
++            or self._kv_shard_pool is not None
++            or self.kv_index_translator.is_translating
++            or self.kv_index_translator.reads_are_translated
++            or self.needs_cpu_seq_lens
++            or self.is_prefill_aware_swa
++            or get_parallel().attn_cp_size != 1
++            or _should_disable_scheduler_metadata_precompute()
++        ):
++            return "draft metadata has a host-fed or translated layout"
++        return ""
++
++
+     def validate_elastic_cuda_graph_recapture(self) -> None:
+         if self.use_mla and self.fa_impl_ver != 3:
+             raise ValueError(
+@@ -720,6 +771,17 @@ class FlashAttentionBackend(AttentionBackend):
+                         self._sched_meta_buf[n:] = 0
+                         metadata.scheduler_metadata = self._sched_meta_buf[:n]
+ 
++            if forward_mode.is_target_verify() and self.topk <= 1:
++                metadata = self.target_verify_metadata[bs]
++                if self._verify_sched_meta_buf is not None:
++                    sched = self._compute_verify_scheduler_metadata(metadata, bs)
++                    if sched is not None:
++                        n = sched.numel()
++                        assert n <= self._verify_sched_meta_buf.numel()
++                        self._verify_sched_meta_buf[:n].copy_(sched)
++                        self._verify_sched_meta_buf[n:].zero_()
++                        metadata.scheduler_metadata = self._verify_sched_meta_buf[:n]
++
+             if forward_mode.is_draft_extend_v2():
+                 # CUDA graph bakes max_seq_len_q as a constant. replay() sets it to
+                 # max(num_accept_tokens_cpu) which is None/empty at capture time,
+@@ -1368,6 +1430,12 @@ class FlashAttentionBackend(AttentionBackend):
+                 )
+                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
+ 
++        # The page table must already have been converted to pages, so
++        # scheduler capacity matches the table passed to FA3 exactly.
++        if forward_batch.forward_mode.is_target_verify() and self.topk <= 1:
++            metadata.scheduler_metadata = self._compute_verify_scheduler_metadata(
++                metadata, batch_size
++            )
+         self.forward_metadata = metadata
+ 
+     def get_paged_mha_kv_cache(
+@@ -1786,6 +1854,29 @@ class FlashAttentionBackend(AttentionBackend):
+                     **kwargs,
+                 )
+             else:
++                # Only reuse a scheduler for exactly the geometry it describes.
++                # SWA, cross/local attention and custom masks retain stock paths.
++                sched_meta = None
++                if (
++                    forward_batch.forward_mode.is_target_verify()
++                    and self.topk <= 1
++                    and metadata.scheduler_metadata is not None
++                    and causal
++                    and not is_swa_layer
++                    and not use_local_attn
++                    and not layer.is_cross_attention
++                    and sinks is None
++                    and score_mod is None
++                    and rel_bias is None
++                    and metadata.image_token_ranges is None
++                    and q.dtype == self.kv_cache_dtype
++                    and layer.tp_q_head_num == self.num_attention_heads
++                    and layer.tp_k_head_num == self.num_kv_heads
++                    and layer.head_dim == self.head_dim
++                    and layer.v_head_dim == self.head_dim
++                    and bool(layer.logit_cap > 0) == self.has_softcap
++                ):
++                    sched_meta = metadata.scheduler_metadata
+                 result = flash_attn_with_kvcache(
+                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                     k_cache=key_cache,
+@@ -1794,6 +1885,7 @@ class FlashAttentionBackend(AttentionBackend):
+                     cache_seqlens=cache_seqlens,
+                     cu_seqlens_q=cu_seqlens_q,
+                     cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
++                    scheduler_metadata=sched_meta,
+                     max_seqlen_q=max_seqlen_q,
+                     softmax_scale=layer.scaling,
+                     causal=False if use_cascade_attn else causal,
+@@ -2457,8 +2549,14 @@ class FlashAttentionBackend(AttentionBackend):
+             self._sched_meta_buf = torch.zeros(
+                 1 + b_rounded * 4, dtype=torch.int32, device=self.device
+             )
++            # Verify has max_seqlen_q > 1 and needs four rounded vectors.
++            # Keep its storage separate from decode's captured views.
++            self._verify_sched_meta_buf = torch.zeros(
++                1 + b_rounded * 4, dtype=torch.int32, device=self.device
++            )
+         else:
+             self._sched_meta_buf = None
++            self._verify_sched_meta_buf = None
+ 
+         if self.local_attn_builder is not None:
+             self.decode_cuda_graph_local_attn_metadata = (
+@@ -3185,12 +3283,18 @@ class FlashAttentionBackend(AttentionBackend):
+                     verify_lens = seq_lens
+                     verify_delta = self.speculative_num_draft_tokens
+ 
+-                # Page table built on-device (self-guards on cache_seqlens);
+-                # max_seq_len_k left unset -- unread here (scheduler_metadata is
+-                # normal-decode-only).
++                # Both attention and its scheduler use the page-table capacity;
++                # live lengths remain device data and need no host maximum.
+                 self._set_decode_page_metadata(
+                     plan, metadata, req_pool_indices, verify_lens, verify_delta
+                 )
++                if metadata.scheduler_metadata is not None:
++                    sched = self._compute_verify_scheduler_metadata(metadata, bs)
++                    if sched is not None:
++                        n = sched.numel()
++                        assert n == metadata.scheduler_metadata.numel()
++                        self._verify_sched_meta_buf[:n].copy_(sched)
++                        self._verify_sched_meta_buf[n:].zero_()
+             else:
+                 # When topk > 1, we need two specific target verify metadata, and then merge states
+                 # 1. The first half of metadata for prefix tokens
+diff --git a/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py b/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
+index be859b407bcee512bab1c8b21efe6a3f76079612..fd09430510c593e5e07de8a3ab10c25e58c3a759 100644
+--- a/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
++++ b/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
+@@ -69,3 +69,99 @@ def gemm_ag(
+     if out is None:
+         out = torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
+     return all_gather(comm, local, out, b, c)
++
++
++def prefill_row_projection_supported(group, x, weight) -> bool:
++    """A large replicated projection with equal contiguous token-row shards."""
++    if group is None or group.world_size not in (2, 4, 8):
++        return False
++    if not x.is_cuda or x.ndim != 2 or weight.ndim != 2:
++        return False
++    if x.dtype != torch.bfloat16 or weight.dtype != x.dtype:
++        return False
++    if weight.device != x.device or not weight.is_contiguous():
++        return False
++    m, k = x.shape
++    n = weight.shape[0]
++    return (
++        torch.cuda.get_device_capability(x.device) == (9, 0)
++        and m >= 512
++        and m % group.world_size == 0
++        and min(k, n) >= 1024
++        and k == weight.shape[1]
++        and k % 128 == 0
++        and n % 128 == 0
++    )
++
++
++def prefill_row_projection(group, x, weight):
++    """Compute full output rows once, then gather in original token order.
++
++    Input and weights must be replicated on the TP group. The complete K
++    reduction and full output dimension remain local, with FP32 output before
++    the single BF16 rounding. No persistent repacked weight or padding exists.
++    """
++    m_local = x.shape[0] // group.world_size
++    start = group.rank_in_group * m_local
++    local_fp32 = torch.mm(
++        x[start : start + m_local], weight.t(), out_dtype=torch.float32
++    )
++    local = local_fp32.to(x.dtype)
++    del local_fp32
++    return group.all_gather(local, dim=0)
++
++
++def small_projection_supported(group, x, weight) -> bool:
++    """Hopper column shards through an already-reserved multicast workspace."""
++    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
++        CustomAllReduceV2,
++    )
++
++    if group is None or group.world_size not in (2, 4, 8):
++        return False
++    comm = group.ca_comm
++    if (
++        not isinstance(comm, CustomAllReduceV2)
++        or comm.disabled
++        or not comm.has_multicast
++        or comm.world_size != group.world_size
++    ):
++        return False
++    if not x.is_cuda or x.ndim != 2 or weight.ndim != 2:
++        return False
++    if x.dtype != torch.bfloat16 or weight.dtype != x.dtype:
++        return False
++    if weight.device != x.device or not weight.is_contiguous():
++        return False
++    m, k = x.shape
++    n = weight.shape[0]
++    return (
++        torch.cuda.get_device_capability(x.device) == (9, 0)
++        and 1 <= m < 512
++        and min(k, n) >= 1024
++        and k == weight.shape[1]
++        and k % 128 == 0
++        and n % (128 * group.world_size) == 0
++        and m * n * 2 <= comm.max_push_size
++        and comm.config.num_push_blocks >= 2
++    )
++
++
++def small_projection_local(comm, x, weight):
++    """Complete K reductions for this rank's contiguous output columns."""
++    n_local = weight.shape[0] // comm.world_size
++    start = comm.rank * n_local
++    local_fp32 = torch.mm(
++        x, weight[start : start + n_local].t(), out_dtype=torch.float32
++    )
++    return local_fp32.to(x.dtype)
++
++
++def small_projection(group, x, weight):
++    """Gather complete BF16 columns without an intermediate layout copy."""
++    comm = group.ca_comm
++    local = small_projection_local(comm, x, weight)
++    output = torch.empty(
++        x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device
++    )
++    return all_gather(comm, local, output)
+diff --git a/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py b/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
+index 41c463dcfabe782eb681e9b2ab7b5c37c81d0df2..367fdf5477b2ef5ba9d250bcdea5e36ac8f8dc55 100644
+--- a/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
++++ b/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
+@@ -130,7 +130,12 @@ class MuseSpark1xFp4Experts(nn.Module):
+         self.dispatcher = _DirectDispatcher()
+ 
+         capability = get_device_capability() if is_cuda() else None
+-        self.use_marlin = self.moe_runner_backend.is_marlin()
++        self.use_humming = self.moe_runner_backend.is_humming()
++        if self.use_humming and self.params_dtype != torch.bfloat16:
++            raise ValueError("Muse NVFP4 Humming requires BF16 activations")
++        # Shared BF16 activation/finalization semantics also disable early FP4
++        # activation quantization and preserve the existing projection guards.
++        self.use_marlin = self.moe_runner_backend.is_marlin() or self.use_humming
+         self._sm_major = capability[0] if capability is not None else 0
+         if not self.use_marlin and capability is not None and capability < (10, 0):
+             raise ValueError(
+@@ -175,6 +180,13 @@ class MuseSpark1xFp4Experts(nn.Module):
+                 num_local_experts, dtype=torch.int32
+             )
+         self.register_buffer("_expert_map", expert_map, persistent=False)
++        # Derived from the fixed expert map; not part of model checkpoints.
++        expert_lookup = (
++            None
++            if expert_map is None
++            else torch.cat((expert_map.new_full((1,), -1), expert_map))
++        )
++        self.register_buffer("_expert_lookup", expert_lookup, persistent=False)
+ 
+         self.quant_method = MuseSparkNvFp4FusedMoEMethod(quant_config)
+         if not self.use_marlin and not self.quant_method.enable_flashinfer_trtllm_moe:
+@@ -209,7 +221,7 @@ class MuseSpark1xFp4Experts(nn.Module):
+         behaviour change for it; a ``False`` export would previously have been
+         mis-scaled by the hardcoded weight-first form.
+ 
+-        ``post_expert_norm`` is *not* registered as a submodule — it already
++        ``post_expert_norm`` is *not* registered as a submodule â€” it already
+         belongs to the parent block, so registering it here would duplicate its
+         weight in ``state_dict`` and create a reference cycle.
+         """
+@@ -229,7 +241,7 @@ class MuseSpark1xFp4Experts(nn.Module):
+             weight = torch.ones(
+                 self.hidden_size,
+                 dtype=torch.bfloat16,
+-                device=self.gate_up_proj.device,
++                device=next(self.parameters()).device,
+             )
+         object.__setattr__(self, "_post_expert_norm", post_expert_norm)
+         self._post_expert_norm_weight = weight.detach().to(torch.bfloat16)
+@@ -377,21 +389,63 @@ class MuseSpark1xFp4Experts(nn.Module):
+         )
+         return output.to(out_dtype)
+ 
++    @torch.no_grad()
++    def refresh_expert_lookup_(self) -> None:
++        """Refresh after map edits, before consumers on the ordered CUDA stream.
++
++        Preserves captured storage. Replacing/moving buffers requires graph
++        recapture; direct map mutations are not automatically detected.
++        """
++        if self._expert_map is not None:
++            self._expert_lookup[0].fill_(-1)
++            self._expert_lookup[1:].copy_(self._expert_map)
++
++    @torch.no_grad()
++    def update_expert_map_(self, mapping: torch.Tensor) -> None:
++        """Update fixed-shape routing metadata without replacing graph inputs."""
++        if self._expert_map is None:
++            raise ValueError("Mapping cannot be enabled without reconstructing the module")
++        if (
++            mapping.shape != self._expert_map.shape
++            or mapping.dtype != torch.int32
++            or mapping.device != self._expert_map.device
++        ):
++            raise ValueError("Expert map update must preserve shape, int32 dtype and device")
++        self._expert_map.copy_(mapping)
++        self.refresh_expert_lookup_()
++
+     def _marlin_expert_outputs(
+         self,
+         hidden_states: torch.Tensor,
+         topk_scores: torch.Tensor,
+         topk_ids: torch.Tensor,
++        *,
++        defer_downscale: bool = False,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         """Project local routes; finalization skips undefined inactive slots."""
++        if self.use_humming:
++            from sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe import (
++                _humming_expert_outputs,
++            )
++
++            local_ids = topk_ids.to(torch.int32)
++            if self._expert_map is not None:
++                local_ids = self._expert_lookup[local_ids.clamp_min(-1) + 1]
++            return _humming_expert_outputs(
++                self._humming_layer, hidden_states.contiguous(),
++                local_ids.contiguous(), torch,
++                defer_downscale=defer_downscale,
++                global_experts=self.global_num_experts,
++            )
++
+         from sgl_kernel.scalar_type import scalar_types
+ 
+         from sglang.kernels.ops.activation.activation import silu_and_mul
+-        from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
+-        from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+-        from sglang.srt.layers.moe.token_dispatcher.standard import (
+-            _map_topk_ids_to_local_experts,
++        from sglang.kernels.ops.moe.adaptive_marlin_tiles import (
++            adaptive_gemm as moe_wna16_marlin_gemm,
++            prepare_adaptive_alignment,
+         )
++        from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+         from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+ 
+         hidden_states = hidden_states.contiguous()
+@@ -401,41 +455,83 @@ class MuseSpark1xFp4Experts(nn.Module):
+         gemm1_n = 2 * size_n
+         expert_map = self._expert_map
+ 
+-        local_topk_ids = topk_ids.to(torch.int32)
+-        if expert_map is not None:
+-            local_topk_ids = _map_topk_ids_to_local_experts(local_topk_ids, expert_map)
+-        local_topk_ids = local_topk_ids.contiguous()
++        from sglang.kernels.ops.moe.moe_align_small_numel import (
++            SMALL_NUMEL_LIMIT,
++            moe_align_small_numel,
++        )
++
++        fuse_mapping = (
++            expert_map is not None
++            and hidden_states.is_cuda
++            and topk_ids.is_contiguous()
++            and expert_map.is_contiguous()
++            and 0 < topk_ids.numel() <= SMALL_NUMEL_LIMIT
++        )
++        if fuse_mapping:
++            local_topk_ids = torch.empty_like(topk_ids, dtype=torch.int32)
++        else:
++            local_topk_ids = topk_ids.to(torch.int32)
++            if expert_map is not None:
++                local_topk_ids = self._expert_lookup[
++                    local_topk_ids.clamp_min(-1) + 1
++                ]
++            local_topk_ids = local_topk_ids.contiguous()
+         topk_weights = topk_scores.to(torch.float32).contiguous()
+ 
+         for block_size_m in _MARLIN_BLOCK_SIZE_M_CANDIDATES:
+             if num_tokens * topk / self.num_local_experts / block_size_m < 0.9:
+                 break
+ 
+-        if num_tokens == 1 and topk <= 32 and expert_map is None:
++        if fuse_mapping:
++            # Every route can occupy its own padded block, including sentinels.
++            # Fuse conversion, sentinel-preserving EP mapping and alignment.
++            num_routes = topk_ids.numel()
++            sorted_token_ids = torch.empty(
++                num_routes * block_size_m, device=topk_ids.device, dtype=torch.int32
++            )
++            expert_ids = torch.empty(
++                num_routes, device=topk_ids.device, dtype=torch.int32
++            )
++            num_tokens_post_padded = torch.empty(
++                1, device=topk_ids.device, dtype=torch.int32
++            )
++            moe_align_small_numel(
++                topk_ids.contiguous(),
++                self.num_local_experts + 1,
++                block_size_m,
++                sorted_token_ids,
++                expert_ids,
++                num_tokens_post_padded,
++                expert_map=expert_map,
++                local_topk_ids=local_topk_ids,
++            )
++        elif num_tokens == 1 and topk <= 32:
+             from sglang.kernels.ops.moe.moe_align_single_token import (
+                 moe_align_single_token,
+             )
+ 
+             sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                 moe_align_single_token(
+-                    local_topk_ids, block_size_m, return_inactive_prefix_count=True
++                    local_topk_ids,
++                    block_size_m,
++                    return_inactive_prefix_count=expert_map is None,
+                 )
+             )
+         else:
+-            align_num_experts = (
+-                self.global_num_experts
+-                if expert_map is not None
+-                else self.num_local_experts
+-            )
+             sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                 local_topk_ids,
+                 block_size_m,
+-                align_num_experts,
++                self.num_local_experts,
+                 return_inactive_prefix_count=expert_map is None,
+             )
+ 
+         # Both aligners emit ascending block IDs with inactive blocks first;
+         # no expert remapping occurs after this ordering is established.
++        adaptive_tables = prepare_adaptive_alignment(
++            local_topk_ids, block_size_m, self.num_local_experts,
++            num_tokens_post_padded, expert_map is not None, sorted_token_ids,
++            small_block=32,
++        )
+         workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
+         cache2 = torch.empty(
+             (num_tokens * topk, size_n),
+@@ -479,6 +575,8 @@ class MuseSpark1xFp4Experts(nn.Module):
+             is_zp_float=False,
+             expert_ids_are_sorted=True,
+             has_inactive_prefix_count=expert_map is None,
++            adaptive_tables=adaptive_tables,
++            adaptive_block=32,
+         )
+         silu_and_mul(
+             cache1.view(-1, gemm1_n),
+@@ -515,6 +613,8 @@ class MuseSpark1xFp4Experts(nn.Module):
+             is_zp_float=False,
+             expert_ids_are_sorted=True,
+             has_inactive_prefix_count=expert_map is None,
++            adaptive_tables=adaptive_tables,
++            adaptive_block=32,
+         ).view(num_tokens, topk, size_k), local_topk_ids
+ 
+     def _forward_marlin(
+@@ -538,8 +638,14 @@ class MuseSpark1xFp4Experts(nn.Module):
+             )
+         if pre_expert_norm is not None:
+             hidden_states = pre_expert_norm(hidden_states)
++        # Recognize the current norm before deciding whether scaling can be
++        # deferred. Generic norm fallback and direct helper calls remain scaled.
++        if self.use_humming and self._post_expert_norm is not post_expert_norm:
++            self.set_post_expert_norm(post_expert_norm)
++        defer_downscale = self.use_humming and self._post_expert_norm_weight is not None
+         expert_outputs, local_topk_ids = self._marlin_expert_outputs(
+-            hidden_states, topk_scores, topk_ids
++            hidden_states, topk_scores, topk_ids,
++            defer_downscale=defer_downscale,
+         )
+         if self._post_expert_norm is not post_expert_norm:
+             self.set_post_expert_norm(post_expert_norm)
+@@ -551,6 +657,9 @@ class MuseSpark1xFp4Experts(nn.Module):
+                 eps=self._post_expert_norm_eps,
+                 weight_first=self._post_expert_norm_weight_first,
+                 slot_expert_ids=local_topk_ids,
++                expert_output_scale=(
++                    self._humming_layer.w2_post_scale if defer_downscale else None
++                ),
+             )
+         return finalize_identity_with_post_expert_norm(
+             expert_outputs=expert_outputs,
+diff --git a/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py b/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
+index f3acc418dd69d58e13200935876cbe6648df0f0e..e26c279ad385ab803ff1dbf9f7f9e6ba3d11cc24 100644
+--- a/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
++++ b/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
+@@ -84,6 +84,21 @@ def _align_fp4_moe_weights_for_flashinfer_trtllm(layer) -> None:
+ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
+     """Prepare Muse FP4 experts without process-global mutation or duplication."""
+ 
++    def __init__(self, quant_config):
++        from sglang.srt.layers.moe import get_moe_runner_backend
++        from sglang.srt.utils.common import get_device_capability, is_cuda
++
++        backend = get_moe_runner_backend()
++        if not backend.is_humming():
++            super().__init__(quant_config)
++            return
++        if not is_cuda() or not (8, 0) <= get_device_capability() < (10, 0):
++            raise ValueError("Muse NVFP4 Humming W4A16 requires SM80-SM90")
++        self.quant_config = quant_config
++        self._lora_marlin = False
++        self.enable_flashinfer_trtllm_moe = False
++        self.use_flashinfer_trtllm_weight_layout = False
++        self._cache_permute_indices = {}
+     def create_weights(
+         self,
+         layer,
+@@ -138,9 +153,25 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
+                 delattr(layer, native)
+         return result
+ 
++    def _process_weights_for_humming(self, layer):
++        from types import SimpleNamespace
++
++        raw = SimpleNamespace()
++        for alias, native in self._MARLIN_PARAM_ALIASES:
++            setattr(raw, alias, getattr(layer, native))
++        # Match stock Marlin's gate/up global-scale collapse exactly.
++        if raw.w13_weight_scale_2.dim() > 1:
++            raw.w13_weight_scale_2 = raw.w13_weight_scale_2[:, 0].contiguous()
++        layer._humming_layer = _prepare_humming_experts(raw, torch)
++        # Only the canonical Humming packed tensors remain resident.
++        for _, native in self._MARLIN_PARAM_ALIASES:
++            delattr(layer, native)
++
+     def process_weights_after_loading(self, layer):
+         """Prepare the TRT-LLM layout from native HF parameters in place."""
+         backend = getattr(self, "_moe_runner_backend", None)
++        if backend is not None and backend.is_humming():
++            return self._process_weights_for_humming(layer)
+         if backend is not None and backend.is_marlin():
+             return self._process_weights_for_marlin(layer)
+         input_scale = layer.gate_up_proj_input_scale.max().float()
+@@ -192,3 +223,98 @@ __all__ = [
+     "MuseSparkNvFp4FusedMoEMethod",
+     "_align_fp4_moe_weights_for_flashinfer_trtllm",
+ ]
++
++
++def _prepare_humming_experts(raw, torch):
++    """Pack one canonical NVFP4 layout with FP8 block scales.
++
++The caller validates aligned shapes, allowing repacking without redundant
++zero-padding copies. Global scales are applied after each BF16 GEMM output
++to preserve the stock Marlin rounding boundary. Tuning overrides are owned
++by this layer; Humming's cached defaults remain unchanged."""
++    from humming import dtypes
++    from humming.config import WeightScale2Type, WeightScaleType
++    from humming.layer import HummingMethod
++    from humming.schema import HummingInputSchema, HummingWeightSchema
++    layer = torch.nn.Module()
++    for prefix in ('w13', 'w2'):
++        w = getattr(raw, prefix + '_weight')
++        sf = getattr(raw, prefix + '_weight_scale')
++        gs = getattr(raw, prefix + '_weight_scale_2')
++        e, n, k2 = w.shape
++        if w.dtype != torch.uint8 or sf.dtype != torch.float8_e4m3fn:
++            raise ValueError('Humming NVFP4 requires uint8 codes and FP8 scales')
++        if n % 64 or k2 * 2 % 64 or sf.shape != (e, n, k2 * 2 // 16):
++            raise ValueError('Humming NVFP4 requires aligned shapes and group size 16')
++        if gs.ndim != 1 or gs.shape[0] != e:
++            raise ValueError('Humming NVFP4 requires one global scale per expert')
++        layer.register_parameter(prefix + '_weight', torch.nn.Parameter(w.contiguous().view(torch.int32), requires_grad=False))
++        layer.register_parameter(prefix + '_weight_scale', torch.nn.Parameter(sf.contiguous(), requires_grad=False))
++        layer.register_buffer(prefix + '_post_scale', gs.to(torch.bfloat16).contiguous())
++        schema = HummingWeightSchema(b_dtype=dtypes.float4e2m1, bs_dtype=dtypes.float8e4m3, weight_scale_group_size=16, weight_scale_type=WeightScaleType.GROUP, weight_scale_2_type=WeightScale2Type.NONE)
++        meta = HummingMethod.prepare_layer_meta(layer, shape_n=n, shape_k=k2 * 2, weight_schema=schema, input_schema=HummingInputSchema(a_dtype=dtypes.bfloat16), num_experts=e, torch_dtype=torch.bfloat16, sublayer_name=prefix)
++        assert meta.a_dtype == dtypes.bfloat16 and meta.c_dtype == dtypes.bfloat16
++        assert not meta.use_int_weight_scale and (not meta.has_input_scale)
++        HummingMethod.transform_humming_layer(layer, sublayer_name=prefix, already_padded=True)
++    layer.register_buffer('locks', torch.zeros(max(2048, torch.cuda.get_device_properties(0).multi_processor_count * 8), device='cuda', dtype=torch.int32))
++    import copy
++    layer.fp32_configs = {}
++    for stage in ('w13', 'w2'):
++        default = HummingMethod.get_default_tuning_configs(layer, use_f16_accum=False, gemm_type='indexed', sublayer_name=stage)
++        snapshot = copy.deepcopy(default)
++        owned = copy.deepcopy(default)
++        for lo, hi, c in owned:
++            # Stream-K reduces partial outputs in BF16 even with FP32 MMA.
++            # Disable it to preserve the stock FP32 reduction contract.
++            c['use_stream_k'] = False
++            c['use_f16_accum'] = False
++        assert default == snapshot, 'Default tuning cache must stay unchanged'
++        layer.fp32_configs[stage] = owned
++    return layer
++
++
++def _humming_expert_outputs_default(layer, x, local_ids, torch, retain=False, *, defer_downscale=False):
++    """Compute local routes with FP32 accumulation and no Stream-K reduction.
++
++First and final outputs alias one buffer as in the stock Marlin path.
++The caller applies the original per-expert norm and weighted finalization."""
++    from humming.layer import HummingMethod
++    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
++    from sglang.kernels.ops.activation.activation import silu_and_mul
++    from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
++    configs = layer.fp32_configs
++    valid = local_ids.numel()
++    selected = {s: next((c for lo, hi, c in cfg if lo < valid <= hi)) for s, cfg in configs.items()}
++    assert all((c['use_stream_k'] is False and c['use_f16_accum'] is False for c in selected.values()))
++    block = selected['w13']['block_shape'][0]
++    sorted_ids, expert_ids, padded = moe_align_block_size(local_ids, block, layer.w13_post_scale.numel(), ignore_invalid_expert=True)
++    m, k = x.shape
++    topk = local_ids.shape[1]
++    i = layer.humming_metas['w2'].shape_k
++    cache13 = torch.empty((m * topk * max(2 * i, k),), device=x.device, dtype=x.dtype)
++    cache1 = cache13[:m * topk * 2 * i].view(m * topk, 2 * i)
++    common = dict(sorted_ids=sorted_ids, expert_ids=expert_ids, num_tokens_padded=padded, valid_shape_m=valid, compute_config={'gemm_type': 'indexed', 'use_f16_accum': False})
++    HummingMethod.forward_layer(layer, inputs=x, outputs=cache1, top_k=topk, sublayer_name='w13', tuning_config=selected['w13'], **common)
++    # GEMM output has already rounded to BF16. Apply the BF16 global scale
++    # in a separate BF16 operation, preserving Marlin's second rounding.
++    scale_active_rows(cache1, local_ids, layer.w13_post_scale)
++    cache2 = torch.empty((m * topk, i), device=x.device, dtype=x.dtype)
++    silu_and_mul(cache1, cache2, expert_ids=local_ids.flatten(), expert_step=1)
++    cache3 = cache13[:m * topk * k].view(m * topk, k)
++    if selected['w2']['block_shape'][0] != block:
++        second = moe_align_block_size(local_ids, selected['w2']['block_shape'][0], layer.w2_post_scale.numel(), ignore_invalid_expert=True)
++        common.update(sorted_ids=second[0], expert_ids=second[1], num_tokens_padded=second[2])
++    HummingMethod.forward_layer(layer, inputs=cache2, outputs=cache3, top_k=1, sublayer_name='w2', tuning_config=selected['w2'], **common)
++    # Preserve the same BF16-output -> BF16-scale boundary for GEMM2.
++    if not defer_downscale:
++        scale_active_rows(cache3, local_ids, layer.w2_post_scale)
++    return (cache3.view(m, topk, k), local_ids)
++
++
++def _humming_expert_outputs(layer, x, local_ids, torch, retain=False, *,
++                            defer_downscale=False, global_experts=None):
++    from sglang.kernels.ops.moe.muse_spark_humming_split import split_expert_outputs
++    return split_expert_outputs(
++        _humming_expert_outputs_default,layer,x,local_ids,torch,global_experts,
++        retain=retain,defer_downscale=defer_downscale,
++    )
+diff --git a/python/sglang/srt/models/muse_spark.py b/python/sglang/srt/models/muse_spark.py
+index 6b638e9f5ebd3b74271fe4c5eb7fa81c13bdcba1..2e6a7570e23ba46cd2f0e35d5ec8e0423904f60c 100644
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -53,7 +53,11 @@ from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
+ from sglang.srt.layers.communication.muse_spark_gemm_ag import (
+     gemm_ag,
+     gemm_local,
++    prefill_row_projection,
++    prefill_row_projection_supported,
+     reserve_projection_workspace,
++    small_projection,
++    small_projection_supported,
+ )
+ from sglang.srt.layers.cp.utils import is_cp_active
+ from sglang.srt.layers.dp_attention import (
+@@ -221,28 +225,30 @@ class MuseSpark1xRouter(nn.Module):
+         self.register_buffer(
+             "e_score_correction_bias", torch.zeros(num_experts, dtype=torch.float32)
+         )
+-        self._split2_hi = None
+-        self._split2_lo = None
++        self._split2_weight = None
+         self._split2_key = None
+ 
+     @torch.no_grad()
+     def _build_split2(self) -> None:
+-        w = self.weight.data
+-        key = (w.data_ptr(), w.shape, w._version)
++        w = self.weight
++        # Keep the parameter's version counter: .data hides in-place weight
++        # updates and could leave the packed router stale after a reload.
++        key = (w.data_ptr(), w.shape, w.dtype, w.device, w._version)
+         if self._split2_key == key:
+             return
+         hi = w.to(torch.bfloat16)
+         lo = (w - hi.to(torch.float32)).to(torch.bfloat16)
+-        self._split2_hi = hi.t().contiguous()
+-        self._split2_lo = lo.t().contiguous()
++        # Share the input read and GEMM launch while retaining separate FP32
++        # accumulators for the high and low BF16 components.
++        self._split2_weight = torch.cat((hi, lo)).t().contiguous()
+         self._split2_key = key
+ 
+     def forward_split2(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         self._build_split2()
+         x = hidden_states.to(torch.bfloat16)
+-        acc = torch.mm(x, self._split2_hi, out_dtype=torch.float32)
+-        acc += torch.mm(x, self._split2_lo, out_dtype=torch.float32)
+-        return acc
++        acc = torch.mm(x, self._split2_weight, out_dtype=torch.float32)
++        hi, lo = acc.chunk(2, dim=-1)
++        return hi + lo
+ 
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         # Decode-sized FP32 logits: one CuTe GEMV instead of cuBLAS split-K + reduce.
+@@ -609,6 +615,22 @@ class MuseSpark1xMoE(nn.Module):
+             )
+         self.experts.post_expert_norm = post_expert_norm
+         self.experts.use_megamoe = self.use_megamoe
++        if (
++            self.pre_expert_proj is not None
++            and self.tp_size in (4, 8)
++            and getattr(self.experts, "use_marlin", False)
++            and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
++            and parallel.attn_dp_size == 1
++            and parallel.attn_cp_size == 1
++            and torch.cuda.is_available()
++            and torch.cuda.get_device_capability() == (9, 0)
++        ):
++            # This shared group workspace grows only on the first layer.
++            # Reserve before any forward, workspace binding or graph capture.
++            reserve_projection_workspace(
++                parallel.tp_group.ca_comm,
++                max(self.expert_hidden_size, self.hidden_size),
++            )
+         self.sp_dispatcher = None
+         self.finalize_ar_workspace = None
+         self.unpool_gather_boundary: Optional[FusedPostNormResidualPreNorm] = None
+@@ -735,9 +757,39 @@ class MuseSpark1xMoE(nn.Module):
+                 if self._defers_unpool_gather(comm, output.shape[0]):
+                     return gemm_local(comm, output, self.post_expert_proj.weight)
+                 return gemm_ag(comm, output, self.post_expert_proj.weight)
++            if self._can_shard_prefill_row_projection(output, self.post_expert_proj.weight):
++                return prefill_row_projection(
++                    get_parallel().tp_group, output, self.post_expert_proj.weight
++                )
++            if self._can_shard_small_projection(output, self.post_expert_proj.weight):
++                return small_projection(
++                    get_parallel().tp_group, output, self.post_expert_proj.weight
++                )
+             output = bf16_gemm_dispatch(output, self.post_expert_proj.weight, None)
+         return output
+ 
++    def _can_shard_prefill_row_projection(self, x, weight) -> bool:
++        parallel = get_parallel()
++        return (
++            getattr(self.experts, "use_marlin", False)
++            and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
++            and not getattr(get_forward(), "sp_active", False)
++            and parallel.attn_dp_size == 1
++            and parallel.attn_cp_size == 1
++            and prefill_row_projection_supported(parallel.tp_group, x, weight)
++        )
++
++    def _can_shard_small_projection(self, x, weight) -> bool:
++        parallel = get_parallel()
++        return (
++            getattr(self.experts, "use_marlin", False)
++            and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
++            and not getattr(get_forward(), "sp_active", False)
++            and parallel.attn_dp_size == 1
++            and parallel.attn_cp_size == 1
++            and small_projection_supported(parallel.tp_group, x, weight)
++        )
++
+     def _defers_unpool_gather(self, comm, num_tokens: int) -> bool:
+         boundary = self.unpool_gather_boundary
+         return (
+@@ -815,6 +867,18 @@ class MuseSpark1xMoE(nn.Module):
+                 and gemm_ag_supported(comm, hidden_states, self.pre_expert_proj.weight)
+             ):
+                 expert_input = gemm_ag(comm, hidden_states, self.pre_expert_proj.weight)
++            elif self._can_shard_prefill_row_projection(
++                hidden_states, self.pre_expert_proj.weight
++            ):
++                expert_input = prefill_row_projection(
++                    get_parallel().tp_group, hidden_states, self.pre_expert_proj.weight
++                )
++            elif self._can_shard_small_projection(
++                hidden_states, self.pre_expert_proj.weight
++            ):
++                expert_input = small_projection(
++                    get_parallel().tp_group, hidden_states, self.pre_expert_proj.weight
++                )
+             else:
+                 expert_input = bf16_gemm_dispatch(
+                     hidden_states, self.pre_expert_proj.weight, None

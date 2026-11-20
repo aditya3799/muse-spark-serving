@@ -1,0 +1,71 @@
+--- a/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
++++ b/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
+@@ -175,6 +175,13 @@
+                 num_local_experts, dtype=torch.int32
+             )
+         self.register_buffer("_expert_map", expert_map, persistent=False)
++        # Derived from the fixed expert map; not part of model checkpoints.
++        expert_lookup = (
++            None
++            if expert_map is None
++            else torch.cat((expert_map.new_full((1,), -1), expert_map))
++        )
++        self.register_buffer("_expert_lookup", expert_lookup, persistent=False)
+ 
+         self.quant_method = MuseSparkNvFp4FusedMoEMethod(quant_config)
+         if not self.use_marlin and not self.quant_method.enable_flashinfer_trtllm_moe:
+@@ -377,6 +384,31 @@
+         )
+         return output.to(out_dtype)
+ 
++    @torch.no_grad()
++    def refresh_expert_lookup_(self) -> None:
++        """Refresh after map edits, before consumers on the ordered CUDA stream.
++
++        Preserves captured storage. Replacing/moving buffers requires graph
++        recapture; direct map mutations are not automatically detected.
++        """
++        if self._expert_map is not None:
++            self._expert_lookup[0].fill_(-1)
++            self._expert_lookup[1:].copy_(self._expert_map)
++
++    @torch.no_grad()
++    def update_expert_map_(self, mapping: torch.Tensor) -> None:
++        """Update fixed-shape routing metadata without replacing graph inputs."""
++        if self._expert_map is None:
++            raise ValueError("Mapping cannot be enabled without reconstructing the module")
++        if (
++            mapping.shape != self._expert_map.shape
++            or mapping.dtype != torch.int32
++            or mapping.device != self._expert_map.device
++        ):
++            raise ValueError("Expert map update must preserve shape, int32 dtype and device")
++        self._expert_map.copy_(mapping)
++        self.refresh_expert_lookup_()
++
+     def _marlin_expert_outputs(
+         self,
+         hidden_states: torch.Tensor,
+@@ -389,9 +421,6 @@
+         from sglang.kernels.ops.activation.activation import silu_and_mul
+         from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
+         from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+-        from sglang.srt.layers.moe.token_dispatcher.standard import (
+-            _map_topk_ids_to_local_experts,
+-        )
+         from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+ 
+         hidden_states = hidden_states.contiguous()
+@@ -418,9 +447,9 @@
+         else:
+             local_topk_ids = topk_ids.to(torch.int32)
+             if expert_map is not None:
+-                local_topk_ids = _map_topk_ids_to_local_experts(
+-                    local_topk_ids, expert_map
+-                )
++                local_topk_ids = self._expert_lookup[
++                    local_topk_ids.clamp_min(-1) + 1
++                ]
+             local_topk_ids = local_topk_ids.contiguous()
+         topk_weights = topk_scores.to(torch.float32).contiguous()
+ 

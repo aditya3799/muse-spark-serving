@@ -1,0 +1,20 @@
+﻿{
+    "job_id":  "9577d0fdbe714fa6",
+    "files":  [
+                  "python/sglang/kernels/ops/moe/adaptive_marlin_tiles.py",
+                  "python/sglang/kernels/ops/moe/moe_align_small_numel.py",
+                  "python/sglang/kernels/ops/moe/muse_spark_humming_scale.py",
+                  "python/sglang/kernels/ops/moe/muse_spark_humming_split.py",
+                  "python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py",
+                  "python/sglang/srt/layers/attention/flashattention_backend.py",
+                  "python/sglang/srt/layers/communication/muse_spark_gemm_ag.py",
+                  "python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py",
+                  "python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py",
+                  "python/sglang/srt/models/muse_spark.py"
+              ],
+    "serving_flags":  {
+                          "--moe-runner-backend":  "humming",
+                          "--swa-full-tokens-ratio":  "0.35"
+                      },
+    "notes_bytes":  3281
+}

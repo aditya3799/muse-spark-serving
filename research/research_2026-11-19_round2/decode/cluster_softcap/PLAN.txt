@@ -1,0 +1,37 @@
+Source-only cluster alternative for target softcap reduction.
+No production kernel, activation, H200 execution or performance claim.
+
+Primary donor: FlashInfer5617 head2cb3521e52d0452a2524bad7d2c4d43a273a2aba,
+include/flashinfer/sampling.cuh (saved flashinfer_nov/).
+The donor uses cooperative_groups::this_cluster, map_shared_rank and sync, with
+cudaLaunchAttributeClusterDimension. It demonstrates the required final DSM
+lifetime barrier; it does not supply our greedy softcap arithmetic.
+
+One8-CTA cluster per input row. Each rank owns one original4096-column tile,
+using exactly8warps and preserving native divide/libdevice.tanh/multiply and
+leftmost argmax. Width<=32768; tiles past valid_width publish(-inf,0), including
+the8thtile for25256columns. After a cluster publication barrier, rank0 reads
+the8 DSM slots in increasing tile order, performs the native strict> fold from
+(-inf,0), adds unchanged col_offset and stores the original FP32[max,index].
+Every CTA then executes a final cluster barrier before shared memory can die.
+There is no cross-cluster global spin, epoch counter, separatezero launch or
+per-replay scratch lifetime to manage. Output allocation and graph device/stream
+ownership still must obey the native wrapper contract.
+
+Exactness obligations: NaN tile maxima must be skipped by strict>; an all-NaN
+or all-negative-infinity row keeps native index0; equal maxima keep the first
+tile/index; +/-zero selection and output bits remain native. The native4096
+block reduction and pointwise division/tanh code must be retained or shown
+equivalent in compiled SM90 code and actual CUDA tests. A C++ rewrite of the
+math is NOT qualified simply because the expressions look the same.
+
+Fallback: nonSM90, no supported8-CTA cluster, tilecount>8, unsupported dtype/
+stride/offset, or no qualified arithmetic implementation. No policy chosen by
+the four challenge request counts; any later speedgate must be shape/resource
+based and measured in the full native producer boundary.
+
+CPU protocol proof enumerates40320 arrival orders and72 value/identity cases,
+including a missing-final-barrier counterexample. It models ordering and fold
+semantics only; it neither validates CUDA memory model implementation nor proves
+the untouched GPU arithmetic. A Triton/Gluon clustered layout must show perCTA
+tile ownership and original block reduction before a compile prototype is useful.

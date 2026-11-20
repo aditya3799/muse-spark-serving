@@ -1,0 +1,160 @@
+Additional three-hour research: decision and evidence
+Session requested: 2026-11-19 10:32:37 to 13:32:37 UTC.
+Completion state and final remote timestamps: SESSION_STATE.json.
+
+Decision: no scored submission request. The official frozen result remains
+1.2363x. Nothing in this continuation establishes a 2x serving result or a
+credible numerical forecast of one. All new source amendments are isolated;
+the scored release and the existing user's serving worktree are preserved.
+The available local GPU is SM86, not the H200 TP8 evaluation system.
+
+What the local gains can project to
+
+The strongest previous actual-weight draft FC chain holdout was 4.3200x locally,
+including RMS and five distinct KV projections, but excluding distributed
+transport and the rest of the transformer. Its true share of serving time is
+unknown. Under a deliberately simplified uniform-duration model, lifting the
+1.2363x parent to 2x requires removing 38.185% of parent duration. A 4.32x component
+would have to occupy 49.6865% of that duration. These are break-even conditions,
+not estimated shares or official frontier-score predictions. Actual scoring
+compares stock interactivity points, not simply equal-concurrency raw throughput.
+Historical p90 TTFT and median generation values do not form an additive profile.
+Do not multiply the FC, row-ownership, selector, norm or MoE ratios together.
+FORECAST_LIMITS.json retains the original measurements and assumptions.
+
+Decode findings
+
+1. Native target post-gather selector: 539 payload and 24 actual native softcap
+producer GPU cases were bit-exact. The device-guarded captured holdout measured
+4.00-4.76x for this small postprocessing segment, about 4 microseconds saved.
+All eager timing controls failed the strict interval gate, so no eager win is
+claimed. Native LM head, softcap arithmetic and collective payload are unchanged.
+Actual Muse subclass dispatch and FP32-output policy were checked. Default-off
+package 7d31f72e is reviewable; no actual NCCL/H200/whole-server gain exists.
+
+2. Draft sampler packing: an exact bounded-ID 8-byte payload, with full-int64
+fallback, replaces two gathers with one while preserving native logits/max.
+CPU/Gloo, local GPU and actual sampler-method checks pass. This is a real
+communication-redundancy candidate, but the local arithmetic timing excludes
+collective transport. Separate package 4f5a3583 remains disabled and unapplied.
+The alternative deferred-broadcast package is ineligible for Muse as frozen:
+its exact-base-class guard rejects the actual model subclass.
+
+3. Parallel native softcap: 2,800 exact payload cases. Captured N8 improves
+2.61x/2.20x for the two tested widths; larger batches are neutral or regress.
+There is no valid eager improvement. A cluster/DSM design is intended to preserve native
+per-tile arithmetic and passes CPU value/lifetime ordering proofs; its corrected
+Gluon version has not compiled because the unchanged memory preflight refused
+execution. This is source research, not a Hopper kernel result.
+
+4. Prologue fusion's local wider target-chain gain is only about 1.00208x despite
+a larger isolated-component gain. It does not justify a serving promotion.
+Released FlashInfer small-query FA2 dispatch excludes FP8 queries; the new
+cluster sampler is stochastic and is not a replacement for unchanged greedy
+sampling. Native ring/side-stream donors have FA3/HiCache or state-policy
+exclusions. The fresh low-T MoE decode donor admits T<=2 (C++ max4), excluding
+unchanged DFlash verification's minimum eight rows.
+
+MoE findings
+
+1. Finite-register dequantization removes the old WGS lookup dependency and
+compiles without spills. The scored Humming parent already uses register
+coefficient work, so this is not a new parent-wide bandwidth reduction.
+Separated input/weight readiness and a dependent wait-hint variant also compile.
+Compiler inspection matters: the plain split did not reliably move multiplication
+before the blocking input-wait retry boundary, whereas the dependent variant
+does, with extra instruction cost. Its first TRYWAIT can still issue earlier. No Hopper execution or speedup is measured for these variants.
+
+2. A new open SGLang SM90 grouped NVFP4 donor and a variant restoring native BF16
+coefficient/epilogue boundaries compile without spills. Its published comparison
+is a different DeepSeek/Humming workload, not Muse or our scored parent. Generic
+runner integration combines routes before Muse's required per-expert norm and
+cannot be copied directly. Different GEMM reduction order still needs numerical,
+quality and token qualification; restoring boundaries is not a full-FFN proof.
+
+3. The donor's normalized scale packing aliases zero with a subnormal encoding
+and erases signed-zero information. The boundary-restored variant retains this
+limitation. A separate raw-scale/original-code layout proves reversible CPU
+roundtrips across 100,663,296 nibbles and 6,291,456 scale bytes in four full-width
+E1 changed-seed W13/W2 cases, including all 256 scale byte values. Its finite coefficient decoder also passes 4,064 CPU pairs.
+There is no GPU converter, runtime loader or residency hook for that variant.
+This is a useful path toward one resident layout and exact fallback, rather than
+retaining another approximately 906 MB of expert weights per E32 layer
+(source size formula, not a new GPU residency measurement).
+
+4. Binary hazard screening required two repairs to the upstream checker:
+indirect jump-table successors and divergent branch fallthrough coverage.
+Exact cubin/CFG/SASS bindings, nonempty instruction inventories and injected
+hazard controls are required. Earlier reports with incomplete coverage are
+superseded by the final wgmma_hazard_audit/READOUT.txt and manifest. These are
+static screens of local binaries, not hardware race or numerical proofs.
+
+5. Native-layout fallback is exact but substantially slower than native execution
+in tested whole-FFN cases. Its extra E32 storage is 864 MiB. Faster tiled restore
+relative to the old restore path does not establish a win over the scored parent.
+Old WGS's recorded serving decode rates also trail the frozen parent; prefill-only
+gains cannot erase that evidence.
+
+Prefill findings
+
+1. Projection integration had concrete lifetime and phase-memory problems.
+Separate early qualification, no_grad, fail-stop vendor status handling and
+constructor cleanup amendments now compose in a private index and pass CPU
+source/fault tests. Unchanged queued row16K qualification plus retained MoE state
+exceeds 3 GB. Corrected ordering gives an approximately 1.766 GB conditional
+source bound for a later phase, not a measured total H200 peak. Graph pools,
+all-rank workspace sizing and allocator/native allocations remain live gates.
+Do not combine the two queued packages unchanged.
+
+2. Ragged actual-weight FC passes its numerical pilot, but first-use qualification
+cost exceeds one measured M753 call's saving. M753 is an average prompt length,
+not a guaranteed repeated shape. No activation rule follows without reuse data.
+The 128 MiB contiguous-KV helper preserves bytes and passes native BF16 scaffolds;
+actual Hopper native FP8 attention parity is untested. Both specialized builds
+hit the preserved host memory cap, so it remains disabled.
+
+3. A saved row exposed three wrong FP8 K bytes from the original large-prefill
+prologue: matching source BLOCK size did not preserve the compiler's reduction
+tree. The one-ULP variance difference was reproduced from original PTX on CPU.
+The failing BLOCK32 regime is outside the unchanged 16 MiB qualifier, so this
+is not evidence of an accepted decode failure. A separate eight-warp repair
+restores the reduction layout and passes 42 changed-input byte cases plus
+SM90 offline layout checks. No timing, integration or budget expansion follows.
+
+4. Terminal-layer FFN liveness was checked against actual native logits selection
+and the public draft capture-layer configuration. Ordinary finishing prefill
+could avoid some nonfinal rows; VERIFY still needs all rows. Muse's norm-preserving
+residual gate, TP8 coherence, graph buffers and changed-M GEMM parity prevent a
+naive slicing port. This is a documented opportunity, not an enabled optimization.
+
+Communication and exact arithmetic
+
+The finalizer/native all-reduce prototype preserves the native push protocol and
+matches 1,440 virtual rank outputs, including mixed native/fused generations.
+Its local arithmetic-only controlled gain is 1.2080x, CI[1.1990,1.2172]. Actual
+transport is excluded. Integration must launch the entire allocated counter grid,
+serialize device execution across streams, preserve zero-pair encoding and keep
+all ranks participating. No serving hook is enabled. A separate C1 gather/norm
+candidate compiles actual SM90 variants but has no NVLink timing evidence.
+A lossless codec compresses the actual 671 MB draft FC to 75.0659% of its bytes;
+there is no fused GEMM implementation or speed claim.
+
+Research coverage and remaining decision gates
+
+The broad source ledger from the preceding round contains 92 repository strings,
+77 with some retrieved content, and 50 manual applicability assessments. That is
+not 77 validated engines and not an exhaustive inventory of every product.
+This continuation adds pinned source audits of newly released FlashInfer and
+Nov10-19 SGLang work, actual donor compilation, compiler/binary inspection,
+public ServingStudio data applicability, and independent cross-reviews.
+Open pull requests are distinguished from released or merged functionality.
+Primary URLs, revisions and hashes live beside each lane's evidence.
+
+Before a scored request: actual H200/TP8 correctness and captured lifetime;
+whole-FFN/native-parent comparisons; exact generation and quality acceptance;
+added peak memory <=2 GB/rank; TTFT limits at C1/4/16/32; and independent full
+frontier evidence supporting the claimed gain. A disabled receipt evaluator
+records these gates and cannot authorize a submission automatically.
+Existing remote checks are read only; no new check or scored job was launched
+in this three-hour continuation. Final statuses and source integrity hashes are
+recorded by the completion step in SESSION_STATE.json and EVIDENCE_INDEX.json.

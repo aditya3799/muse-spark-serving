@@ -1,0 +1,73 @@
+SERVING PROGRESS - 2026-11-15 (Asia/Kolkata)
+Saved: 2026-11-15T02:15:31.790792+05:30 / 2026-11-14T20:45:31.790792+00:00 UTC
+Workspace: D:\OpenKernelChallenge\serving
+
+CURRENT STATE
+Active candidate: V4 + cached expert mapping, using the exact selected two-buffer draft.
+User authorized integration and one unscored submission. Integration and submission are complete.
+Job f1513498e8d84de8: 16-user unscored check, accepted and still QUEUED for an 8xH200 node when checked this session. No result yet.
+Scored runs go first in the queue. Do not resubmit this accepted job.
+Last quota observation after submission: 2/3 checks and 1/1 scored run left in the UTC quota day. Refresh status before relying on these counts; reset is 00:00 UTC.
+The local date is November 15; the submission's UTC date is November 14. These are the same session, not different runs.
+
+PROFILING OUTCOME AND DECISION
+Closed the MoE mapping profiling phase after Notebook 14. No Notebook 15 is planned.
+Measured component: pre-alignment expert-ID conversion, global-to-local mapping, and score conversion inside MuseSpark1xFp4Experts._marlin_expert_outputs.
+Scheduler and tokenizer initialization have NOT been profiled in this phase.
+Latest Colab T4 repeat: selected two-buffer prefix median event latency reduction 30.08% eager and 25.73% CUDA graph; 48/48 cases won in each schedule. Earlier equivalent Colab results were 30.06% and 24.91%.
+Native router defaults are int32 expert IDs and float32 scores; traced prefix kernels fell from six to four. This is neither a full-layer nor an end-to-end serving speedup.
+Single-owner alternative was 11.80% slower than two-buffer eager and 0.55% slower at the graph median. Keep the two-buffer choice.
+Notebook 12 Kaggle: 1,296 configurations, 2,208 value checks, 384 fused-branch metadata checks, 128 graph-update outputs, 48 device-move outputs, 25 malformed updates rejected.
+Notebook 13 Kaggle: 768 ordered stream handoffs, 1,536 output checks, 768 pointer checks and eight recaptures passed.
+Notebook 14 ran on Colab (user confirmed), not Kaggle. Kaggle latency replication is unmeasured. Historical reports retain their original pre-integration statements; this note and candidate_manifest.json describe the current state.
+
+INTEGRATION
+Registered a nonpersistent lookup with a leading -1 sentinel alongside the original expert map.
+Fallback mapping now indexes the cache. Original small-batch fused mapping, alignment and GEMM tail remain unchanged.
+Added explicit update/refresh APIs. No refresh on each forward. Direct future map edits need refresh and correct CUDA stream ordering; replacing/moving buffers needs graph recapture.
+Additional lookup storage for 256 global experts: 1,028 bytes per layer. No extra expert-weight copies or precision changes.
+Other three V4 source files are unchanged. V5/V6 remain discarded.
+Original V4 patch: submission_v4.diff (preserved).
+Pre-integration backup: D:\OpenKernelChallenge\serving\iterations\before_v4_cached_mapping_20261114T201851Z
+
+VALIDATION AND PACKAGE
+27 local actual Python routing-method cases passed with real AOT CUDA alignment, including the 8/9-token boundary. Small fused aligner is shimmed; Marlin GEMMs and activation are stubbed. This does not validate full H200 arithmetic.
+Selected draft hash verified; V4-relative delta applied exactly. Cumulative patch applied cleanly to the pinned source and reproduced all four active source files.
+Python AST, git whitespace and patch path/size/line restrictions passed.
+Pinned base: 297e54fd105e974cdf401e5b4d20253a22c16f90
+Cumulative patch: submission_v4_cached_mapping.diff (same bytes as patch.diff)
+Patch size: 16169 bytes; four changed files; maximum added line 93 characters.
+Patch SHA256: cf02617f790e28c9229ac9aec5e517f04344c49491347ef732a352fbaa3aa4a4
+Selected owner source SHA256: 18438f083871ec322bdc409690f8b2674cef5381e1e786176eae685dddea2c0f
+Launch flags: judge defaults; local flags file contains comments only.
+
+SUBMISSION AND INTERPRETATION
+Receipt: submitted_f1513498e8d84de8.json
+Current unscored job: f1513498e8d84de8, 16 users, result pending.
+Original V4 historical one-user check 717001a114f3471a passed, ratio 1.051x. Its result does not validate this new candidate.
+The new check compares against stock at 16 users. Comparing its ratio to the old one-user V4 run cannot isolate the cache's incremental benefit.
+Full-model correctness, throughput, per-user speed, TTFT and GPU-memory behavior must come from the H200 result. Do not claim the T4 percentage as a serving gain.
+
+RESUME HERE
+1. Read SESSION_HANDOFF.txt and candidate_manifest.json.
+2. Check existing job (read-only):
+   wsl -d Ubuntu -- /mnt/d/OpenKernelChallenge/bin/okc serve status f1513498e8d84de8
+3. If still queued/running, report that state; do not launch a duplicate.
+4. When complete, save its result/logs and analyze correctness, throughput, latency and memory. Update manifest/status with actual evidence before deciding any next run.
+5. Do not launch a scored run automatically. No further profiling notebook is scheduled. Any new phase should follow the evidence and user scope.
+
+REFERENCE FILES
+profiling_kaggle/MOE_MAPPING_FINAL_REVIEW.txt
+profiling_kaggle/notebook14_results/NOTEBOOK14_REVIEW.txt
+validation/V4_CACHED_MAPPING_INTEGRATION_REVIEW.txt
+validation/v4_cached_mapping_integration.json
+validation/v4_cached_mapping_adapter.json
+validation/v4_cached_mapping_package.json
+candidate_manifest.json
+CANDIDATE_STATUS.txt
+
+WORKING PREFERENCES AND CONSTRAINTS
+User has no paid H100/H200 access or credits. Use free Colab/Kaggle T4 for scoped component studies; contest checks supply H200 full-serving validation.
+For future agreed notebook experiments, provide the next runnable notebook alongside the result analysis. This does not mean reopening the completed 14-notebook loop.
+Use Ubuntu Git and OKC through WSL for this Linux-created checkout. Windows Git has shown filesystem/line-ending artifacts. Preserve baseline artifacts and exact submitted patch hashes.
+Saving this progress did not launch another run or change serving source.

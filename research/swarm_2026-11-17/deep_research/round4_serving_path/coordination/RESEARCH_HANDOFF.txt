@@ -1,0 +1,115 @@
+ROUND 4 SERVING-PATH SWARM — RESEARCH HANDOFF
+
+Status: research work complete; baseline preservation and owned-process audit passed. TTS state clarification remains separate.
+Requested window: 2026-11-17 17:05:50–18:35:50 UTC (90 minutes).
+Team: root coordinator plus aux_speculation, expert_partition and hopper_moe.
+Scope: local research, isolated source prototypes and bounded component probes.
+No submission, remote serving check, paid compute, active serving installation or TTS change.
+
+OUTCOME
+
+There is no new verified end-to-end serving gain. The confirmed scored result remains1.2237x from job e399c79bb1994630 and the frozen round5 Humming candidate. The unsubmitted combination has no defensible projected speedup.2.5x is not established.
+
+There is one qualified local component timing improvement: at M753/K1024/N8192 on the RTX3050, producing the BF16 projection directly into its destination took920.88us versus1141.71us for F.linear plus copy, a220.83us (~19.3%) reduction. The smaller M32/128/256 groups failed their stability controls and are rejected. This is not H200, communication, or serving performance.
+
+The pass produced three distinct paths with concrete isolated prototypes. It also rejected unsupported scheduler and metadata claims and found integration failures before activation. These paths are not a validated combined patch.
+
+1. TARGET VERIFICATION WORK
+
+Keep the existing width8 candidate block (one seeded anchor/previous bonus plus seven draft proposals) but give target verification its own width-specific backend and graph state. The isolated graph-aware overlay handles IDs, positions, full/SWA KV slots, output stride, acceptance buffers, metadata width, padding and auxiliary consumption. It leaves global/draft width8 unchanged and restores the default target runner after use. It is default-off.
+
+Real CUDA metadata tests executed the pinned metadata and translated KV-table kernels across widths2/4/6/8 and changing requests, maps and lengths. All12 captured width/batch pairs were replayed. This validates metadata ownership and kernel results, not FA3 attention or the target model. CPU source tests cover preparation, actual worker-tail control flow, default8 preservation and rejected unsupported layouts.
+
+A second, different option verifies the same candidate block in two stages: first four rows, then the remaining four only for surviving requests. It avoids redrafting the existing proposal. The fourth continuation edge must be checked explicitly; ordinary width4 acceptance tests only three draft edges. The first target auxiliary output must be copied before the second forward overwrites shared storage.
+
+Canonical full8 auxiliary staging preserves the original40960→8192 projection and full append shape. The full-size BF16 FC plus installed native RMSNorm passed64 finite/bitwise comparisons on local CUDA, with changed inputs and representable weight changes, all commit lengths1..8, independent graph outputs and poisoned temporary storage. Peak allocation was827,606,016bytes (~789MiB), within the900MiB fixture budget and512MiB reserve. The installed native RMS binary is hashed; it is not claimed to match the judge image. Full five-layer GPU KV append and target attention were not executed.
+
+A concrete source hazard remains for a naive two-stage implementation: _accept_len_buf is a single shared buffer. A compacted tail can overwrite a first-stage non-survivor's decision. Dedicated stage decisions/merge storage and exactly one final output-ring reservation/publication are required. A compact tail's target_out cannot replace full-batch result metadata.
+
+The preferred staged design retains the full original A8 auxiliary append cost, plus staging copies. It needs measured T4(B)+T4(S)+decision/compaction/staging versus T8(B), not an assumption that half the rows means half the time. Additional target passes can reread expert weights and repeat collectives. Dynamic survivor countS also introduces a mid-step host dispatch dependency. Rank decisions must agree.
+
+Current additional logical metadata/input/aux allocation for widths2/4/6 is about381MiB, excluding graph workspace, binaries, fragmentation and omitted small buffers. This does not establish compliance with the peak memory limit. FUTURE_MEMORY_OPTION.json identifies about246MiB of potentially omittable unused-mode buffers across three dedicated states, but that saving is source-only arithmetic and is not implemented; the current381MiB estimate remains. Production mutation/recapture hooks and full model/FP8-KV numerical equivalence remain held.
+
+Evidence: aux_speculation/README.txt, QUALIFICATION_LEDGER.json, GRAPH_PREFIX_OVERLAY.json, metadata_gpu_02/probe/results.json, fullshape_aux_gpu_02/probe/results.json, SEGMENTED_VERIFY_FEASIBILITY.json and SEGMENTED_ACCEPT_BUFFER_CPU.json.
+
+2. ATTENTION COMMUNICATION COPIES
+
+The frozen scored attention dispatch can select V2 custom all-reduce for admitted shapes; its saved startup log confirms V2 initialized with multicast and pull enabled. This does not prove every attention call uses V2; larger inputs can fall back. For supported sizes, keep the existing native multicast two-shot reduction but let the unchanged norm consume the completed ordinary-VA local workspace. A separate direct-producer option also writes the projection into that workspace, removing input staging.
+
+The actual norm specialization matters: post_weight=False; smallM uses FP32 router output, while the broad Hopper path does not. The corrected small-M virtual-peer fixture passes45 finite/bitwise output checks. Only M1 tests cooperative virtual-rank progress; M2/M8 use prefilled peer planes. This is one GPU and is not NVLink visibility/progress validation.
+
+Actual SM90a kernels and all six future native-gate FFI exports compile. Generated code retains the stock multicast arithmetic. Compilation is not link/load, FFI invocation, native execution or speed evidence.
+
+A default-off caller gate checks actual selected V2 algorithm, communicator/group ownership, capacity/current plane pointer, projection backend, norm parameters, dtype/layout and immediate-use revalidation. Its helper lock cannot exclude unrelated stock communicator users. Python checks do not run during subsequent graph replay. Whole-worker plane lifetime and external invalidation remain unqualified.
+
+The small-M push/norm fusion has a concrete regression risk: M8 changes132 active push CTAs to8 fused row CTAs; M1 changes32 to1. Matched PDL-off offline controls use233 registers/thread for the fused kernel versus188 for the actual original norm body, and candidate PDL is off while stock Hopper can use PDL. Do not infer speed from fewer launches or copies. The future native gate must compare stock, matched PDL-off and candidate complete boundaries, then separately stress asynchronous reuse and capture lifetime.
+
+Evidence: hopper_moe/README.txt, CHECKPOINT.json, projection_timing_01/results.json, virtual_actual_02/results.json, offline_actual_01/results.json, offline_ffi_01/results.json and PUSH_FUSION_GRID_AND_PDL_AUDIT.json.
+
+3. TARGET ARGMAX CAPTURE
+
+The baseline already avoids a full-vocabulary gather for greedy target verification. This candidate captures that same per-rank-max selection in the target graph, using stable token-ID storage afterward. It preserves sampling arithmetic.
+
+Separate exact-bucket and padded-batch overlays are retained. The padded version validates raw request count×width against valid token rows and returns the leading valid rows. Real local CUDA tests execute the actual graph backend capture/replay/cleanup methods and overlaid lifecycle wrapper, including changed inputs, failed partial recapture, graph replacement, cap20 and native local vocabulary25256. A nine-request batch inside a ten-request graph returns72 valid rows; poisoned padding is excluded.
+
+TP8 collection is emulated in these tests; allocator scopes and rank barriers are stubbed. Actual NCCL/PyNCCL, graph-pool borrowing, full model and complete-path timing remain untested. All-rank installation/fallback must be coherent. Non-greedy graphs still compute an unused argmax. The prefix overlay deliberately rejects these capture-tail hooks: composition is not qualified.
+
+Evidence: expert_partition/TARGET_ARGMAX_QUALIFICATION.json, TARGET_ARGMAX_COLLECTIVE_AND_BUCKET_AUDIT.json, target_argmax_overlay_v2/, coordination/target_argmax_overlay_01/probe/results.json and target_argmax_padded_01/probe/results.json.
+
+WHAT THE SAVED BENCHMARK DOES AND DOES NOT SHOW
+
+Ten saved jobs contain four scored results. Raw throughput and throughput at the stock-speed frontier are different metrics; the confirmed score uses paired frontier ratios. The near-stock patched run is not a stock component trace. Truncated logs and aggregate TTFT/acceptance do not identify draft, target, communication, prefill or CPU time fractions.
+
+Under ideal prior-turn reuse, the workload token accounting reproduces the reported92% cache hit. The first turn supplies about89% of uncached prefill tokens but only one of13 requests. This is token accounting, not a measured time fraction, and explains why an aggregate percentile can hide cold-turn cost.
+
+Scheduler replay conserves work and rejects a throughput claim from reordering alone under additive service costs. More interleaving can reduce stalls but add launches. A rank-local age rule can diverge collective order; it is not a safe ready-to-enable TP8 optimization. Target/draft metadata capture already present in the source was not counted as a new gain.
+
+DIAGNOSTICS AND NEXT DECISIVE EVIDENCE
+
+The existing DeviceTimer can supply coarse intervals, but its DFlash draft-runner wiring was missing. An isolated flag-gated fix is provided. Both runners use target_verify category, so this alone does not distinguish them. The optional subphase recorder is separately tested and documented; it adds overhead and must not be used to manufacture an uninstrumented speed claim.
+
+An even lighter CPU-only observer now uses on_verify_complete_cpu, an existing callback after acceptance counts reach the CPU. It records correct-draft histograms and joint per-batch survivor counts without importing torch or adding GPU work. It observes counts before grammar/termination/retraction filtering. It is not a live rank-coherent controller, and host overhead is unmeasured.
+
+DECISION_BOUNDS.json demonstrates why mean acceptance4.1 (including the bonus) is insufficient: under an exact illustrative mean, continuation after four rows can range from2.5% to77.5%. Redrafting changes future proposals, so clipped old histograms alone cannot forecast a capped policy. Reaching2.5 from1.2237 would require about2.043x further improvement if all rungs improved uniformly; local component percentages cannot be multiplied into that score.
+
+The next decisive evidence is a real target/TP8 correctness and full-path cost comparison, with phase and acceptance observations on the same workload. No such run was authorized or performed in this pass. Further local toy checks cannot substitute for it.
+
+PROVENANCE AND PRESERVATION
+
+Frozen scored candidate: swarm_2026-11-16/coordination/round5_humming_adaptive_fused/candidate.diff
+SHA256:8b3ed81e053e4ccb2a043afd25cb94bb49017995ece517bb35aeb6e1b79e026b
+Explicit submitted override: --moe-runner-backend humming. Judge defaults elsewhere name Marlin; that does not change the scored override.
+
+BASELINE_HASHES.json pins the original patch.diff, frozen candidate, active Muse model and active DFlash worker. FINAL_PRESERVATION_AUDIT.json records the end-of-pass comparison. EVIDENCE_INDEX.json hashes selected final receipts and distinguish CPU/source, local CUDA, offline native compilation and serving evidence. Failed attempts and rejected timing rows are retained. No assertion count is treated as independent serving experiments.
+
+Primary references and applicability decisions are in PRIMARY_SOURCE_DECISIONS.json. Published speedups on other models, runtimes, hardware or non-speculative baselines were not transferred to this candidate. The3.8x screenshot remains an external result without a proven matching configuration.
+
+FINAL SERVICE OBSERVATION
+
+Read-only inspection first found the previously tracked TTS container running, then found it exited with code137 at2026-11-17T18:27:12.986Z. Docker reported OOMKilled=false and restart count0. No swarm action stopped or restarted it, and no research GPU workers remain. This does not establish the cause or continuous service uptime. A question is pending about whether another session intentionally controls TTS; no competing restart was attempted.
+
+LATE ORGANIZER CLARIFICATION ? CHANGES RESEARCH ADMISSION
+
+The user supplied a Slack thread at the end of the pass. In the quoted organizer replies, same-precision FP32 sum reordering is accepted, including near-tie routing changes. Lossless NVFP4 repacking and the specified expert tensor-parallel sharding are accepted. Re-enabling sliding-window slot freeing is accepted. The2GB limit measures total device memory perGPU.
+
+This supersedes any interpretation that bit identity is a universal eligibility requirement. Our strict component tests remain conservative evidence, not the rule. The structural expert-TP, repacking and SWA-eviction directions are reopened. The user-supplied3.5x/5?5.5x statements are participant claims, not our measured gain or an established ceiling.
+
+ExpertTP requires particular care in Muse: FP32 down partials must be combined BEFORE the nonlinear per-expert normalization, then preserve the original BF16/scaling boundaries. The current EP final reduction occurs later and cannot simply replace that collective. A full token?top8?4096 FP32 plane would be too large at long prefill sizes; bounded chunking and load-time ownership changes need study.
+
+ORGANIZER_CLARIFICATION.json separates confirmed pasted answers from unresolved questions and unsupported inferences. Short source-only lane addenda record the revised next prototypes. No new serving gain or active implementation is claimed from these clarifications.
+
+ADDITIONAL ORGANIZER REPLIES - REVISED RESEARCH PRIORITIES
+
+The subsequent user-pasted Q&A explicitly allows request-local prompt lookup, wider verification driven by request matches/drafter scores/startup costs, different walks over the unchanged DFlash candidate lattice, a second drafter block, and score-based verification cutoffs below8. Every committed token still needs target verification. The batch-capacity-dependent fixed row-budget followup remains unanswered. The judge is greedy and calls /generate according to the supplied organizer answer.
+
+The smallest reuse of our work is a score-based W4/W8 target policy. DFlash2 creates lattice scores internally but its greedy q_out is one-hot, not confidence. A prototype must expose compact scores in stable captured storage, account for score readback/rank agreement, and preserve per-request policy semantics. Our existing prefix overlay selects one width for a batch; heterogeneous per-request decisions are additional work. Native width8 is an anchor plus seven proposals. Wider-than8 verification needs new KV reservation, acceptance, auxiliary-state and graph contracts; it is not a switch in the existing scaffold. An alternate top16 path changes candidate choice, not the number of temporal positions.
+
+The organizer also explicitly accepts different FA3 KV split counts under the described FP8/FP32 arithmetic, including the resulting changed P-rounding boundaries. This is a concrete second priority. Target speculative verification uses forward_extend and num_splits; decode_num_splits alone is not the target verify control, and precomputed scheduler metadata must be consistent. Freeze choices per backend/captured state and recapture as needed. No native Hopper split sweep has been run. FP16 attention accumulators and BF16/FP16 partial sums replacing stock FP32 are explicitly disallowed. Alternative exp2 has a specific every-input error condition, not blanket permission for approximate math.
+
+Hot-expert replicas are explicitly allowed within +2GB total device memory PER GPU, chosen from current-run routing counts with no cross-run persistence. This is separate from expert TP and may avoid its per-expert rank-reduction volume, but routing skew, replica assignment and memory costs remain to be measured. The first expert-TP note mistakenly treated2GB as an aggregate across all ranks; its current version corrects that interpretation and preserves the superseded version for audit.
+
+Final-layer prefill dead-row pruning is explicitly allowed subject to general proof that no needed computation is skipped. Preserve all required attention/QKV/cache writes first; then consider final FFN/residual/norm only on live rows. DFlash taps alone are not a complete proof: the logits processor can also return last_hidden_states alongside the tap pack. Prove that output unused in the guarded caller or retain the full path. This optimization affects a bounded final-layer portion, not the preceding61 layers; no large total gain follows merely from dropping most rows there.
+
+The revised order is score-based verification and request-local proposal construction; FA3 split tuning; same-run expert replicas/repacking; general final-layer liveness; structural expert TP/tiled reductions; and SWA slot reuse when pressure is established. This is an engineering priority order, not a speedup projection. Compare complete cost per committed token and full serving latency/frontier; include extra drafting, score handling, cache repair and communication. See ORGANIZER_CLARIFICATION.json, REVISED_RESEARCH_DECISION_CRITERIA.json and six source-only lane addenda.
+
+The original90-minute experimental window is complete. Additional time reconciles organizer evidence supplied during finalization; no new GPU/compiler work, active serving changes, remote checks or submissions were performed for these addenda. Confirmed serving score remains1.2237x;2.5x and any combined unsubmitted speedup remain unverified.

@@ -1,0 +1,356 @@
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -20,6 +20,7 @@
+ from torch import nn
+ 
+ from sglang.kernels.ops.attention.muse_spark_qk_norm_rope_store import FusedQKNorm
++from sglang.kernels.ops.attention.muse_fa3_prologue.host import maybe_fuse as _maybe_fuse_fa3_prologue
+ from sglang.kernels.ops.communication.muse_spark_all_gather import (
+     gemm_ag_supported,
+ )
+@@ -422,22 +423,26 @@
+         else:
+             q, k, v = qkv.split(split_sizes, dim=-1)
+             o_gate = None
+-        fuse_rope = self._fused_qk_norm is not None and self.rotary_emb is not None
+-        kv_store = (
+-            self._fused_kv_store(forward_batch)
+-            if self._fused_qk_norm is not None
+-            and (self.rotary_emb is None or fuse_rope)
+-            else None
+-        )
+-        if fuse_rope:
+-            q, k = self._fused_qk_norm(
+-                qkv, positions, self.rotary_emb.cos_sin_cache, kv_store=kv_store
+-            )
+-        elif self._fused_qk_norm is not None:
+-            q, k = self._fused_qk_norm(qkv, kv_store=kv_store)
+-        if self.rotary_emb is not None and not fuse_rope:
+-            q, k = self.rotary_emb(positions, q, k)
+-        output = self.attn(q, k, v, forward_batch, save_kv_cache=kv_store is None)
++        fused_q = _maybe_fuse_fa3_prologue(self, qkv, positions, forward_batch)
++        if fused_q is not None:
++            output = self.attn(fused_q, None, None, forward_batch, save_kv_cache=False)
++        else:
++            fuse_rope = self._fused_qk_norm is not None and self.rotary_emb is not None
++            kv_store = (
++                self._fused_kv_store(forward_batch)
++                if self._fused_qk_norm is not None
++                and (self.rotary_emb is None or fuse_rope)
++                else None
++            )
++            if fuse_rope:
++                q, k = self._fused_qk_norm(
++                    qkv, positions, self.rotary_emb.cos_sin_cache, kv_store=kv_store
++                )
++            elif self._fused_qk_norm is not None:
++                q, k = self._fused_qk_norm(qkv, kv_store=kv_store)
++            if self.rotary_emb is not None and not fuse_rope:
++                q, k = self.rotary_emb(positions, q, k)
++            output = self.attn(q, k, v, forward_batch, save_kv_cache=kv_store is None)
+         output = self._fused_o_norm_gate(output, o_gate)
+         output, _ = self.o_proj(output)
+         return output
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -1475,9 +1475,13 @@
+             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+         return q, q_rope, k_rope, k_descale, v_descale
+ 
+-    def get_fused_kv_write_buffers(self, layer, forward_batch):
++    def get_fused_kv_write_buffers(self, layer, forward_batch, *, allow_fp8_prologue=False):
+         if (
+-            self.kv_cache_dtype != torch.bfloat16
++            not (self.kv_cache_dtype == torch.bfloat16 or (
++                allow_fp8_prologue and self.kv_cache_dtype == torch.float8_e4m3fn
++                and self.fa_impl_ver == 3 and layer.k_scale is None and layer.v_scale is None
++                and layer.head_dim == layer.v_head_dim
++            ))
+             or self.use_mla
+             or layer.is_cross_attention
+             or self.kv_index_translator.is_translating
+--- /dev/null
++++ b/python/sglang/kernels/ops/attention/muse_fa3_prologue/host.py
+@@ -0,0 +1,43 @@
++"""Opt-in model hook. Every unsupported state returns None before a KV write."""
++import os
++import torch
++from .runtime import Fa3Prologue
++
++def maybe_fuse(attention,qkv,positions,forward_batch):
++    if os.environ.get('SGLANG_EXPERIMENTAL_MUSE_FA3_PROLOGUE','0')!='1':return None
++    from sglang.kernels.fused_op import get_fused_op_backend
++    from sglang.kernels.spec import KernelBackend
++    from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
++    from sglang.srt.layers.cp.utils import is_cp_active
++    from sglang.srt.model_executor.forward_context import get_attn_backend
++    from sglang.srt.runtime_context import get_memory,get_parallel
++    backend=get_attn_backend();norm=attention._fused_qk_norm
++    if norm is None or norm.is_torch_compile:return None
++    if get_fused_op_backend() not in (None,KernelBackend.TRITON):return None
++    if norm.auto_selected_backend()!=KernelBackend.TRITON:return None
++    if type(backend) is not FlashAttentionBackend or backend.fa_impl_ver!=3:return None
++    if backend.is_draft_runner or backend.topk>1:return None
++    if get_memory().enable_unified_memory or get_parallel().attn_dp_enabled:return None
++    if is_cp_active(forward_batch) or forward_batch.dcp_kv_mask is not None:return None
++    mode=forward_batch.forward_mode
++    if not (mode.is_decode() or mode.is_target_verify()):return None
++    if backend.kv_cache_dtype!=torch.float8_e4m3fn:return None
++    if attention.attn.k_scale is not None or attention.attn.v_scale is not None:return None
++    buffers=backend.get_fused_kv_write_buffers(attention.attn,forward_batch,allow_fp8_prologue=True)
++    if buffers is None:return None
++    k,v,loc=buffers
++    if k.ndim!=3 or v.shape!=k.shape or k.shape[1:]!=(2,64):return None
++    if not k.is_contiguous() or not v.is_contiguous():return None
++    rope=attention.rotary_emb.cos_sin_cache if attention.rotary_emb is not None else None
++    pos=positions if rope is not None else None
++    if not norm.backend_eligible(KernelBackend.TRITON,qkv,pos,rope,kv_store=None):return None
++    adapter=getattr(attention,'_experimental_fa3_prologue',None)
++    if adapter is None:
++        if torch.cuda.is_current_stream_capturing():return None
++        adapter=Fa3Prologue()
++        attention._experimental_fa3_prologue=adapter
++    return adapter.try_run(qkv,pos,rope,k.view(k.shape[0],128),v.view(v.shape[0],128),loc,
++        reference=lambda x,p,r:norm._forward_triton(x,p,r,kv_store=None),
++        head_dim=attention.head_dim,num_q_heads=attention.num_heads,num_kv_heads=attention.num_kv_heads,
++        eps=attention.norm_eps,k_scale=attention.attn.k_scale,v_scale=attention.attn.v_scale,
++        reference_is_triton=True,compatible_pool=True)
+--- /dev/null
++++ b/python/sglang/kernels/ops/attention/muse_fa3_prologue/kernel.py
+@@ -0,0 +1,119 @@
++import triton
++import triton.language as tl
++
++@triton.jit
++def encode_fp8(x, NATIVE: tl.constexpr = False):
++    if NATIVE:
++        return x.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
++    # Installed Torch2.14.1 header-only conversion, saturating RN-even.
++    # Software bits permit an honest SM86 test without native FP8 instructions.
++    bits=x.to(tl.float32).to(tl.uint32,bitcast=True)
++    sign=(bits >> 24) & 128
++    ab=bits & 0x7fffffff
++    odd=(ab >> 20) & 1
++    # Explicit modulo avoids debug overflow traps for intended uint32 wrapping.
++    rounded=(ab.to(tl.uint64) + 0xc407ffff + odd.to(tl.uint64)) & 0xffffffff
++    norm=(rounded >> 20) & 255
++    norm=tl.minimum(norm,126)
++    tiny=ab.to(tl.float32,bitcast=True)+16384.0
++    den=tiny.to(tl.uint32,bitcast=True)-(141 << 23)
++    finite=tl.where(ab < (121 << 23),den,norm)
++    result=tl.where(ab >= (1087 << 20),tl.where(ab > 0x7f800000,127,126),finite)
++    return (result | sign).to(tl.uint8)
++
++@triton.jit
++def conversion_probe(X,Y,N:tl.constexpr,NATIVE:tl.constexpr=False):
++    ix=tl.program_id(0)*128+tl.arange(0,128)
++    x=tl.load(X+ix,ix<N,other=0).to(tl.float32)
++    tl.store(Y+ix,encode_fp8(x,NATIVE),ix<N)
++
++@triton.jit
++def fusion18_kernel(
++    QKV,  # [T, qkv_width] source projection output
++    Q_OUT,  # [T, NUM_Q_HEADS * D]
++    K_OUT,  # [T, NUM_KV_HEADS * D]
++    POS,  # [T] positions; only read when HAS_ROPE
++    COS_SIN,  # [max_pos, D] fp32, cos then sin halves; only read when HAS_ROPE
++    K_CACHE,  # [N, NUM_KV_HEADS * D] BF16/FP8 pool; written when HAS_KV_STORE
++    V_CACHE,  # [N, NUM_KV_HEADS * D]
++    CACHE_LOC,  # [T] pool row per token
++    eps,
++    stride_qkv,  # row stride of QKV, in elements
++    n_rows,  # T * (NUM_Q_HEADS + NUM_KV_HEADS [+ NUM_KV_HEADS for V])
++    kv_capacity,
++    NUM_Q_HEADS: tl.constexpr,
++    NUM_KV_HEADS: tl.constexpr,
++    D: tl.constexpr,
++    BD: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    HAS_ROPE: tl.constexpr,
++    HAS_KV_STORE: tl.constexpr,
++    FP8_KV_STORE: tl.constexpr,
++    USE_PDL: tl.constexpr = False,
++    FP8_MAX: tl.constexpr = 448.0,
++    NATIVE: tl.constexpr = False,
++):
++    # One (token, head) row per lane of the block; fp32 RMS reduction over D.
++    if USE_PDL:
++        tl.extra.cuda.gdc_wait()
++        # ---- PDL: Trigger next kernel here to increase overlap
++        tl.extra.cuda.gdc_launch_dependents()
++    pid = tl.program_id(0)
++    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
++    row_mask = rows < n_rows
++    cols = tl.arange(0, BD)
++    col_mask = cols < D
++    mask = row_mask[:, None] & col_mask[None, :]
++
++    # Q, K (and V when storing the cache) are adjacent in the projection, so
++    # one combined head index addresses all of them with one offset.
++    HEADS: tl.constexpr = NUM_Q_HEADS + NUM_KV_HEADS
++    token = rows // HEADS
++    head = rows % HEADS
++    is_q = head < NUM_Q_HEADS
++    is_k = (head >= NUM_Q_HEADS) & (head < NUM_Q_HEADS + NUM_KV_HEADS)
++    is_v = head >= NUM_Q_HEADS + NUM_KV_HEADS
++
++    src = token * stride_qkv + head * D
++    raw = tl.load(QKV + src[:, None] + cols[None, :], mask=mask, other=0.0)
++    x = raw.to(tl.float32)
++    var = tl.sum(tl.where(mask, x * x, 0.0), axis=1) / D
++    rstd = tl.rsqrt(var + eps)
++    x = x * rstd[:, None]
++
++    if HAS_ROPE:
++        # Rope reads the bf16-rounded row, as the separate rope kernel did.
++        x = x.to(QKV.dtype.element_ty).to(tl.float32)
++        partner_cols = cols ^ 1
++        xp = tl.load(
++            QKV + src[:, None] + partner_cols[None, :], mask=mask, other=0.0
++        ).to(tl.float32)
++        xp = (xp * rstd[:, None]).to(QKV.dtype.element_ty).to(tl.float32)
++        pos = tl.load(POS + token, mask=row_mask, other=0).to(tl.int64)
++        freq = cols // 2
++        cs_mask = row_mask[:, None] & (cols < D)[None, :]
++        cos = tl.load(
++            COS_SIN + pos[:, None] * D + freq[None, :], mask=cs_mask, other=1.0
++        )
++        sin = tl.load(
++            COS_SIN + pos[:, None] * D + D // 2 + freq[None, :], mask=cs_mask, other=0.0
++        )
++        is_even = (cols % 2 == 0)[None, :]
++        x = tl.where(is_even, x * cos - xp * sin, xp * sin + x * cos)
++    if FP8_KV_STORE:
++        x = x.to(QKV.dtype.element_ty).to(tl.float32)
++    loc = tl.load(CACHE_LOC + token, mask=row_mask, other=0).to(tl.int64)
++    valid_loc = (loc >= 0) & (loc < kv_capacity)
++    tl.device_assert(valid_loc | ~row_mask | ~is_k, "FA3 prologue cache location out of bounds")
++    kv_mask = mask & (loc != 0)[:, None] & is_k[:, None] & valid_loc[:, None]
++    kv_dst = loc * (NUM_KV_HEADS * D) + (head - NUM_Q_HEADS) * D
++    tl.store(K_CACHE + kv_dst[:, None] + cols[None, :], encode_fp8(x,NATIVE), mask=kv_mask)
++    vraw = tl.load(QKV + (token * stride_qkv + (head + NUM_KV_HEADS) * D)[:, None] + cols[None, :],
++                  mask=mask & is_k[:, None], other=0.0).to(tl.float32)
++    tl.store(V_CACHE + kv_dst[:, None] + cols[None, :], encode_fp8(vraw,NATIVE), mask=kv_mask)
++
++    q_dst = tl.where(is_q, (token * NUM_Q_HEADS + head) * D, 0)
++    k_dst = tl.where(is_k, (token * NUM_KV_HEADS + head - NUM_Q_HEADS) * D, 0)
++    tl.store(Q_OUT + q_dst[:, None] + cols[None, :], encode_fp8(x,NATIVE), mask=mask & is_q[:, None])
++
++
+--- /dev/null
++++ b/python/sglang/kernels/ops/attention/muse_fa3_prologue/runtime.py
+@@ -0,0 +1,110 @@
++"""Experimental prologue. None means complete native fallback before cache writes.
++Eager qualification writes only scratch buffers. Importing activates nothing.
++"""
++from __future__ import annotations
++import logging,math,time
++import torch
++import triton
++from .kernel import fusion18_kernel,conversion_probe
++logger=logging.getLogger(__name__)
++
++class Fa3Prologue:
++    def __init__(self, *, calibration_budget_bytes=16*1024**2, prefer_native=True):
++        self.calibration_budget_bytes=int(calibration_budget_bytes)
++        self.prefer_native=bool(prefer_native)
++        self.codecs={};self.shapes={};self.receipts=[];self.last_reason='not_called'
++
++    def _reject(self,reason):
++        self.last_reason=reason
++        return None
++
++    def guard(self,qkv,positions,rope,k,v,locations,*,head_dim,num_q_heads,num_kv_heads,eps,
++              k_scale=None,v_scale=None,reference_is_triton=False,compatible_pool=False):
++        if not reference_is_triton:return 'native_backend'
++        if not compatible_pool:return 'pool_ownership'
++        if k_scale is not None or v_scale is not None:return 'cache_scales'
++        if (head_dim,num_q_heads,num_kv_heads)!=(64,16,2):return 'head_geometry'
++        if not math.isfinite(float(eps)) or eps<0:return 'epsilon'
++        if qkv.device.type!='cuda' or qkv.dtype!=torch.bfloat16:return 'input_dtype_device'
++        if qkv.ndim!=2 or qkv.shape[1]!=2304 or qkv.shape[0]<=0:return 'input_shape'
++        if qkv.stride(1)!=1 or qkv.stride(0)<2304:return 'input_stride'
++        device=qkv.device;m=qkv.shape[0]
++        if device.index!=torch.cuda.current_device():return 'current_device_mismatch'
++        if any(t.device!=device for t in (k,v,locations)):return 'device_mismatch'
++        if k.dtype!=torch.float8_e4m3fn or v.dtype!=k.dtype:return 'cache_dtype'
++        if k.ndim!=2 or v.shape!=k.shape or k.shape[1]!=128 or k.shape[0]<=0:return 'cache_shape'
++        if not k.is_contiguous() or not v.is_contiguous():return 'cache_stride'
++        if locations.ndim!=1 or locations.numel()!=m or locations.dtype not in (torch.int32,torch.int64):return 'locations_shape_dtype'
++        if not locations.is_contiguous():return 'locations_stride'
++        if (positions is None)!=(rope is None):return 'rope_pair'
++        if positions is not None:
++            if positions.device!=device or rope.device!=device:return 'rope_device'
++            if positions.shape!=(m,) or positions.dtype!=torch.int64 or not positions.is_contiguous():return 'positions'
++            if rope.ndim!=2 or rope.shape[1]!=64 or rope.dtype!=torch.float32 or not rope.is_contiguous():return 'rope_cache'
++        return None
++
++    @staticmethod
++    def _block(m):
++        rows=m*18
++        return 4 if rows<1024 else 8 if rows<8192 else 16 if rows<65536 else 32
++
++    def _launch(self,qkv,positions,rope,k,v,locations,eps,codec):
++        m=qkv.shape[0];block=self._block(m)
++        out=torch.empty((m,1024),device=qkv.device,dtype=torch.uint8)
++        fusion18_kernel[(triton.cdiv(m*18,block),)](
++            qkv,out,qkv,positions if positions is not None else qkv,rope if rope is not None else qkv,
++            k.view(torch.uint8),v.view(torch.uint8),locations,float(eps),qkv.stride(0),m*18,k.shape[0],
++            16,2,64,64,block,positions is not None,True,True,False,NATIVE=codec=='native',num_warps=4,debug=True)
++        return out.view(torch.float8_e4m3fn)
++
++    def prepare_codec(self,device):
++        index=device.index if device.index is not None else torch.cuda.current_device()
++        if index in self.codecs:return self.codecs[index]
++        if torch.cuda.is_current_stream_capturing():return None
++        started=time.perf_counter()
++        bits=torch.arange(65536,device=device,dtype=torch.int32).short().view(torch.bfloat16)
++        expected=bits.to(torch.float8_e4m3fn).view(torch.uint8)
++        result=torch.empty_like(expected);attempts=[];selected=None
++        candidates=['native','software'] if self.prefer_native and torch.cuda.get_device_capability(device)>=(9,0) else ['software']
++        for codec in candidates:
++            conversion_probe[(512,)](bits,result,65536,NATIVE=codec=='native')
++            exact=torch.equal(expected,result)
++            attempts.append(dict(codec=codec,exact=exact,wrong=int((expected!=result).sum())))
++            if exact:selected=codec;break
++        self.codecs[index]=selected
++        receipt=dict(kind='codec',device=index,torch=torch.__version__,attempts=attempts,selected=selected,warmup_ms=(time.perf_counter()-started)*1000)
++        self.receipts.append(receipt);logger.info('MUSE_FA3_PROLOGUE %s',receipt)
++        return selected
++
++    def _qualify(self,key,qkv,positions,rope,eps,codec,reference):
++        m=qkv.shape[0];estimate=m*8192+262144
++        if estimate>self.calibration_budget_bytes:return False
++        started=time.perf_counter()
++        scratch=[torch.zeros((m+1,128),device=qkv.device,dtype=torch.float8_e4m3fn) for _ in range(2)]
++        loc=torch.arange(1,m+1,device=qkv.device,dtype=torch.int64)
++        q,k=reference(qkv,positions,rope)
++        expected=[q.to(torch.float8_e4m3fn),k.to(torch.float8_e4m3fn),qkv[:,1152:1280].to(torch.float8_e4m3fn)]
++        actual=self._launch(qkv,positions,rope,*scratch,loc,eps,codec)
++        checks=[torch.equal(actual.view(torch.uint8),expected[0].view(torch.uint8)),
++                torch.equal(scratch[0][1:].view(torch.uint8),expected[1].view(torch.uint8)),
++                torch.equal(scratch[1][1:].view(torch.uint8),expected[2].view(torch.uint8)),
++                all(bool((x[0].view(torch.uint8)==0).all()) for x in scratch)]
++        accepted=all(checks)
++        receipt=dict(kind='shape',key=list(key),exact=accepted,checks=checks,estimated_scratch_bytes=estimate,warmup_ms=(time.perf_counter()-started)*1000)
++        self.receipts.append(receipt);logger.info('MUSE_FA3_PROLOGUE %s',receipt)
++        return accepted
++
++    def try_run(self,qkv,positions,rope,k,v,locations,*,reference,head_dim=64,num_q_heads=16,num_kv_heads=2,
++                eps=1e-5,k_scale=None,v_scale=None,reference_is_triton=False,compatible_pool=False):
++        reason=self.guard(qkv,positions,rope,k,v,locations,head_dim=head_dim,num_q_heads=num_q_heads,num_kv_heads=num_kv_heads,
++                          eps=eps,k_scale=k_scale,v_scale=v_scale,reference_is_triton=reference_is_triton,compatible_pool=compatible_pool)
++        if reason:return self._reject(reason)
++        codec=self.prepare_codec(qkv.device)
++        if codec is None:return self._reject('codec_unqualified')
++        key=(qkv.device.index,qkv.shape[0],qkv.stride(0),positions is not None,float(eps),codec)
++        if key not in self.shapes:
++            if torch.cuda.is_current_stream_capturing():return self._reject('shape_unqualified_in_capture')
++            self.shapes[key]=self._qualify(key,qkv,positions,rope,eps,codec,reference)
++        if not self.shapes[key]:return self._reject('shape_rejected')
++        self.last_reason='enabled'
++        return self._launch(qkv,positions,rope,k,v,locations,eps,codec)
+--- /dev/null
++++ b/python/sglang/kernels/ops/attention/muse_fa3_prologue/__init__.py
+@@ -0,0 +1 @@
++from .runtime import Fa3Prologue

@@ -1,0 +1,11 @@
+Reduce small-batch Muse expert dispatch and finalization overhead
+
+Fuse int conversion, sentinel-preserving expert-parallel mapping and small-route
+alignment into one launch. For small routed batches, parallelize independent
+expert norm reductions and use a tiled weighted combine instead of serializing
+all expert reductions in one CTA per token. Retain existing paths for larger
+batches and unsupported layouts. Keep the packed router and local alignment
+improvements from the preceding candidate. No extra expert weight layouts.
+
+Validation: local CUDA route identity, FP64/stock numerical comparisons, changing-
+input graph replay and stubbed adapter wiring; static patch checks. H200 one-user check passed correctness and stock rescoring, with 1.4 GB less GPU memory than stock and a 1.051x indicative frontier ratio. Multi-load V4 performance remains unmeasured.

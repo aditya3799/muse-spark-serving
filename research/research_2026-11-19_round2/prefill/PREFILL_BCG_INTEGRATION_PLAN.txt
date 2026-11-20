@@ -1,0 +1,128 @@
+﻿Prefill prologue: precise BCG integration plan, not an activation patch
+2026-11-19; unchanged16MiB qualification budget; no GPU/serving claim.
+
+Decision
+Do not build a model activation patch for the eight-warp repair yet. The repaired
+BLOCK32 starts at realM3641, while the unchanged decoder qualifier permits at most
+M2016 before adding padded-reference overhead. Therefore the repaired geometry
+has no production reachability under this budget. Small-prefill reuse is a
+separate possible optimization, with first-use cost, padded qualification and
+actual BCG replay still unqualified. A patch that simply opens is_extend would
+misrepresent both correctness and the memory contract.
+
+Exact source boundary
+- MuseSpark1xAttention.forward: captured QKV GEMM and raw o_gate extraction stay.
+  Original QKnorm/RoPE must move inside the existing attention eager boundary for
+  an opted-in static model path; fallback still performs original padded math.
+- RadixAttention.forward: allocate_attention_outputs runs BEFORE eager_on_graph.
+  Keep that BF16, padded, graph-owned output. The callback returns None, avoiding
+  a fresh eager output whose strong reference is retained by every graph segment.
+- eager_on_graph explicitly retains capture-time argument identities. Pass only
+  graph-owned qkv, padded positions, output and immutable layer identity. Do NOT
+  pass capture-time forward_batch, out_cache_loc, SWA locations or metadata.
+- Inside callback obtain get_forward_batch() and get_attn_backend() afresh.
+  n=global_num_token_non_padded_cpu; derive query count via attention_query_tokens.
+  Initially require query/cache counts equal and no cross/CP/DP/speculative mode.
+- Use attention_input_scope with cache_tokens=n while resolving write locations.
+  Its actual finally restores out_cache_loc, positions and _attn_output even when
+  candidate resolution raises. Actual KVWriteLoc.__post_init__ narrows the
+  pre-resolved SWA vector to the narrowed generic locations, preserving row order.
+- Call the backend's get_fused_kv_write_buffers(allow_fp8_prologue=True) within
+  that scope. Full layers use physical generic locations; SWA layers use backend
+  pre-resolved SWA locations. Never infer SWA ownership by modulo or arithmetic.
+  Require length exactly n, FP8 contiguous2x64 buffers, valid unique live IDs as
+  guaranteed by native ownership, and zero slot remains reserved.
+- After successful direct stores, exit the temporary scope, then invoke the
+  existing RadixAttention._eager_attention.run_eager(q,None,None,output,False).
+  This reuses the body, not its wrapper, hence no second graph break. The body
+  resolves fresh metadata again, supplies output[:n] to the backend and applies
+  original padded-output zeroing. No new eager output bridges graph segments.
+- Failed admission occurs BEFORE any real cache write. Fallback runs original
+  norm on whole padded QKV and graph-owned padded positions, then calls the same
+  body with native K/V and save_kv_cache=True. No double append.
+- n=0 simply uses original zero-output branch. Do not allocate or qualify a plan.
+
+Native FP8 dispatch must remain native
+RoPE is a property of the layer, not synonymous with a backend window mode.
+Pass the original FP32 cosine/sine cache and positions only when rotary_emb exists;
+full/no-RoPE and RoPE variants require distinct qualification keys. Do not alter
+FA3 attention implementation, num_splits, softcap, causal/window flags, page table,
+cache lengths, cu_seqlens or output pointer. prepare_paged_mha_query already casts
+Q to the cache dtype; an already-FP8 Q preserves this API path. Keep all scaling
+arguments at the same unit/None contract. SWA/full page-table selection remains
+inside the original forward_extend. This is a byte-prologue proposal, not a
+contiguous-KV or FP8-attention replacement.
+
+Initial exclusions
+No FULL prefill graphs, ordinary CUDA capture, unified memory, translated/sharded
+KV pools, context/attention data parallelism, Mamba, MLA, cross/encoder attention,
+cascade or speculative metadata, local-attention builder, returnLSE, sinks,
+score_mod, rel_bias, image masks, MXFP8, nonunit cache scales, unknown norm backend
+or shape. Leave original complete path for every unsupported state. Default-off
+must allocate neither adapter GPU memory nor graph bridges beyond original output.
+
+Qualification contract missing from a naive decoder reuse
+The existing shape key is (device,realM,stride,has_rope,eps,codec). Prefill compares
+against ORIGINAL PADDED normalization, so it additionally needs paddedM/native
+BLOCK and kernel/source policy identity. A realM accepted with one padded bucket
+must not authorize a different padded reference. Native/full+RoPE codec selection
+must be rerun per actual device/toolchain; do not enable nativeFP8 from SM86 tests.
+Current source bound is realM*8192+262144. Original padded native Q/K allocate
+2304*paddedM bytes. A conservative unchanged-budget extension adds
+2304*(paddedM-realM), never subtracting presumed allocator reuse:
+  estimated=8192*realM+262144+2304*(paddedM-realM) <=16777216.
+Examples:753/1024 fits;2016/2048 no longer fits; any realBLOCK32 still fails.
+This excludes baseline-common QKV/FC weights, but includes extra padded reference.
+The callback needs no input clone and no full KV-pool clone: compare scratch K/V
+at synthetic unique locations, preserve actual cache bytes until accepted.
+Qualification executes under no_grad, releases all native references/scratch
+before the live launch, and never resets process-global memory peak history.
+
+Lifecycle and first-use cost
+Do not perform hidden shape qualification on an arbitrary replay request. Each
+new realM would synchronize for exact comparisons and potentially compile; sparse
+ragged lengths may never repeat. Current decoder runtime records dictionaries
+without bounded prefill eviction. Before promotion, choose a bounded configured
+startup shape set OR bounded sightings/amortization policy, with actual padded
+keys and a total model-wide cost budget. Startup qualifying all62layers also has
+a real time cost; shared kernel geometry does not prove layer-input parity.
+All failures/rejected probes and compilation must be charged. Keep metadata LRU
+bounded. No CPU collective may be inserted into captured segments. This local
+prologue has no numerical collective, but rank-asymmetric slow qualification can
+stall later TP collectives, so qualification scheduling must be coherent outside
+capture and respect worker timeout/teardown policy.
+No tensor references from qualification survive in per-layer shape metadata.
+A captured graph holds static producer/output storage; the eager callback reads
+current state on every replay. Weight/rope/backend mutation requires invalidating
+shape acceptance and graphs; this design assumes static model identity unless a
+coherent recapture implementation is added.
+
+Memory coexistence
+A16MiB probe is transient, not16MiB per retained layer. Candidate Q=1024*realM
+bytes replaces native BF16 Q/K temporaries during ordinary execution. Nonetheless
+cached allocator segments and graph-private pools remain real. Add actual resident
+normal/WGS arenas, row/N projection scratch and live outputs using the existing
+phase ledger; do not reset peaks or assume empty_cache frees active graphs.
+The source budget is not a whole-serving measurement. The previously disproven
+post-graph large-row FC+normal combination remains invalid.
+
+Completed controls
+prefill_bcg_source_controls.json uses actual AST of attention_input_scope,
+KVWriteLoc and the unapplied decoder FP8 buffer API:8 full/SWA+fresh-generation+
+exception-restoration cases and8 negative guards pass. Lightweight tensor slicing
+surrogates only, no native BCG. Ten geometry budget examples recorded.
+prologue_warp8/byte_matrix.json:42 local byte cases and actual CUDA graph pointer
+identity control pass. Original four-warp veto and saved-row IR/PTX proof remain.
+Independent MoE review agrees with the narrow causal and reachability statements.
+
+Required decisive future validation
+1. Actual SGLang BCG capture/replay with changing request/cache identities, empty
+   and partial rows, shared prefixes, both full and SWA layers, unsupported-state
+   fallback, exceptions and output padding; compare real native backing bytes.
+2. H200 native-FP8 prologue codec + whole attention output versus exact frozen
+   native pipeline, including long context and request-boundary masks.
+3. First-use and steady-state full-layer timing against frozen Humming graph,
+   charging qualification, graph segmentation and runtime allocation overhead.
+4. Per-rank allocated/reserved peaks with combined lifecycle, and model-output gate.
+No quota or suitable native hardware remains in this lane; no remote job, score,
+calibration-budget expansion or activation is requested on current evidence.

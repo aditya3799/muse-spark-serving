@@ -1,0 +1,95 @@
+2026-11-16 independent CPU source review, bounded experiment only
+
+Reviewed projection_communication/adaptive_expert_split.py SHA256
+604ea855ac30af490402d38043aec624537c993bec41ab83cb1ebb67249b6e02
+and updated adaptive_split_bench.py SHA256
+c65c2e44185415044d8e976a9625d54d95b844a8c43025c9f5068f0ba8e0266b.
+No source blocker found for the root-authorized local GPU experiment. This is
+not GPU compilation, numerical, timing, production-integration or H200 proof.
+
+Histogram/ownership
+- BINS=next_power_of_2(EXPERTS+1), so sentinel BINS-1 is outside valid IDs even
+  when EXPERTS is a power of two. Masked/padded/invalid routes accumulate only
+  in that unused bin. Counts are bounded by BLOCK<=4096, so int32 cannot overflow.
+- Gather indexes are legal local IDs or zero. Each live expert's entire count
+  chooses light <=cutoff or heavy >cutoff. The two output ID vectors preserve
+  original slot indexes and are complementary. Out-of-range positive IDs are
+  dropped by this experiment, whereas the rest of the helper assumes IDs are
+  valid local IDs or negative; normal dispatcher mapping satisfies that contract.
+- Checked API semantics against primary Triton docs:
+  https://triton-lang.org/main/python-api/generated/triton.language.histogram.html
+  https://triton-lang.org/main/python-api/generated/triton.language.gather.html
+  This confirms the histogram/gather intent, not this kernel's installed-version
+  lowering or runtime performance.
+
+Shared output buffers and capture
+- Both up partition calls complete before scale/SiLU and before cache13 is reused
+  for down output. Alignment is cached locally by (partition,blockM), with all
+  tensors live through the call; no host route read or persistent Tensor cache.
+- Full route-array valid_shape_m is preserved for every GEMM, and top_k indexing
+  remains the original up top-k/down1 mapping. Vendor Humming scheduler.cuh:306
+  loads sorted original rows; epilogue/gmem_writer.cuh:103-105 writes indexed
+  rows only when wr_row_index<output_shape_m. The launcher uses supplied outputs
+  without a blanket clear. Thus complementary calls should not overwrite each
+  other's live rows; actual runtime tests must still establish that behavior.
+- Extra partition/alignment tensors are small relative to the common activation
+  buffers, but both partitions' alignment sets remain live until helper return.
+  No full-model memory bound follows. Default FP32/no-Stream-K configs are checked
+  and expected-local light configs are owned copies; canonical weights are shared.
+
+Benchmark review
+- All three arms run the full helper plus finalizer, with the same weights,
+  inputs, routes, scores and final norm. A is stock, B is exact v2, C adds split.
+  Full local route mixtures, mixed light/heavy, inactive and hot expert cases
+  are included. Hash pins and separate executed-helper artifact identify source.
+- Updated graph replay changes uniform -> hot_rank -> all_remote -> original
+  pattern, exposing light/heavy ownership changes while keeping static plan and
+  buffers. Replays validate against both stock and v2. All-remote must be zero.
+- Timing restores original pattern, uses balanced forward/reverse A1/B1/C1/A2/
+  B2/C2 orders, equal warmups and cache pressure before every arm, and per-arm
+  A/A controls. The measured chain includes partition and duplicate alignment/
+  launch overhead. Single local GPU data must not be extrapolated to H200/TP/EP
+  end-to-end shares. Separate graph pools in this timing harness are not evidence
+  for serving's shared-pool memory behavior.
+
+Recommended gates: successful compilation; exact count/ownership checks; all
+local live outputs within unchanged stock tolerance; all-remote zero; changing
+expert class on graph replay; and acceptable A/A controls before ranking latency.
+
+Combined v3 serving export follow-up
+Reviewed projection_communication/adaptive_split_v3/serving_export:
+split752038f214e7f8e21e16c4af8de2c9bb43a97733e7bf61615ddbe125124d5bc8,
+NVFP4ecf84353bb83792059788606e0c7cf333560070fb2ee1ebcd9512756a8f5f9c7,
+FP4caller2c2c78ed504bedf25de7a1016c80c64db74895fb25091a2d7bc48884ade39591.
+No source blocker found for the combined numerical regression. The parent
+constructor stores global_num_experts=num_experts separately from local count;
+the dispatcher forwards that global value to the public wrapper. Direct wrapper
+calls default global_experts=None, preserving the original v3 helper. Unsupported
+geometry, missing/noninteger/invalid global metadata, mismatched local stage
+counts, unsuitable/identical tuning policies all return through that helper.
+Fallbacks forward both retain and defer_downscale, so recognized fused norm may
+still defer scaling and generic norm fallback remains scaled. Both split paths
+use the original local IDs for scaling/finalization; final downscale is skipped
+only when defer_downscale is true. No active-source or frozen export was edited.
+
+build_sm90_adaptive_coverage.py independently verifies every combined file hash,
+AST identity of renamed original default helper, and all 512 positive eligible
+M selections against the prototype policy. Those checks passed; finalizer and
+scaling sources remain unchanged from reviewed v3. The exact combined export's
+GPU boundary/replay/full-chain tests were still pending at this review point.
+
+Final regression harness source review
+moe/combined_boundary_probe.py e52c4583ae1280f279d3ad7e533c14a1687a5232c49239c2daec65a897ab035c:
+No blocker. Actual partition at 4096 routes, int32/int64, graph transitions from
+light to heavy/15-16-17 threshold/mixed/all-remote/back to light; exact counts,
+masks and complementary coverage checked. Actual 4104-route dispatcher uses a
+fallback spy to verify retain/defer forwarding; explicitly not arithmetic proof.
+moe/combined_exact_bench.py 2fcd9aacf3f4fbba5f97647bf046a1b5168eace0115d784a0e2d0f38aad33fb1:
+No blocker. A stock, B preserved default helper deferred + fused finalizer,
+C public combined deferred + fused finalizer, D public combined nondeferred +
+baseline finalizer (correctness only). Missing global metadata is checked with
+both defer values. All four graphs see the same changing live inputs, IDs and
+scores, including all-remote; original pattern is restored before balanced
+12-repetition A/B/C timing with controls and equal cache pressure. Numeric
+torch.equal tests do not establish signed-zero bit equality; report wording is
+consistent. These are review conclusions before execution results, not passes.

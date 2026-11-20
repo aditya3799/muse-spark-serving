@@ -1,0 +1,28 @@
+﻿Independent review of coordination/projection_failure_policy, patch71f6152c
+
+Read actual amended row/N invoke and registration implementations plus CPU fault
+injection and private-index composition receipts. No numerical descriptor or
+kernel changes. The status helper permits onlySUCCESS0/NOT_SUPPORTED15. Startup
+registration votes fatal exceptions on the CPU group before acceptanceMIN; healthy
+peer plans are closed on fatal vote. Recoverable Torch OOM coherently disables.
+Runtime fatal statuses propagate to worker teardown rather than pretending native
+fallback repaired an execution error. This composes with early74d63805 and row
+no_grad07f4c518; those changes affect startup order and autograd lifetime only.
+
+Residuals, not evidence of safe recovery:
+- Row startup timing's vendor invocation is outside its allocation-error vote.
+  Fatal dispatch therefore aborts this worker before gather; peers rely on existing
+  worker/process failure teardown. The policy does not claim a hang-free recovery
+  from a poisoned/asynchronously failing CUDA context.
+- RowPlan's constructor takes the vendor handle then allocates scratch before
+  discover enters its cleanup try. Torch OOM at that allocation can leak the
+  newly prepared CABI handle. A guarded constructor call should destroy it before
+  rethrowing; output-N's VendorPlan constructor does not allocate Torch scratch.
+- The old row registration comment that unexpected discovery errors cause peers
+  to fall back is stale: the new branch aborts on those errors.
+- Factories remain static-checkpoint scope. This patch does not implement
+  weight-reload invalidation, bound arbitrary new serving streams, or prove
+  combined memory/serving behavior. Such claims require their separate gates.
+
+Review is source/receipt only; no additional GPU, Gloo or NCCL execution here.
+Frozen joint530e and normal80db hashes independently rechecked unchanged.

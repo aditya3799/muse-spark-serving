@@ -1,0 +1,9 @@
+Exact finalizer plus reduction feasibility
+
+Correctness: 135 changed-input cases across H=1024/4096/8192 and M=2/3/8 match the frozen Triton finalizer, including inactive NaN slots, remote/zero cases, output-scale BF16 rounding, graph replays, local combine and independent increasing-rank/zero-pair oracle. The original inverse-RMS kernel is charged in both arms.
+
+The first pilot timings are INVALID for selection: duplicate-parent ratios span 0.8488..1.4870. All raw observations are retained. A predeclared measurement repair used the unchanged CUDA source, new seed, longer graphs and symmetric A/B/C/C/B/A rounds. The independent steady test has all six controls valid (geometric ratios 0.9983..1.00126) and exact outputs. Local gains are 1.180..1.234x; aggregate 1.2080x, bootstrap interval [1.1990,1.2172]. This is an arithmetic/local-memory component result only. It includes original inverse RMS but excludes actual multi-GPU push, transport, polling/counters and NCCL. No serving speedup is inferred.
+
+Production type audit: effective post-expert weight is BF16, weight_first is true, and Humming defers its BF16 w2_post_scale to this finalizer. The HAS_SCALE=True path is covered. Original local BF16 rounding precedes increasing-rank all-reduce and is preserved.
+
+Do not enable existing Blackwell finalize-AR through an architecture gate alone: the Humming use_marlin branch ignores ar_workspace while the caller would skip ordinary AR. Existing CuTe RMS also uses a different FP32 sum tree. A valid port requires explicit end-to-end collective ownership, matching custom-AR algorithm/group/stream, original inverse RMS, and H200 qualification. All work remains isolated and unapplied.

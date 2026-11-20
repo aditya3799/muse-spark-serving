@@ -1,0 +1,111 @@
+--- a/python/sglang/kernels/ops/attention/metadata.py
++++ b/python/sglang/kernels/ops/attention/metadata.py
+@@ -247,49 +247,52 @@
+     num_live_pages = tl.minimum(
+         tl.cdiv(seq_len + SEQ_LEN_DELTA, PAGE_SIZE), max_seq_pages
+     )
+-    col_start = pid_c * BLOCK_COLS
+-    if not ZERO_TAIL and col_start >= num_live_pages:
+-        return
+-
+     row_idx = tl.load(req_pool_indices + pid_b * req_pool_indices_stride_0)
+-    cols = col_start + tl.arange(0, BLOCK_COLS)
+-    live_mask = cols < num_live_pages
+-    token_ids = tl.load(
+-        req_to_token
+-        + row_idx * req_to_token_stride_0
+-        + cols * PAGE_SIZE * req_to_token_stride_1,
+-        mask=live_mask,
+-        other=0,
+-        cache_modifier=".cg",
+-    )
+-    store_mask = cols < max_seq_pages if ZERO_TAIL else live_mask
+-    full_pages = _resolve_metadata_page_ids(
+-        token_ids, live_mask, PAGE_SIZE, full_v2p, full_v2p_stride_0
+-    )
+-    tl.store(
+-        page_table + pid_b * page_table_stride_0 + cols * page_table_stride_1,
+-        full_pages,
+-        mask=store_mask,
+-        cache_modifier=".cg",
+-    )
+-    if swa_page_table is not None:
+-        swa_pages = _resolve_metadata_page_ids(
+-            token_ids,
+-            live_mask,
+-            PAGE_SIZE,
+-            swa_v2p,
+-            swa_v2p_stride_0,
+-            full_to_swa_index_mapping,
+-            full_to_swa_mapping_stride_0,
++    # Preserve every live page (and every tail page when requested), while
++    # bounding the grid independently of context length. Inputs remain device-fed.
++    end_col = max_seq_pages if ZERO_TAIL else num_live_pages
++    # Widen traversal indices so the final stride cannot wrap at int32 bounds.
++    first_col = pid_c.to(tl.int64) * BLOCK_COLS
++    column_step = tl.num_programs(1).to(tl.int64) * BLOCK_COLS
++    for col_start in range(first_col, end_col.to(tl.int64), column_step):
++        cols = col_start + tl.arange(0, BLOCK_COLS)
++        live_mask = cols < num_live_pages
++        token_ids = tl.load(
++            req_to_token
++            + row_idx * req_to_token_stride_0
++            + cols * PAGE_SIZE * req_to_token_stride_1,
++            mask=live_mask,
++            other=0,
++            cache_modifier=".cg",
++        )
++        store_mask = cols < max_seq_pages if ZERO_TAIL else live_mask
++        full_pages = _resolve_metadata_page_ids(
++            token_ids, live_mask, PAGE_SIZE, full_v2p, full_v2p_stride_0
+         )
+         tl.store(
+-            swa_page_table
+-            + pid_b * swa_page_table_stride_0
+-            + cols * swa_page_table_stride_1,
+-            swa_pages,
++            page_table + pid_b * page_table_stride_0 + cols * page_table_stride_1,
++            full_pages,
+             mask=store_mask,
+             cache_modifier=".cg",
+         )
++        if swa_page_table is not None:
++            swa_pages = _resolve_metadata_page_ids(
++                token_ids,
++                live_mask,
++                PAGE_SIZE,
++                swa_v2p,
++                swa_v2p_stride_0,
++                full_to_swa_index_mapping,
++                full_to_swa_mapping_stride_0,
++            )
++            tl.store(
++                swa_page_table
++                + pid_b * swa_page_table_stride_0
++                + cols * swa_page_table_stride_1,
++                swa_pages,
++                mask=store_mask,
++                cache_modifier=".cg",
++            )
+ 
+ 
+ @triton.jit
+@@ -549,11 +552,13 @@
+         or (page_size == 1 and swa_page_table is None and full_v2p is None)
+         else 128
+     )
+-    grid = (
+-        (1, 1)
+-        if skip_page_table or max_seq_pages == 0
+-        else (batch_size, triton.cdiv(max_seq_pages, block_cols))
+-    )
++    column_blocks = triton.cdiv(max_seq_pages, block_cols)
++    if not skip_page_table and batch_size > 0 and seq_lens.device.type == "cuda":
++        # CUDA properties are cached by PyTorch; no tensor values or host lengths
++        # are read. Four CTAs per SM bound launch overhead while retaining parallelism.
++        sm_count = torch.cuda.get_device_properties(seq_lens.device).multi_processor_count
++        column_blocks = min(column_blocks, max(1, triton.cdiv(4 * sm_count, batch_size)))
++    grid = (1, 1) if skip_page_table or max_seq_pages == 0 else (batch_size, column_blocks)
+     _fused_decode_metadata_kernel[grid](
+         seq_lens,
+         seq_lens.stride(0),

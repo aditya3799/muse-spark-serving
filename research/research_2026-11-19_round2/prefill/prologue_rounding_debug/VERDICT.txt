@@ -1,0 +1,46 @@
+﻿Compiler-bound reduction veto, with precise reachability
+
+The original fused-prologue kernel is NOT bitwise equivalent to native QK
+normalization for the demonstrated BLOCK32 geometry. This finding is preserved
+regardless of later experiments with a different launch configuration.
+
+Evidence chain:
+1. Original padded-native versus real-row fixture failed at real16383/padded16384.
+   Only three K bytes differed, at one logical head. Q and V initially matched.
+2. The unchanged-kernel diagnostic reproduced those bytes. Live destinations were
+   unique and in bounds. Native cache storage matched independent indexed scatter.
+   Native real-M and padded-M K matched in both BF16 and FP8.
+3. A 64-value saved-row reproducer inserts the same data into Q and K. Both fail
+   at M4095 and M16383; the phenomenon is not specific to the K storage path.
+4. Instrumentation exposes variance, reciprocal standard deviation, pre-cast
+   normalized values and rounded BF16. All instrumented Q/K outputs match the
+   corresponding unmodified kernel outputs, including the failure.
+5. Original SM86 IR uses native per-thread columns8, reduction lanes8, shuffle
+   offsets4/2/1. Fused uses columns16, lanes4, offsets2/1. BLOCK_M remains32.
+   CPU reconstruction of those exact PTX trees reproduces both GPU variances:
+     native sum530.0628051757812, variance8.282231330871582;
+     fused sum530.062744140625, variance8.282230377197266.
+   Reciprocal std changes from0.3474770188331604 to0.3474770486354828.
+   BF16 truncation/extension still exists in fused IR: the reduction difference
+   crosses its threshold, then produces differing FP8 bytes.
+6. Decode agent independently compiled24 SM90 variants. BLOCK32 has the same
+   native8-versus-fused16 column divergence for both software and native FP8,
+   with and without RoPE. This is Hopper source evidence, not H200 execution.
+
+Reachability:
+Saved-row M8/32/56/128/256/512 tests pass, with all observer checks matching.
+Current frozen runtime qualification permits M*8192+262144 <=16MiB, or M<=2016.
+BLOCK32 begins at M>=3641, so demonstrated failing geometries are NOT accepted
+by the current default runtime. This veto applies to extending the prefill path
+or increasing its calibration budget without a new compiler/math gate. It does
+not establish that a current accepted decode bucket failed, nor prove universal
+parity for all other inputs. No serving gain or promotion follows from passing
+small buckets.
+
+Receipts: prefill_prologue_initial_veto.json, prefill_prologue_diagnostic.json,
+prologue_rounding_debug/reproducer.json, decode_extension.json,
+reduction_tree_proof.json, native_cache_provenance.json, and original/debug IR.
+Independent Hopper receipt: ../decode/reduction_layout_sm90/receipt.json.
+
+A separate, predeclared eight-warp compiler-layout salvage is queued. It changes
+launch configuration and must retain its own evidence; it cannot erase this veto.

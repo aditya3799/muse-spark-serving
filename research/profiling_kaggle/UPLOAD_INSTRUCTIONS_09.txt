@@ -1,0 +1,8 @@
+Upload 09_kaggle_graph_boundaries.ipynb to Kaggle.
+Select GPU T4, keep defaults and Run All. Only GPU 0 is used.
+Internet can remain off. No packages, weights or datasets are needed.
+Download v4_graph_boundaries_*.zip and place it in D:\OpenKernelChallenge\serving\profiling_kaggle\notebook09_results.
+Stop the GPU session after downloading. If a section fails, run export and return the ZIP.
+
+Expected full run: 27 benchmark cases, 4,428 changed-input output checks, 162 timing rows, 1,782 raw samples, 135 comparisons.
+This compares static expert mapping across eager, separate-graph and combined-graph execution. The independent mapping stages are not actual model layers. It does not measure tokenizer/scheduler startup, full model, alignment/GEMMs or H200 speedup. Active V4 and both drafts remain unchanged.

@@ -1,0 +1,31 @@
+Independent source review of moe/pr50800_boundaries/device_only.cu,
+SHA90d99adc9f217d6180e2384a0298aba7298335653cb966691a2f98b9e0d2451e.
+
+The shared sc_bf16/bmulh changes reach chunk_mma's WGMMA coefficient loads and
+both grouped/pair small-M mma16816 paths. The shared stage_tile rounds all eight
+accumulator slots through BF16, then multiplies a BF16-rounded global scale and
+rounds the result to BF16 for bothGEMMs. AW roundsW8up16, so its padding does not
+leave an omitted epilogue path. copy_out removes the intermediate SiLU-only
+BF16 round while retaining BF16 after multiplication by up. No alternate
+coefficient or GEMM epilogue path omitting those edits was found in this source.
+
+Remaining limits: combine_k still performs the donor's FMA-weighted final sum;
+a future Muse adapter must use per-route outputs and retain per-expert postnorm.
+Host preparation must supply original unfurled global-scale ownership, not the
+upstream up/gate ratio fold. Zero-scale packing loses eight negativezero cases;
+negativeSF/negativezero/NaN are outside the donor pack's admitted domain.
+The CPU coefficient emulation and offline compile do not prove SM90 arithmetic,
+SiLU compiler parity, fullGEMM reduction, route order, graph behavior or serving.
+No runtime/loader integration or hardware performance claim follows from review.
+
+Separate raw-scale follow-up (does not amend the frozen boundary variant):
+pr50800_rawscale/device_only_uncompiled.cu retains original E4M3 bytes and all
+original FP4 nibbles. Its original_scale_bf16 decoder covers finite signed
+normal/subnormal/zero values; all three scale call sites retain the low-byte
+0x4140 convention. The owner's CPU coefficient proof covers 4,064 finite pairs,
+and its byte-layout proof separately preserves all 256 scale encodings. NaN
+payload numerical equality is not claimed. No native BF16-subnormal arithmetic,
+Hopper compilation, runtime integration, memory residency, or speed follows.
+Old header comments about folding scales at pack time remain upstream text and
+must not be treated as the new raw-layout contract; the new disabled-prototype
+header and finite-owner requirement are the relevant scope.

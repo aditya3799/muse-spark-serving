@@ -1,0 +1,20 @@
+--- a/python/sglang/srt/models/dflash.py
++++ b/python/sglang/srt/models/dflash.py
+@@ -144,8 +144,15 @@
+     if tp:
+         return ids.long(), vals, lse
+     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
+-    gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
+-    gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
++    if int(lm_head.org_vocab_size) <= (1 << 24):
++        # All valid token IDs are exactly representable in FP32. Keep values
++        # and IDs in separate leading planes, preserving contiguous top-k rows.
++        packed = torch.stack((vals.float(), global_ids.float()), dim=0)
++        gathered = tensor_model_parallel_all_gather(packed, dim=-1)
++        gathered_vals, gathered_ids = gathered[0], gathered[1]
++    else:
++        gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
++        gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+     top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
+     if lse is not None:
+         lse = torch.logsumexp(

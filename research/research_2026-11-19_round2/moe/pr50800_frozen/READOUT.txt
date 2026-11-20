@@ -1,0 +1,121 @@
+Pinned SGLang grouped Hopper NVFP4 lead (19 November, source-only qualification)
+
+Primary source: https://github.com/sgl-project/sglang/pull/50800
+Head81502f72823876ef01c1f273d7061e1705361735, created2026-11-16T14:43:17Z;
+OPEN and UNMERGED at metadata retrieval12:42UTC. It is a public PR, not a released
+backend. Kernel SHA92219b6456049529db50af189887b7a17132b3ce53a4375bf87912ea0f19f572.
+All four downloaded leaves and exact URLs are in sources/nov10_sweep/pr50800/manifest.json.
+The kernel path is absent from pinned SGLang297e54fd105e974cdf401e5b4d20253a22c16f90.
+The dependent50801 source is independently archived by prefill; its GitHub compare is
+1534ahead/2behind with merge-base2a7987f9009d06493eb249349425de952a221804.
+
+Author-reported evidence is interesting but is not our benchmark:
+50800 reports2.1-2.9x versus Marlin at4096tokens. 50801 additionally reports1.53-1.77x
+versus Humming0.1.19 at DeepSeek-R1 EP8 H200 M128-4096. This differs from Muse4096x4096,
+scored customHumming precision/configuration, target routing, postnorm and full serving.
+The author's44tests use relative-error tolerances, not scored-parent byte parity;
+accuracy/serving claims in the PR have not been independently reproduced here.
+
+What is actually new compared with our existing WGS:
+- Runtime token tiling: <=16local expert rows uses mma.sync; larger tiles use WGMMA
+  widths24/32/40/48/56/64/72/80/88/96/104/112/120/128 to reduce padded compute.
+- Persistent GEMM1/GEMM2 work queue, with GEMM2 waiting on the contributing intermediate
+  row blocks, rather than a whole-grid barrier between the GEMMs.
+- Optional two-CTA cluster tiles multicast token rows and share weight transfers.
+  Auto pairing begins at16384total routes, subject to even row-block counts.
+- PDL can overlap gather tails with grouped-kernel prologue. Dynamic route metadata
+  remains on device and supports changed routing under graph replay in author's tests.
+The one-IMAD0x1084 tiny-FP4 decode is ALREADY present in our finite WGS helper.
+K permutation, uniform descriptors and producer warps are also not novel by themselves.
+
+Precision and storage constraints:
+NVFP4E2M1, positive finite E4M3 group16, BF16 activations and FP32 tensor-core accumulation
+are real SM90 paths. No FP8 activation quantization is used. Upstream packs original
+512code+64scale bytes per16x64 block, but rewrites scale bytes to normalized exponent
+codes. This is a value-preserving representation only in its accepted scale domain.
+Negative scales (including negative zero) and NaNs are explicitly rejected.
+At zero scale it erases all FP4code bits, including negative-zero coefficient signs.
+
+Its coefficient is W*2^-63, restored together with FP32global scale before BF16 output.
+Our scored parent instead uses full-value coefficients, BF16 GEMM output, then a BF16
+post-scale multiplication. Upstream also rounds SiLU before multiplication while the
+parent silu_and_mul has kRoundActivation=false, and folds unequal up/gate into W2scale.
+These change finite outputs. CPU receipt pr50800_coefficient_audit.json proves65664
+packed words/2032positive-finite coefficient pairs, normal-range boundary differences,
+and explicit exceptional-range shifted-product underflow/global overflow examples.
+The changes alone do not decide challenge legality or model quality, but prevent a
+claim of a drop-in exact scored-parent replacement. No arbitrary tolerance is proposed.
+
+Muse adapter requirements before a runtime experiment:
+1. Preserve our actual gate/up scale convention; disable the generic unequal-scale
+   fold when following the scored parent. Preserve BF16 GEMM/post-scale and activation
+   rounding boundaries, or explicitly gate a separately reviewed precision variant.
+2. Request RAW route outputs (topk_weights=None); run existing per-expert Muse RMSNorm
+   before routing-weight combination. Generic combined output skips that required op.
+3. Add explicit custom Muse loader/dispatch hooks. Passing the new backend flag alone
+   is rejected by the frozen Muse constructor; generic ModelOpt hooks do not own it.
+4. Keep one persistent packed representation. Retaining the original plus donor-packed
+   weights across60layers would exceed the2GB incremental budget by tens of GB. A
+   transient repack is a compatibility strategy with measured cost, not a free fallback.
+5. Bound shared route workspace/chunks and qualify actual multi-chunk capture. The raw
+   op gathered+intermediate+output is196608*T bytes at Muse4096/top8; this is the SAME
+   core size as parent cache13+cache2, not3.22GB of net new memory at16K. Peak must still
+   include different lifetimes, metadata/order, postnorm, graph retention and repacking.
+6. Preserve owner/weight-reload invalidation, serialization, PDL/capture lifetime and
+   dynamic-routing liveness. No graph-safe wrapper is implemented in this research.
+
+Local build evidence, no GPU execution:
+pr50800_offline/extraction.json binds exact unchanged device bodyfd6d39c... and all8
+kernel entries; host TensorView/TMA-map/launch wrappers are deliberately not built.
+First preflight refused beforeNVCC; authorized stable preflight then passed three reads.
+Single SM90a compile passed8.65s,169028KiB maxRSS under2GiBAS/120s. grouped_k and pair_k
+both168registers/no spills. Cubin1da0d158791bb5c6293f138feec4872cf136d7e10f9cb41e0f386f709368e50e.
+Their launch uses220160dynamic shared bytes plus1472/1440static; actual occupancy and
+cluster support must be checked on H200. No kernel has run here on Hopper.
+The initial direct upstream hazard-checker completeness claim was SUPERSEDED:
+independent review found missing BRA.DIV fallthrough edges. Root's corrected vendor-CFG
+supplement binds the exact binaries and covers those edges. Explicit final receipts are
+coordination/wgmma_hazard_audit/pr50800_offline/complete_cfg_audit.json and
+pr50800_boundaries/complete_cfg_audit.json, each384RS sites/zero reported issues, with
+missing-edge and injected-register-write controls. These are static known-hazard
+screens only; independent review/status is recorded in root's final READOUT/manifest.
+They do not prove hardware numerical results, progress or performance.
+
+Other fresh PR outcomes:
+51393: new single/two-token kernels, autoT<=2 (C++max4), so ordinary DFlash verifyM>=8
+is excluded unchanged. Decode lane has pinned source and detailed readout.
+50802: removes small-batch Torch finalizer fallback for BF16 Muse only; NVFP4 already
+used fused finalizer. Possible endpoint-only scope requires actual dtype/path evidence.
+51390: online weight restore correctness; no new inference speed evidence.
+51302: mergedNov19 Inkling ops use existing Marlin plus model activation fake quant;
+not an eligible generic unmodified-BF16 improvement for this Muse path.
+FlashInfer9581: recent SM90 latent-MoE W4A16 is MXFP4group32, not this NVFP4group16.
+
+No scored recommendation, no remote job, no conclusive2x serving result.
+
+Separate disabled variants qualified after the original source audit:
+- Boundary-restored device source90d99adc9f217d6180e2384a0298aba7298335653cb966691a2f98b9e0d2451e
+  normalizes tinyFP4 first, uses full-value SF, rounds GEMM toBF16 beforeBF16global
+  multiplication, and removes upstream's extraSiLU round. Scheduling/rawroute code
+  is unchanged. CUDA13.0.88 SM90a compile10.48s/184768KiB; both kernels168regs/no
+  spills. Cubinf976d14146c05e9d32cd1646d2a93fd4b7395497abe6ac3a4643bb31dbef7079.
+  CPU2016nonzero-positive-SF pairs exact;8zero-SF sign losses inherited upstream.
+  Prefill/decode independent source reviews found no omitted arithmetic path.
+- Raw-scale layout sourcef98a308049919a7df2ddc732f049072a676e24d093140d7e56490fa5bbbd7246
+  is UNCOMPILED. It keeps originalE4M3 bytes and originalFP4 codes, eliminating the
+  irreversible zero/subnormal alias. Separate forward/directWGS/inverse CPU oracles
+  pass100663296nibbles/6291456scale bytes, all256scale codes, unchangedweights and
+  canaries, across fourE1 full-widthW13/W2 cases and two seeds. The final forward
+  W13row order is independently derived by reshape/stack; the earlier shared-helper
+  receipt is preserved as weaker preliminary evidence. All4064finite signedSF/code
+  pairs, including32signedzero and224subnormal-scale pairs, matchCPU BF16bits.
+  Rawbytes127/255 survive the layout but NaNnumerical behavior remains unqualified.
+  No GPUconverter, scanner/lease integration, loader or residency hook exists.
+- CPU source-equation checks cover72 changed-route/single/pair tile ownership cases
+  throughM16384. An abstract FIFO progressmodel passes640 schedules with stalled
+  static-owner and reversed-dependency negative controls. Neither executes CUDA or
+  proves TMA/mbarrier/cluster/PDL visibility/progress.
+
+The raw layout must NEVER be passed to the normalized-scale donor kernels. The
+three variants have distinct storage/math contracts and are not interchangeable.
+Future prerequisites are in PR50800_H200_PLAN.txt. No2x evidence or submission.

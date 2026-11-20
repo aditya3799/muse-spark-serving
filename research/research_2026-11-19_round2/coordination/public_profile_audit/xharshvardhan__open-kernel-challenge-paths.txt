@@ -1,0 +1,8 @@
+.gitignore
+NOTICE
+README.md
+kernels/attention_decode.py
+kernels/decoder_layer.py
+kernels/dense_projections.py
+kernels/routed_experts.py
+licenses/Apache-2.0.txt

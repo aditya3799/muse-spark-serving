@@ -1,0 +1,24 @@
+{"device": "NVIDIA GeForce RTX 3050 6GB Laptop GPU", "source_sha256": "1f04c3820b2015010af6dcb023552de7ae25f53dbd70b6835fd7d59667238d69", "pack": [], "routing": [{"m": 2047, "mode": "uniform", "graph": true, "exact": true, "values": 1048064}, {"m": 2047, "mode": "skew", "graph": true, "exact": true, "values": 1048064}, {"m": 2047, "mode": "none", "graph": true, "exact": true, "values": 1048064}, {"m": 2047, "mode": "uniform", "graph": true, "exact": true, "values": 1048064}, {"m": 2048, "mode": "uniform", "graph": true, "exact": true, "values": 1048576}, {"m": 2048, "mode": "skew", "graph": true, "exact": true, "values": 1048576}, {"m": 2048, "mode": "none", "graph": true, "exact": true, "values": 1048576}, {"m": 2048, "mode": "uniform", "graph": true, "exact": true, "values": 1048576}, {"m": 2049, "mode": "uniform", "graph": true, "exact": true, "values": 1049088}, {"m": 2049, "mode": "skew", "graph": true, "exact": true, "values": 1049088}, {"m": 2049, "mode": "none", "graph": true, "exact": true, "values": 1049088}, {"m": 2049, "mode": "uniform", "graph": true, "exact": true, "values": 1049088}], "complete": true, "scope": "Only affected M2048 chunk boundaries; earlier exact pack and restoration receipts remain unchanged."}
+	Command being timed: "timeout 120 /home/aditya/.venvs/okc-marlin-tiles/bin/python research_2026-11-19/moe/launch.py preprocessing_boundaries"
+	User time (seconds): 5.19
+	System time (seconds): 1.46
+	Percent of CPU this job got: 86%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:07.69
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 1069948
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 6130
+	Minor (reclaiming a frame) page faults: 138496
+	Voluntary context switches: 11167
+	Involuntary context switches: 777
+	Swaps: 0
+	File system inputs: 2053576
+	File system outputs: 1496
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

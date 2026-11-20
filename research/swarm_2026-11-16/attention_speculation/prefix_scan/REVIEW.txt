@@ -1,0 +1,59 @@
+PREFIX SCAN PROTOTYPE - INDEPENDENT FUTURE OPTION
+
+Candidate: candidate/python/sglang/kernels/ops/attention/metadata.py
+SHA256:300cb9428d6281c10812be0a302e88d82dff9f81baf5cab1087730fe8bc6df3c
+Diff2778bytes. Active source and previously frozen exports are untouched.
+
+Mechanism:
+The sole metadata owner block computes length prefix sums with a masked
+parallel int32 scan instead of B serialized scalar loads/additions/stores.
+The existing page-table work and kernel launch count are unchanged.
+1024 is a conservative scan resource cap, not a workload-tuned batch list.
+Larger batches and stride-zero/negative output rows retain the exact original
+scalar loop. Input stride-zero is safe: each request reads the shared value.
+
+Arithmetic:
+Each valid source length plus delta is cast to int32 as before. Masked lanes
+are zero AFTER delta addition. Integer prefix sums are associative modulo
+2^32, so a parallel scan and serial loop have equal bit patterns even when
+signed sums overflow. cu[0]=0, cu[B]=sum, all cache lengths are preserved.
+Actual supported lengths are nonnegative, but tests intentionally exercise
+negative/overflow values to avoid accidentally adding a stricter contract.
+B0 lengths-only launch still writes cu[0]=0; pagetable-gridB0 stays unchanged.
+Graph padding rows are live rows up toB, so zero prefix plus delta contributes
+delta exactly as before. Only power-of-two scan lanes beyondB are masked.
+
+Native verification:
+test_cpu.py parses ORIGINAL and EXACT exported kernel source, executes their
+prefix ASTs against a pure-Python pointer/vector model, and compares complete
+output buffers including sentinels. Parallel cumsum uses a doubling tree,
+sum uses a pairwise tree, distinct from the original scalar algorithm.
+The tests cover B0/1, non-power-of-twoB,1024limit,1025fallback,65537stress,
+int32/int64 inputs, integer boundaries, arbitrary positive strides, broadcast
+input, overlapping output fallback, repeated buffer updates and non-owner
+blocks. cpu_validation.json records850paired cases,63mutable-buffer cases
+and21non-owner checks, all passed for the source hash above.
+
+Static checks prove all page-table code and other functions are unchanged;
+the fallback AST is identical to the original owner body; only an extra
+constexpr parameter and one launch keyword accompany the prefix change.
+
+Independent projection-agent source review found no ordinary-buffer blocker.
+Cross-tensor aliasing is a remaining API-contract caveat: positive strides
+ensure rows within one output are distinct, not that seq_lens/cache/cu have
+disjoint storage. Vector loads/stores can differ from the serial loop for
+artificial overlapping tensors. Actual FlashAttention and XPU callers use
+separate CG cache-length/cu-seqlens allocations and runner input lengths;
+see flashattention_backend.py:init_cuda_graph_state at2425 and the equivalent
+XPU graph-state allocation. No such aliasing was found in these callers.
+Do not claim arbitrary alias support. Before upstream integration, either
+make the distinct-buffer contract explicit or add an alias fallback if that
+broader API compatibility is required, measuring its host overhead.
+
+Limitations:
+Native simulation is not Triton compilation/type-lowering verification and
+not CUDA graph validation. It cannot catch register/spill costs, compiler
+control-flow issues or GPU ordering bugs. No speedup claim. Before integration,
+run exact old/new GPU output comparisons for all edge cases, real changing-
+input graph replay, then paired A/A and A/B timing of metadata and complete
+metadata+attention. This is NOT part of any current remote submission.

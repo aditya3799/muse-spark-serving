@@ -1,0 +1,56 @@
+NOTEBOOK 08: VERIFIED UPDATE-OVERHEAD REVIEW
+Run: 20261114T175507Z_dd80bf
+
+VALIDATION
+All 10 ZIP member checksums and source provenance match. Recomputed all three metrics for 168 timing rows from 1,848 samples; verified 192 comparisons. 24 benchmark cases, 504 poisoned-state checks and inherited 576 output checks passed.
+Device trace: 136 kernels + 20 copies; all attributed. Each baseline update/replay has eight kernels and one copy; each single-owner path has six kernels and one copy.
+
+MATCHED LATENCY REDUCTIONS (%)
+Candidate / Reference | K | Event median (wins/6) | Wall median | Enqueue median
+baseline_checked / baseline_direct | 1 | -16.37% (0/6) | -12.56% | -42.32%
+baseline_checked / baseline_direct | 2 | -6.13% (0/6) | -4.61% | -27.66%
+baseline_checked / baseline_direct | 4 | -3.77% (0/6) | -3.57% | -22.17%
+baseline_checked / baseline_direct | 8 | -2.13% (0/6) | -2.24% | -12.69%
+single_bound / baseline_direct | 1 | 14.37% (6/6) | 12.76% | 9.10%
+single_bound / baseline_direct | 2 | 16.95% (6/6) | 14.83% | 9.00%
+single_bound / baseline_direct | 4 | 16.52% (6/6) | 15.44% | 10.49%
+single_bound / baseline_direct | 8 | 17.58% (6/6) | 17.21% | 8.25%
+single_bound / single_property | 1 | 27.64% (6/6) | 23.72% | 37.10%
+single_bound / single_property | 2 | 8.39% (6/6) | 7.37% | 28.03%
+single_bound / single_property | 4 | 5.10% (6/6) | 5.73% | 22.42%
+single_bound / single_property | 8 | 3.50% (6/6) | 4.24% | 13.60%
+single_checked / baseline_checked | 1 | -23.10% (1/6) | -21.17% | -29.50%
+single_checked / baseline_checked | 2 | 0.70% (4/6) | 0.18% | -28.39%
+single_checked / baseline_checked | 4 | 11.10% (6/6) | 10.57% | -15.11%
+single_checked / baseline_checked | 8 | 14.16% (6/6) | 13.67% | -10.00%
+single_checked / baseline_direct | 1 | -42.34% (0/6) | -34.82% | -83.83%
+single_checked / baseline_direct | 2 | -5.79% (1/6) | -4.47% | -65.03%
+single_checked / baseline_direct | 4 | 7.43% (6/6) | 6.87% | -37.65%
+single_checked / baseline_direct | 8 | 12.79% (6/6) | 11.63% | -21.06%
+single_property / baseline_direct | 1 | -15.35% (1/6) | -12.93% | -42.55%
+single_property / baseline_direct | 2 | 8.06% (6/6) | 7.20% | -26.31%
+single_property / baseline_direct | 4 | 12.29% (6/6) | 11.58% | -16.19%
+single_property / baseline_direct | 8 | 15.38% (6/6) | 14.59% | -6.66%
+single_property / single_checked | 1 | 17.89% (6/6) | 17.18% | 23.21%
+single_property / single_checked | 2 | 11.72% (6/6) | 9.99% | 23.28%
+single_property / single_checked | 4 | 4.29% (6/6) | 3.85% | 15.84%
+single_property / single_checked | 8 | 3.93% (6/6) | 3.80% | 13.04%
+single_static / baseline_static | 1 | 16.57% (6/6) | 12.86% | 8.41%
+single_static / baseline_static | 2 | 18.18% (6/6) | 16.11% | 9.46%
+single_static / baseline_static | 4 | 17.86% (6/6) | 15.49% | 7.08%
+single_static / baseline_static | 8 | 18.36% (6/6) | 17.75% | 8.82%
+Negative reduction means slower. Descriptive matched trial/configuration medians, not confidence intervals.
+
+FINDINGS
+At K=1 versus baseline direct copy: single checked is 42.34% slower, single property-copy is 15.35% slower, and single retained-view copy is 14.37% faster (6/6 wins). At K=2/4/8 retained-view copy reduces event latency by 16.95%/16.52%/17.58%, all 6/6 wins.
+The checked API costs time even on the baseline: K=1 event latency is 16.37% higher and host enqueue time is 42.32% higher than baseline direct-copy. Same GPU operations, different host API path.
+Removing the checked method while retaining property access reduces K=1 candidate event latency by 17.89%. Retaining the view instead of recreating it reduces that property-copy path by another 27.64%. These are separate ratios with different denominators; do not add them.
+The unchanged six-kernel/one-copy candidate traces plus lower host enqueue times support host submission overhead as the reason frequent updates lose. They do not provide an exact additive CPU/GPU breakdown: enqueue overlaps GPU work and CUDA events can include dispatch-induced idle gaps.
+The retained-view fast path skips per-call validation and assumes stable owning storage. The test rejects stale handles outside timing. It is not ready for production without a lifecycle contract, so neither draft is promoted.
+Static single-owner mapping still wins all 24 event-time comparisons. Frequent updates in Notebooks 06-08 are stress scenarios; they are not established as the actual serving workload.
+
+SOURCE AUDIT AND NEXT STEP
+In the checked-out MuseSpark1xFp4Experts implementation, _expert_map is registered in __init__ and read in _marlin_expert_outputs. Repository text search found no explicit runtime mutation of this specific attribute. This is not proof against indirect buffer manipulation, device moves or future integration.
+The next notebook tests static maps with 1/8/32 independent source-prefix stages: eager execution, one graph per stage, and one combined graph containing all stages. Token counts 9/32/128 stay above V4's small fused-mapping boundary.
+This checks whether prefix savings persist with a different graph boundary and reports complete-chain latency plus normalized per-stage values. The stages are synthetic independent mapping work, not model layers; there is no expert GEMM, communication, attention or artificial filler compute.
+No full-model latency, H200 gain, pointer-offset fused-kernel validation, framework-wide buffer compatibility, scheduler initialization or tokenizer initialization is established. Active V4 remains unchanged.

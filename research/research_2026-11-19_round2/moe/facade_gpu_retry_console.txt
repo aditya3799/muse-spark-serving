@@ -1,0 +1,16 @@
+{"m": 8, "mode": "uniform", "graph_replay": true, "sequence": [0, 1, 0], "raw_values": 98304, "final_values": 98304, "exact": true}
+{"m": 8, "mode": "skew", "graph_replay": true, "sequence": [0, 1, 0], "raw_values": 135168, "final_values": 98304, "exact": true}
+{"m": 8, "mode": "remote", "graph_replay": true, "sequence": [0, 1, 0], "raw_values": 0, "final_values": 98304, "exact": true}
+{"m": 128, "mode": "uniform", "graph_replay": true, "sequence": [0, 1, 0], "raw_values": 1572864, "final_values": 1572864, "exact": true}
+{"m": 128, "mode": "skew", "graph_replay": true, "sequence": [0, 1, 0], "raw_values": 2101248, "final_values": 1572864, "exact": true}
+{"m": 128, "mode": "remote", "graph_replay": true, "sequence": [0, 1, 0], "raw_values": 0, "final_values": 1572864, "exact": true}
+{"m": 256, "mode": "uniform", "graph_replay": true, "sequence": [0, 1, 0], "raw_values": 3145728, "final_values": 3145728, "exact": true}
+{"m": 256, "mode": "skew", "graph_replay": true, "sequence": [0, 1, 0], "raw_values": 4202496, "final_values": 3145728, "exact": true}
+{"m": 256, "mode": "remote", "graph_replay": true, "sequence": [0, 1, 0], "raw_values": 0, "final_values": 3145728, "exact": true}
+{"m": 753, "mode": "uniform", "graph_replay": true, "sequence": [0, 1, 0], "raw_values": 9252864, "final_values": 9252864, "exact": true}
+{"m": 753, "mode": "skew", "graph_replay": true, "sequence": [0, 1, 0], "raw_values": 12337152, "final_values": 9252864, "exact": true}
+{"m": 753, "mode": "remote", "graph_replay": true, "sequence": [0, 1, 0], "raw_values": 0, "final_values": 9252864, "exact": true}
+{"m": 4097, "mode": "uniform", "graph_replay": false, "sequence": [0, 1, 0], "raw_values": 50343936, "final_values": 50343936, "exact": true}
+{"m": 4097, "mode": "skew", "graph_replay": false, "sequence": [0, 1, 0], "raw_values": 67129344, "final_values": 50343936, "exact": true}
+{"m": 4097, "mode": "remote", "graph_replay": false, "sequence": [0, 1, 0], "raw_values": 0, "final_values": 50343936, "exact": true}
+{"complete": true, "seed": 930239, "device": "NVIDIA GeForce RTX 3050 6GB Laptop GPU", "metadata": [{"layer": 0, "exact": true, "layouts": {"w13": "humming_mma", "w2": "humming_mma"}, "weight_storage_shared": true, "post_scale_aliases_original": true}, {"layer": 1, "exact": true, "layouts": {"w13": "humming_mma", "w2": "humming_mma"}, "weight_storage_shared": true, "post_scale_aliases_original": true}], "scope": "Original frozen BF16 full expert FFN+finalizer, synthetic actual-width weights; source-minimal local test, no H200 WGS kernel or normal CUTLASS execution", "graph_owned_close_rejected": true, "owned_weight_workspace_bytes": 56631296, "historical_peak_allocated": 7399257088, "historical_peak_reserved": 8489271296}

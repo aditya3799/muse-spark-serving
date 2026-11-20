@@ -1,0 +1,14 @@
+Cold timing harness readiness
+
+Native Windows CPU audit passed against exact frozen round2 helper d6b60d95..., model255b2ce0... and packageb9004309.... Original96-case numeric evidence verified; no CUDA or WSL command ran during this audit. benchmark_small_projection_cold.py is a new timing-only harness, so prior arithmetic evidence remains intact.
+
+Fairness fixes: rotates8 distinct64MiB weights (512MiB full /64MiB local slices); read/write cache pressure of at least128MiB before EVERY arm outside CUDA events; explicit ABBA/BAAB paired full versus local and interleaved A/A controls. Three eager warmups and3 graph replays precede timing. Events are initialized before timing. Inputs/weights/graph pools preexist, captured allocation-related work remains included, and complete graph pools are dropped between shapes. Reports paired savings, raw samples and A/A noise gate. Cache pressure is not a directly measured cache flush. Native gather has no separate layout transform, so old NCCL layout diagnostic is omitted.
+
+Unchanged unpoolM1/M8 marked controls, with no incremental serving benefit. F.linear is a local component baseline; Hopper stock may use GEMV/split-K dispatch, so results cannot establish H200 or serving speedup. Real multicast is absent. Any failing A/A quality, incomplete report or timeout is not usable performance evidence.
+
+Prepared Windows command (run ONLY after explicit root handoff):
+& .\Run-ProjectionTiming.ps1 -Execute -AuthorizedGpuSlot -Geometry both
+
+Default invocation without -Execute only prints the plan. Inner Linux timeout240s,TERM thenKILL after15s; harness cooperative limit210s; outer owned Windows launcher limit270s. Default shortgroup M1/8/16/32/128/256 covers both projection directions. No process suspension. On outer timeout only the directly owned launcher is killed and guest/GPU release remains unverified; coordinator must verify before another slot. Logs are unique per launch; timing report unique per guestPID/UTC.
+
+Exact artifact hashes and all source pins are in COLD_TIMING_READINESS.json.

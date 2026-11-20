@@ -1,0 +1,104 @@
+﻿DISABLED H200 VALIDATION PLAN — 2026-11-19 round2 MoE
+
+This plan does not launch a job or authorize a submission. There is no available
+unscored quota in this research window. The root agent owns future authorization.
+Current status is HOLD: offline SM90 builds and SM86 coefficient/conversion proofs
+are not H200 execution, full-serving evidence, or proof of the requested2x result.
+
+Frozen references
+Scored Humming parent: release_2026-11-18/candidate.diff
+SHA8c7547213fb993a318321a26f84e2872db8c87b358ee3d3ea638695702b0dc2b; score1.2363x.
+Pinned SGLang297e54fd105e974cdf401e5b4d20253a22c16f90; .85 static memory fraction.
+Four independent kernels, NEVER jointly enabled for a single call:
+- unchanged_lut: old WGS native source7d41368f..., known serving regression.
+- finite_only: source3a958850..., exact register coefficient expansion, no schedule change.
+- split_ready: source19ebc066..., independent weight/input readiness barriers.
+- dependent_hint: sourcea6394a53..., decoded-value dependency in optional wait hint.
+Exact full hashes are constants in evaluate_h200_receipt.py and frozen manifests.
+The finite-only change removes old WGS LUT traffic. Scored Humming already uses
+register dequantization, so beating old WGS alone cannot justify promotion.
+
+Phase1: arithmetic and lifetime, before any benchmark
+On actual H200, compare all4064finite FP4xE4M3 coefficient combinations to original
+LUT BF16 bytes, including signed zeros/subnormal scale values. The32NaN pairs must
+reject finite specialization and exercise unchanged LUT fallback. Preserve global
+scale placement, BF16 rounding boundaries, FP32 accumulation and WGMMA order.
+Use finite_lifetime_v2's canonical owner lease: identity snapshots around the scan,
+weakly bound stage tensors, no reentrant retirement, retire every referencing graph
+and synchronize every referencing stream before any weight/reload mutation.
+Raw CUDA and .data writes are not detected automatically; owner integration must
+prove every mutation obeys the contract. Python pre-capture checking alone is not
+sufficient because replay bypasses Python dispatch.
+
+Phase2: whole FFN and real route holdouts
+Use actual checkpoint weights with hashed manifests. Capture actual serving routes
+from at least3layers and all8ranks, recording layer/rank/token positions. Freeze a
+separate holdout before selecting any variant. Graph dummy routes are inadequate.
+M8,32,128,256,384,385,753,4097 cover decode, original384-row chunk boundaries and
+prefill. Each must cover uniform, skew, all-local and all-remote synthetic stresses
+IN ADDITION to real route replay. Record actual valid rows per expert and chunk count.
+Compare every variant against unchanged WGS and the complete scored Humming FFN,
+including any conversion, routing, both GEMMs, global scales and finalization.
+Exact live raw slots and all final output bytes are required against unchanged WGS
+because these variants do not intentionally change arithmetic. Unused raw remote
+slots are undefined and excluded. Humming may have different ordinary FP32 reduction
+order; record raw max/RMS differences and enforce real model/token quality gates.
+Do not invent a tolerance to force the candidate active.
+
+Reuse ONE packed weight resident and ONE bounded shared workspace across variants.
+Do not retain complete GPU gold buffers or all-layer alternate weights. Hash bounded
+64-row CPU copies, release phase-owned tensors and views, and preserve per-phase
+allocator/free-memory receipts. If mismatch occurs, rerun only that case for bounded
+error analysis. Never combine incomplete/oversubscribed timings with valid samples.
+
+Phase3: capture and progress
+Warmup, eager dispatch and actual model graph capture must all activate the same
+intended policy, with explicit logs. Replay at least256times with changed inputs and
+routes, mixed decode/prefill shapes, three-slot generation wraparound, and phaseA/B
+intermediate dependencies. Include empty and highly skewed local experts, invalid
+EP routes, unknown-stream fallback, finite-certificate rejection and owner reload.
+Use a bounded external watchdog for deadlocks; incomplete progress is a veto.
+Root's existing no-TBO/SBO and serialized arena assumptions must be preserved or
+explicitly revalidated. No new CUDA driver/cubin loader is part of this plan.
+
+Phase4: controlled timing, still diagnostic
+For each shape/profile run two independent seeds, at least8balanced AB/BA pairs,
+with unchanged Humming as a third arm and exclusive GPU use. Prefer sufficiently
+long graph arms to amortize event noise. Preserve raw samples, telemetry, all failed
+controls and compilation/startup costs. Each duplicate-parent ratio must lie within
+0.95..1.05 for this conservative screen. Use the pinned existing reward protocol and
+its independent confirmation for any component KEEP. The receipt evaluator reports
+per-shape conservative median ratios only; it never sums/multiplies component gains.
+The old LUT baseline may regress; its measurement remains a required diagnostic.
+
+Phase5: full serving and memory
+Only a reviewed integrated patch may enter future authorized H200 service checks.
+Measure joint feature memory across full startup, qualification, capture and serving,
+not merely tensor ownership. Preserve .85memory fraction and <=2,000,000,000 extra
+bytes against matched parent for allocated and reserved peaks. No production peak
+counter resets. Include the interaction of projection plans, WGS graph buffers,
+normal-packed prefill arena and finite certification. A memory failure vetoes speed.
+Require matched prompt/cache traces, real output/token gates, TTFT and TPOT/SLO gates
+at C1,4,16,32 for both cold and cache-hit operation, plus an independent holdout.
+Use the official full-frontier methodology and retain its source hash and raw results.
+C16-only receipts and kerneltrack speedups are insufficient. A>=2point estimate with
+lower bound below2 is insufficient for this plan's conclusive threshold. No microbench
+ratio, RL reward, model-share estimate or product of kernel gains can replace serving.
+
+Receipt evaluator
+python evaluate_h200_receipt.py <receipt.json> --output <decision.json>
+It invokes no GPU, subprocess, network or submission. It validates receipt consistency,
+not authenticity. Official frontier scalars are not independently recomputed here.
+reported_gates_consistent means only that reported claims pass preliminary checks.
+conclusive_2x_evidence and scored_submission_authorized are ALWAYSfalse, including
+READY_FOR_HUMAN_REVIEW. Human review must verify complete raw official results.
+The user must explicitly approve any scored submission after concrete patch review.
+Schema constants and required fields are in the evaluator. test_h200_receipt.py builds
+an in-memory synthetic valid schema and76negative cases; it is NOT H200 evidence.
+
+Primary source basis
+https://humansand.ai/blog/faster-than-light-nvfp4-decode
+https://docs.nvidia.com/cuda/pdf/ptx_isa_8.7.pdf
+https://www.lmsys.org/blog/2026-11-01-glm53-h200-pd/
+Existing local protocol: research_2026-11-18_rl/PROTOCOL.md.
+

@@ -1,0 +1,9 @@
+﻿import hashlib,json
+from pathlib import Path
+H=Path(__file__).resolve().parent; R=H.parent
+paths=['aux_speculation/eager_prefix_overlay.diff','aux_speculation/dflash_prefix_verification.py','coordination/target_argmax_capture.py','coordination/phase_recorder.py']
+report={'status':'FOLLOWUP_SOURCE_REVIEW','pins':{},'findings':['Root argmax warmup qualification issue resolved by pending-only-during-actual-capture plus explicit post-install confirmation; strong runner identity references now retained until invalidation. Our separate integration overlay tests exercise this exact core.','Aux prefix padding issue resolved in current overlay by explicit nondefault prediction/logits row-count and 2D auxiliary row-count guards before views; actual target post-forward trim coverage reported separately. Full-model prefix equality remains unqualified.','Root recorder nested-capture and partial-install transaction issues were resolved in reviewed c1dcd41d source; later source hash here is a provenance observation, not a new semantic review.','Our pre-capture adapter originally assumed decode runner attribute exists; fixed via getattr and covered by startup-negative test. Earlier CPU receipt preserved.'],'remaining_holds':['Real multi-rank NCCL graph capture and all-rank identical hook installation','Serial same-stream lifetime is a required deployment invariant','No inferred target/draft critical-path fraction from saved benchmark percentiles','No serving speed claim for any overlay']}
+for rel in paths:
+ p=R/rel; digest=hashlib.sha256(p.read_bytes()).hexdigest(); report['pins'][rel]=digest
+ (H/('followup_'+p.stem+'_'+digest[:12]+p.suffix)).write_bytes(p.read_bytes())
+(H/'CROSS_LANE_REVIEW_FOLLOWUP.json').write_text(json.dumps(report,indent=2)+'\n'); print(json.dumps(report,indent=2))

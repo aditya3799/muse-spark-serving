@@ -1,0 +1,27 @@
+Final artifact-bound WGMMA static audit
+
+All six sealed artifacts pass the corrected static RS/accumulator hazard screen:
+4 WGS variants at512RS instructions each and2 donor variants at384RS each.
+This is NOT Hopper execution, a full asynchronous-memory/race proof, numerical
+correctness, a performance result, or serving readiness.
+
+The upstream PR50799 checker alone was insufficient. Its indirect branches were
+marked incomplete; a first BRX-only adapter additionally missed BRA.DIV
+fallthroughs. The accepted adapters bind cubin/SASS/vendorCFG hashes, enforce
+nonempty exact RS inventory, cover all raw vendor nodes/edges/instructions and
+reachable GMMA sites, and prove any omitted self-BRA/NOP suffix is disconnected.
+WGS adds4 resolved BRX target sets and3 BRA.DIV fallthroughs per binary; donor
+functions add60 BRA.DIV fallthroughs per binary. WGS CALL callee edges remain
+conservative; both helpers contain no GMMA/DEPbar and cannot change pending state.
+The two audited donor GMMA functions must be leaf functions.
+
+Injected pending-A writes are detected. Removing a required divergent edge is
+rejected. Donor missing-node/entry-edge/corrupt-tail controls also fail closed.
+Exact bindings and raw edge counts prevent stale or vacuous completeness claims.
+Each future compiler/toolkit/source change requires a fresh binary audit.
+
+Authoritative reports and hashes: FINAL_MANIFEST.json. Earlier direct checker,
+BRX-only and pre-hardening reports remain on disk for provenance but are
+superseded. Never treat process exit0 or a lone complete flag as a pass.
+Independent reviews: ../../prefill/wgmma_bra_div_repair_review.json and
+../../decode/final_static_cross_review.json, plus donor_cfg_independent_review.json.

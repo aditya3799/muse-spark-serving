@@ -1,0 +1,40 @@
+NOTEBOOK 09: VERIFIED GRAPH-BOUNDARY REVIEW
+Run: 20261114T180926Z_ac3144
+
+VALIDATION
+All 10 ZIP member checksums and source provenance match. Recomputed all three metrics for 162 rows from 1,782 samples and verified 135 comparisons. All 27 cases, 4,428 changed-input output checks and inherited 576 output checks passed.
+Trace: 1,008 kernels, no copies, no unattributed device operations. Each eight-stage baseline cycle has 64 kernels, each single-owner cycle 48, under all three schedules.
+
+LATENCY REDUCTION (%)
+Candidate / Reference | Stages | Event median (wins/9) | Wall median | Enqueue median
+baseline_combined / baseline_separate | 1 | -0.88% (3/9) | -0.24% | 1.90%
+baseline_combined / baseline_separate | 8 | 0.88% (7/9) | 0.90% | 51.44%
+baseline_combined / baseline_separate | 32 | 6.63% (8/9) | 6.55% | 63.65%
+single_combined / baseline_combined | 1 | 18.30% (9/9) | 15.02% | 10.16%
+single_combined / baseline_combined | 8 | 19.28% (9/9) | 18.73% | 21.64%
+single_combined / baseline_combined | 32 | 19.21% (9/9) | 19.03% | 23.05%
+single_combined / single_separate | 1 | 3.13% (6/9) | 1.19% | 10.89%
+single_combined / single_separate | 8 | 2.32% (9/9) | 2.14% | 60.09%
+single_combined / single_separate | 32 | 8.05% (9/9) | 7.64% | 68.98%
+single_eager / baseline_eager | 1 | 12.16% (8/9) | 11.96% | 12.94%
+single_eager / baseline_eager | 8 | 17.28% (9/9) | 17.14% | 17.52%
+single_eager / baseline_eager | 32 | 17.49% (9/9) | 17.32% | 17.65%
+single_separate / baseline_separate | 1 | 17.24% (9/9) | 13.72% | -1.00%
+single_separate / baseline_separate | 8 | 18.65% (9/9) | 17.99% | 9.58%
+single_separate / baseline_separate | 32 | 16.44% (8/9) | 16.30% | 9.16%
+Negative reductions mean slower; descriptive matched trial/configuration ratios, not confidence intervals.
+
+FINDINGS
+Inside one combined graph, the single-owner mapping wins all 27 comparisons: 18.30% median reduction at one stage, 19.28% at eight, 19.21% at 32. Thus the benefit is not solely from replaying separate graphs.
+Combining 32 graphs improves baseline event latency by 6.63% (8/9 wins), and candidate latency by 8.05% (9/9 wins). Their host enqueue medians fall by 63.65% and 68.98%; those percentages are not whole-cycle speedups.
+The one-stage combined-versus-separate comparison is a same-work control: both replay one graph. Small differences there demonstrate timing/allocation variability rather than graph coalescing.
+The operation-count reduction remains two kernels per prefix. The trace counts 64 versus 48 kernels across eight prefixes with zero refresh copies.
+
+INPUT-CONTRACT LIMITATION FOUND IN SOURCE AUDIT
+Notebook 09 uses int64 IDs and float16 scores inherited from the earlier harness. The inspected JIT and Triton router allocation paths default to contiguous int32 IDs and float32 scores. The serving prefix converts IDs to int32 and scores to float32, so the old harness includes conversion work that is normally unnecessary for those default outputs.
+This does not invalidate matched synthetic comparisons. It limits how representative their absolute times, kernel counts and percentage gains are. The actual backend, preallocated output buffers and runtime layout have not been observed in a full model run.
+Notebook 10 will test all four ID/score dtype combinations in the same run: int64/fp16 historical control, int32/fp16 and int64/fp32 individual conversion controls, and int32/fp32 matching the inspected default router outputs.
+Only baseline and unchanged single-owner prefixes are timed, inside combined graphs, with 1/8 stages and 9/32/128 tokens. The actual router kernel remains omitted.
+
+BOUNDARIES
+All stages are independent mapping prefixes, not transformer layers. No alignment, expert GEMM, attention, communication or full model is executed. Small fused mapping, framework buffer compatibility, H200 performance and scheduler/tokenizer startup remain unvalidated. Active V4 and both drafts stay unchanged.

@@ -1,0 +1,1 @@
+Read-only route audit: official https://openkernelchallenge.dev/llms.txt lines100-120 and157 explicitly states kernel submissions return409 whileclosed. CLI quota display is not availability. No kernel check launched. Keep existing serving checks; no scored submission.

@@ -1,0 +1,229 @@
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -100,7 +100,7 @@
+     get_token_to_kv_pool,
+ )
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+-from sglang.srt.runtime_context import get_forward, get_memory, get_parallel
++from sglang.srt.runtime_context import get_disagg, get_exec, get_forward, get_memory, get_parallel
+ from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+ from sglang.srt.utils import add_prefix, is_cpu, use_intel_amx_backend
+ from sglang.srt.utils.common import get_device_capability, is_cuda
+@@ -1427,6 +1427,19 @@
+             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+         )
+ 
++    def decode_aux_output_spec(self):
++        parallel = get_parallel()
++        if (not self.capture_aux_hidden_states or parallel.pp_size != 1
++            or parallel.attn_dp_enabled or parallel.attn_cp_size != 1
++            or get_exec().overlap.enable_two_batch_overlap
++            or get_disagg().enable_pdmux):
++            return None
++        return self.model.prefill_aux_output_spec()
++
++    def get_aux_hidden_states_width(self) -> int:
++        spec = self.decode_aux_output_spec()
++        return spec[0] * len(spec[1]) if spec is not None else 0
++
+     def set_dflash_layers_to_capture(self, layer_ids: List[int]) -> None:
+         """Capture the residual stream after each listed decoder layer.
+ 
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -1819,9 +1819,24 @@
+         physical ids for a fused draft, the virtual ids for a private one."""
+         return plan.write_ids(self.draft_model_runner.kv_index_translator)
+ 
++    def _aux_output_owners(self):
++        model_runner = self.target_worker.model_runner
++        owners = []
++        for runner_name, owner_name in (
++            ("prefill_cuda_graph_runner", "prefill_aux_output_owner"),
++            ("decode_cuda_graph_runner", "decode_aux_output_lease"),
++        ):
++            runner = getattr(model_runner, runner_name, None)
++            owner = getattr(runner, owner_name, None)
++            if owner is not None:
++                owners.append(owner)
++        return owners
++
+     def _append_target_hidden_to_draft_kv_by_loc(self, **kwargs) -> None:
+-        runner = self.target_worker.model_runner.prefill_cuda_graph_runner
+-        owner = getattr(runner, "prefill_aux_output_owner", None)
++        owner = next(
++            (owner for owner in self._aux_output_owners()
++             if owner.owns(kwargs["target_hidden"])), None
++        )
+         lease = (
+             owner.consume(kwargs["target_hidden"])
+             if owner is not None
+@@ -2348,13 +2363,11 @@
+         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
+ 
+     def forward_batch_generation(self, *args, **kwargs):
+-        runner = self.target_worker.model_runner.prefill_cuda_graph_runner
+-        owner = getattr(runner, "prefill_aux_output_owner", None)
+-        generation = owner.generation if owner is not None else None
++        generations = [(owner, owner.generation) for owner in self._aux_output_owners()]
+         try:
+             return self._forward_batch_generation_with_aux_output(*args, **kwargs)
+         except Exception:
+-            if owner is not None:
++            for owner, generation in generations:
+                 owner.discard_ready(generation + 1)
+             raise
+ 
+--- /dev/null
++++ b/python/sglang/srt/layers/decode_aux_output.py
+@@ -0,0 +1,30 @@
++"""Lease an existing decode runner's canonical auxiliary output buffer."""
++import torch
++from sglang.srt.layers.prefill_aux_output import PrefillAuxOutputOwner
++
++
++class DecodeAuxOutputLease(PrefillAuxOutputOwner):
++    def __init__(self, buffer, hidden_size, capture_ids):
++        ids = tuple(capture_ids)
++        if (not torch.is_tensor(buffer) or buffer.ndim != 2
++            or buffer.shape[0] <= 0 or hidden_size <= 0
++            or not ids or any(type(i) is not int or i < 0 for i in ids)
++            or ids != tuple(sorted(set(ids)))
++            or buffer.shape[1] != hidden_size * len(ids)
++            or buffer.dtype != torch.bfloat16 or not buffer.is_contiguous()):
++            raise ValueError("invalid decode auxiliary output buffer")
++        # The runner/global input-buffer pool remains the allocation owner.
++        # This object retains and leases that exact storage; it allocates none.
++        self.buffer = buffer
++        self.hidden_size = hidden_size
++        self.capture_ids = ids
++        self._state = "idle"
++        self._generation = 0
++        self._producer_stream = None
++        self._consumer_stream = torch.cuda.current_stream(buffer.device)
++        self._recorded_streams = {self._consumer_stream}
++
++    def validate_binding(self, buffer, spec):
++        if (spec != (self.hidden_size, self.capture_ids)
++            or not self.owns(buffer) or buffer.shape != self.buffer.shape):
++            raise RuntimeError("decode auxiliary binding changed; rebuild captured runner")
+--- a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+@@ -61,6 +61,7 @@
+     set_is_extend_in_batch,
+ )
+ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
++from sglang.srt.layers.decode_aux_output import DecodeAuxOutputLease
+ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+     CudaGraphBufferRegistry,
+     GraphSlot,
+@@ -593,6 +594,7 @@
+ 
+         # --- backend ---------------------------------------------------
+         self.backend = resolve_decode_backend(self)
++        self._init_decode_aux_output_lease()
+ 
+         # --- capture --------------------------------------------------
+         try:
+@@ -602,6 +604,45 @@
+             raise Exception(
+                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+             )
++
++    decode_aux_output_lease = None
++
++    def _init_decode_aux_output_lease(self):
++        spec_fn = getattr(self.model_runner.model, "decode_aux_output_spec", None)
++        if (spec_fn is None or self.buffers.aux_hidden_states is None
++            or self.model_runner.is_draft_worker
++            or not self.model_runner.spec_algorithm.is_dflash()
++            or self.pp_size != 1 or self.enable_pdmux or self.enable_two_batch_overlap
++            or get_parallel().attn_dp_enabled or get_parallel().attn_cp_size != 1
++            or torch.device(self.device).type != "cuda"
++            or self.buffers.aux_hidden_states.device.type != "cuda"
++            or not self.capture_forward_mode.is_target_verify()):
++            return
++        spec = spec_fn()
++        if spec is not None:
++            self.decode_aux_output_lease = DecodeAuxOutputLease(
++                self.buffers.aux_hidden_states, spec[0], spec[1]
++            )
++
++    def _validate_decode_aux_binding(self):
++        lease = self.decode_aux_output_lease
++        if lease is not None:
++            lease.validate_binding(
++                self.buffers.aux_hidden_states,
++                self.model_runner.model.decode_aux_output_spec(),
++            )
++
++    def _decode_aux_capture_buffer(self, num_tokens):
++        if hasattr(self.model_runner.model, "decode_aux_output_spec"):
++            self._validate_decode_aux_binding()
++            lease = self.decode_aux_output_lease
++            return lease.view(num_tokens) if lease is not None else None
++        buffer = self.buffers.aux_hidden_states
++        return buffer[:num_tokens] if buffer is not None else None
++
++    def adopt_owned_cuda_graph_output(self, output, rows):
++        lease = self.decode_aux_output_lease
++        return lease.adopt(output, rows) if lease is not None else None
+ 
+     def _next_token_logits_buffer_capacity_rows(self, max_num_tokens: int) -> int:
+         """Rows reserved for the largest shared logits output."""
+@@ -1120,11 +1161,7 @@
+         )
+         mrope_positions = _slot("mrope_positions")
+         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+-        aux_hidden_states_buffer = (
+-            buffers.aux_hidden_states[:num_tokens]
+-            if buffers.aux_hidden_states is not None
+-            else None
+-        )
++        aux_hidden_states_buffer = self._decode_aux_capture_buffer(num_tokens)
+         rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
+         bootstrap_room_ids_int = (
+             buffers.bootstrap_room_ids_int[:bs]
+@@ -1247,8 +1284,15 @@
+         return forward_batch, attn_backend, pp_proxy_tensors
+ 
+     def capture(self) -> None:
+-        with self.model_context():
+-            self._capture()
++        self._validate_decode_aux_binding()
++        lease = self.decode_aux_output_lease
++        generation = lease.begin_capture() if lease is not None else None
++        try:
++            with self.model_context():
++                self._capture()
++        finally:
++            if lease is not None:
++                lease.end_capture(generation, getattr(self, "stream", None))
+ 
+     def _capture(self) -> None:
+         # Warm up + autotune kernels once before capture (run-once across the
+@@ -1978,7 +2022,23 @@
+ 
+         return round_up_grid(total_verify_tokens, self.capture_num_tokens)
+ 
+-    def execute(
++    def execute(self, forward_batch, pp_proxy_tensors=None):
++        lease = self.decode_aux_output_lease
++        if lease is None:
++            return self._execute_with_aux_output(forward_batch, pp_proxy_tensors)
++        self._validate_decode_aux_binding()
++        if not forward_batch.forward_mode.is_target_verify() or forward_batch.batch_size <= 0:
++            raise RuntimeError("decode auxiliary lease requires nonempty target verification")
++        generation = lease.begin_produce()
++        try:
++            output = self._execute_with_aux_output(forward_batch, pp_proxy_tensors)
++            lease.end_produce(generation, output.hidden_states)
++            return output
++        except BaseException:
++            lease.cancel_produce(generation)
++            raise
++
++    def _execute_with_aux_output(
+         self,
+         forward_batch: ForwardBatch,
+         pp_proxy_tensors: Optional[PPProxyTensors] = None,

@@ -1,0 +1,13 @@
+﻿Sparse-route memory and arithmetic contract, round two
+
+Pinned scored finalizer reads expert_output only inside live=(expert_id>=0). The scored activation also skips inactive rows. Therefore a full R=M*topK allocation does not imply full R arithmetic or full R*H memory traffic. The composed epilogue removes the full gate/up buffer and the activation launch itself; its canonical activation and down arrays still reserve R rows for graph-safe worst-case capacity.
+
+Legal unique top8 routes can select all eight local experts for every token. Any fixed capacity derived only from expected R/EP local routes can overflow by EP and cannot be accepted. A device histogram can reveal current local count but cannot change a captured tensor allocation without a different memory-management contract. Silent route truncation, host synchronization on each replay and precision changes are excluded.
+
+A compact route representation needs both compact-to-original and original-to-compact maps. The W13 A-row mapping must remain original_slot//topK, W2 must read the corresponding compact activation, and finalizer must traverse original k order with the same BF16 downscale and FP32 norm/product/sum operations. Computing expert sums via atomics changes the sum order; no such approach is proposed.
+
+Token chunking can bound worst-case storage without device-dependent allocation, but must freeze full-batch classification and GEMM K topology. CPU experiment shows 256-token chunks at M768 uniform triple padded rows for three illustrative tile geometries. It also rereads expert weights; this is not a promising first optimization absent a fusion mechanism.
+
+Next worthwhile sparse experiment after composition: compact-address scheduling with static worst-case allocation as an address-locality experiment, not a capacity reduction claim. It requires changes to Humming indexed A/C mappings and finalizer gather. A smaller allocation is only justified by a generic hard capacity plus proven overflow fallback that executes every route, or by bounded expert pipelines whose extra launches/padding are explicitly measured.
+
+Current prototype is research-only, SM86-only due root fused launcher assertions, and does not replace any public serving API. No H200 or serving speedup inferred. Small-K repair remains held after prior raw numerical failures. Racecheck retries remain prohibited for this session.

@@ -1,0 +1,10 @@
+Primary source anchors used in this research
+
+Challenge rules and serving API: https://openkernelchallenge.dev/llms.txt
+Pinned SGLang source: https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90
+Pinned target FA3 dependency: https://github.com/sgl-project/sgl-attn/tree/f89bc2306632d1ec5f97b014dded4254f5b4a907
+Public draft configuration: https://huggingface.co/RadixArk/Muse-Spark-Open-DFlash2/blob/main/config.json
+NVIDIA Compute Sanitizer: https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html
+NVIDIA PTX ISA: https://docs.nvidia.com/cuda/parallel-thread-execution/
+
+Authoritative dependency bytes and source hashes are retained in the lane reports. Documentation does not replace runtime evidence. The final HuggingFace web-tool refresh was inaccessible; the earlier downloaded public configuration remains the source for its reported geometry. No gated target checkpoint was downloaded and no access terms were accepted.

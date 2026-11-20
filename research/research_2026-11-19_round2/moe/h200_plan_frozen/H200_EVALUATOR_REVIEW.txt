@@ -1,0 +1,14 @@
+﻿INDEPENDENT REVIEW — disabled H200 receipt evaluator
+Reviewer: decode_research, 2026-11-19.
+
+Initial review found unbound integrated patch/policy provenance and a misleading
+conclusive flag based on unverified frontier scalars. Both were corrected.
+The source manifest now binds patch, baseline, all four kernel sources, checkpoint,
+real route holdout and selected policy; every serving scenario binds that manifest.
+The evaluator ALWAYS returns false for independently conclusive2x evidence,
+independent frontier recomputation and scored submission authorization.
+READY_FOR_HUMAN_REVIEW means reported receipt consistency only. Human review must
+inspect authenticated hardware receipts and recompute/verify the official frontier.
+No remaining false-conclusive path was found in this deliberately limited scope.
+Malformed nested types may raise rather than return HOLD; this fails closed.
+Tests are synthetic CPU contracts, not actual H200 or serving evidence.

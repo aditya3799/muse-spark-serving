@@ -1,0 +1,1 @@
+Read SESSION_REVIEW.txt and SESSION_RESULTS.json. The current draft is candidate_compact32_01/candidate_unsubmitted.diff. Active V4 cached-mapping submission is unchanged; existing H200 check f1513498e8d84de8 is pending. No new judge run was launched. Full-model 1.5x is not established.

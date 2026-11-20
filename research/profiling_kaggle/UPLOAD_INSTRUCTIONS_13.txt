@@ -1,0 +1,8 @@
+Upload 13_kaggle_stream_ordering.ipynb to Kaggle.
+Select GPU T4, keep defaults and Run All. Only GPU 0 is used, even if two GPUs are visible.
+No Internet, packages, datasets or weights required.
+Download v4_stream_ordered_*.zip into D:\OpenKernelChallenge\serving\profiling_kaggle\notebook13_results.
+Run export even after a failure and return the whole ZIP. Stop the GPU session afterward.
+
+Expected: 768 event-ordered handoff cycles, 1,536 output checks, 768 pointer checks, eight recaptures after moves, plus prerequisites.
+This is a correctness-only test of producer/consumer CUDA event ordering. No deliberately unsynchronized races, no latency benchmark, no full model or H200 claim. Selected draft remains unapplied; active V4 is unchanged.

@@ -1,0 +1,13 @@
+Research-only native one-shot communication prototype
+
+protocol.cu embeds the exact local BF16 finalizer producer in the pinned native all_reduce_1shot_push_kernel body. The source transformation replaces only vec.load with fill_vec; rank order, 32-bit zero-pair encoding, peer pushes, all-peer polling, output reduction, local clears, synchronization and epoch flip remain unchanged. PDL is false. The production entry receives the existing push workspace; no new communication allocation is proposed.
+
+Single-GPU virtual eight-rank test: 36 configurations, 180 changed-input cases, 1,440 rank-output cases pass. H=1024/4096/8192, M=2/8/3, optional deferred BF16 scale and 1/2 controllers. It checks original Triton inverse RMS/combine, independent increasing-rank oracle, local combine, output/workspace/counter guards, clearing BOTH phase halves, and interleaving native/fused calls on the SAME push plane. All counters, including idle CTAs, toggle together. Peak GPU allocated49,703,424B/reserved62,914,560B. No timing claim.
+
+The first run refused below the unchanged2GiB host-memory threshold. A read-only check showed3.74GB available; the unchanged second run passed. No unrelated process was modified.
+
+SM90a offline compilation passed5.87s/352,424KiB RSS under2GiB address-space cap and120s timeout. Production entries have64registers, zero stack and zero spills. The virtual-rank fixture has200B stack for its parameter construction; this is absent in production entries.
+
+Applicability: pinned SGLang uses CustomAllReduceV2 by default when full NVLink is eligible. The H200 TP8 table uses one-shot push up to128KiB in eager and graph modes; H4096 M2..8 needs16..64KiB. This remains conditional on the actual selected communicator and overrides. Future admission must check exact group/communicator identity, actual outplace method=ca, no FlashInfer override, one-shot algorithm, contiguous BF16 output, capacity, all-rank agreement, matching controller count, and serialized stream ownership. Production grid must cover every allocated counter, not change the phase of only a subset.
+
+There is no serving hook. In particular, the existing Humming caller must not set already_reduced merely because a workspace exists: it currently ignores that workspace in the Humming path. Original inverse-RMS must remain unchanged; a different CuTe reduction is not substituted. Exceptions after a collective starts cannot fall back rank-locally. Multi-device NVLink ordering/liveness, IPC pointer validity, mixed graph/eager operation, end-to-end tokens and latency still require H200 validation.

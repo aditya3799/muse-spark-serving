@@ -1,0 +1,29 @@
+# Muse Spark expert execution and cache allocation
+
+This patch reduces expert-parallel MoE overhead, avoids redundant projection work, and reuses compatible FA3 verification scheduler metadata. The submitted launch configuration allocates more of the existing KV budget to full-attention tokens through SGLang's standard cache-ratio flag.
+
+## Launch configuration
+
+- `--moe-runner-backend humming`
+- `--swa-full-tokens-ratio 0.35`
+
+The cache ratio is constant across all requests and loads. It changes the capacity split between full-attention and sliding-window pools through the existing allocator; it does not shorten attention windows or truncate prompts. The judge's `--mem-fraction-static 0.85` remains in effect.
+
+## Source changes
+
+- Humming expert execution uses canonical NVFP4 weights and FP8 block scales, FP32 accumulation, and the existing BF16 output boundaries. Device-side histograms partition local routes between compatible light and heavy expert configurations, retaining the original K-reduction geometry in the larger-prefill path. Configuration admission occurs before capture, with fallback for unsupported cases.
+- Routing metadata is prepared for reuse, including expert lookup maps and small-route alignment. The Marlin path retains guarded adaptive tile selection for applicable sparse expert-parallel geometry.
+- Expert finalization separates per-expert RMS reduction from tiled weighted combination. The source credits the public MoE decomposition that informed this implementation.
+- Guarded tensor-parallel projections shard token rows for larger replicated projections or output columns for eligible small projections, gathering the complete outputs in their original order.
+- FA3 target-verification scheduling metadata is reused only when attention geometry matches. Sliding-window, local, cross-attention and unsupported masking cases retain their existing paths. This patch does not introduce a new attention exponential approximation or lower-precision attention arithmetic.
+
+## Validation and measured scope
+
+The source patch is byte-identical to scored run `317c88a5fd474cd2`, which passed correctness and later-turn checks and scored **1.2363x** across the serving ladder with the Humming flag alone.
+
+The exact source and both flags above were tested in unscored check `f464d5f09f534363` at 32 concurrent users. It passed correctness and later-turn checks, returned no short outputs, and reported GPU memory **1.4 GB below stock per GPU**. The indicative throughput ratio at stock's interactivity point was **1.398x**, with first/later-turn TTFT ratios **0.72/0.22**. This is a single-load check, not a four-load score or a guaranteed improvement over the earlier run; the runs used different nodes.
+
+Before this final submission, the 83,849-byte patch passed plain `git apply --check` and plain `git apply` against the pinned base. All ten resulting source hashes matched the frozen release, and all ten Python files parsed. The longest added line is 226 characters. Existing local CPU/GPU qualification supplements these official full-model results; no additional last-minute source changes are included.
+
+Base: `297e54fd105e974cdf401e5b4d20253a22c16f90`.
+Patch SHA256: `8c7547213fb993a318321a26f84e2872db8c87b358ee3d3ea638695702b0dc2b`.

@@ -1,0 +1,12 @@
+Upload only 04_kaggle_mapping_integration.ipynb; it is self-contained.
+
+1. Select GPU T4 in Kaggle and keep the default configuration. Internet can stay off.
+2. Run All. No packages, weights, datasets or credentials are needed.
+3. Expected: environment, lifecycle, benchmark and update_cost passed; profiler may be partial if GPU tracing is unavailable.
+4. Defaults: 672 module correctness input cases; 48 benchmark cases; 288 changed-input benchmark graph checks; 204 timing rows and 2,244 samples including update costs.
+5. The stale-cache test intentionally demonstrates incorrect output before explicit refresh, then checks the remedy. It does not provide automatic stale-cache detection.
+6. Run the final export cell even if a section fails or is skipped.
+7. Download v4_mapping_integration_*.zip and place it in profiling_kaggle/notebook04_results.
+8. Stop the interactive GPU session after downloading.
+
+This is an isolated module-ownership prototype, not the full serving class or an applied source patch. It does not test real alignment/GEMMs, model checkpoints, startup or H200 performance.

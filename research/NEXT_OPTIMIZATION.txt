@@ -1,0 +1,7 @@
+Latest checkpoint: PROGRESS_2026-11-16.txt
+Checked UTC: 2026-11-15T20:41:28Z
+H200 check 32bcbb190b204dd6: queued. No result yet.
+Confirmed serving score: 1.0111x; target 1.5x not achieved.
+Resume from SESSION_HANDOFF.txt. Do not duplicate the queued run.
+Use the explicit projection_fp32_candidate/candidate.diff, not root patch.diff.
+Read live quotas; prior-day quota notes are historical.

@@ -1,0 +1,35 @@
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -221,8 +221,7 @@
+         self.register_buffer(
+             "e_score_correction_bias", torch.zeros(num_experts, dtype=torch.float32)
+         )
+-        self._split2_hi = None
+-        self._split2_lo = None
++        self._split2_weight = None
+         self._split2_key = None
+ 
+     @torch.no_grad()
+@@ -233,16 +232,17 @@
+             return
+         hi = w.to(torch.bfloat16)
+         lo = (w - hi.to(torch.float32)).to(torch.bfloat16)
+-        self._split2_hi = hi.t().contiguous()
+-        self._split2_lo = lo.t().contiguous()
++        # Share the input read and GEMM launch while retaining separate FP32
++        # accumulators for the high and low BF16 components.
++        self._split2_weight = torch.cat((hi, lo)).t().contiguous()
+         self._split2_key = key
+ 
+     def forward_split2(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         self._build_split2()
+         x = hidden_states.to(torch.bfloat16)
+-        acc = torch.mm(x, self._split2_hi, out_dtype=torch.float32)
+-        acc += torch.mm(x, self._split2_lo, out_dtype=torch.float32)
+-        return acc
++        acc = torch.mm(x, self._split2_weight, out_dtype=torch.float32)
++        hi, lo = acc.chunk(2, dim=-1)
++        return hi + lo
+ 
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         # Decode-sized FP32 logits: one CuTe GEMV instead of cuBLAS split-K + reduce.

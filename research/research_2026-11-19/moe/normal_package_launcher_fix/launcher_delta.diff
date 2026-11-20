@@ -1,0 +1,52 @@
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_grouped_build.py b/python/sglang/kernels/ops/moe/muse_spark_grouped_build.py
+--- a/python/sglang/kernels/ops/moe/muse_spark_grouped_build.py
++++ b/python/sglang/kernels/ops/moe/muse_spark_grouped_build.py
+@@ -8,7 +8,7 @@
+ import logging
+ import os
+ from pathlib import Path
+-import resource
++import sys
+ import signal
+ import subprocess
+ import tempfile
+@@ -36,12 +36,23 @@
+     raise RuntimeError('exact pinned CUTLASS headers unavailable; keep original Humming')
+ 
+ 
+-def _no_core():
+-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+-    try:
+-        Path('/proc/self/coredump_filter').write_text('0')
+-    except OSError:
+-        pass
++CORE_LIMIT_WRAPPER = """import os, resource, sys
++resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
++try:
++    with open('/proc/self/coredump_filter', 'w') as stream:
++        stream.write('0')
++except OSError:
++    pass
++os.execv(sys.argv[1], sys.argv[1:])
++"""
++
++
++def _compiler_process(args):
++    # No Python preexec callback in a forked multithreaded Torch worker.
++    # A fresh interpreter applies child-local limits, then execs NVCC in-place.
++    return subprocess.Popen([sys.executable, '-c', CORE_LIMIT_WRAPPER, *args],
++                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++                            text=True, start_new_session=True)
+ 
+ 
+ @lru_cache(maxsize=1)
+@@ -85,8 +96,7 @@
+                     '-L'+str(driver.parent), '-l:'+driver.name,
+                     '-Xlinker=-rpath='+str(cudart.parent), '-o', str(cache/'kernel.tmp.so')]
+             version = subprocess.check_output([str(home/'bin/nvcc'), '--version'], text=True)
+-            process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+-                                       text=True, preexec_fn=_no_core, start_new_session=True)
++            process = _compiler_process(args)
+             try:
+                 output, _ = process.communicate(timeout=600)
+             except subprocess.TimeoutExpired:

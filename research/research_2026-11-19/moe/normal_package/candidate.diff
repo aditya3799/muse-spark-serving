@@ -1,0 +1,2656 @@
+diff --git a/python/sglang/kernels/ops/moe/adaptive_marlin_tiles.py b/python/sglang/kernels/ops/moe/adaptive_marlin_tiles.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/adaptive_marlin_tiles.py
+@@ -0,0 +1,106 @@
++"""Select sparse EP tiles on-device while preserving the dense Marlin path.
++
++The caller supplies sorted, already-local routing tables with inactive
++blocks first, caller-owned output buffers, and masked inactive output
++consumers. The selector preserves every active route and disables the
++unused projection with a zero padded count; it never reads back to CPU.
++This experimental helper is used only by the Muse Spark Marlin path.
++"""
++
++import triton
++
++
++import triton.language as tl
++
++
++@triton.jit
++def _select_and_compact(
++    IDS,
++    BIG_TOKENS,
++    BIG_COUNT,
++    SMALL_TOKENS,
++    SMALL_EXPERTS,
++    SMALL_COUNT,
++    N: tl.constexpr,
++    E: tl.constexpr,
++    BIG: tl.constexpr,
++    SMALL: tl.constexpr,
++    NP: tl.constexpr,
++    NB: tl.constexpr,
++):
++    offsets = tl.arange(0, NP)
++    ids = tl.load(IDS + offsets, offsets < N, other=-1)
++    # Mask padding out of the histogram: it is not a real inactive route.
++    ids = tl.where(offsets < N, ids + 1, NB)
++    counts = tl.histogram(ids, NB)
++    buckets = tl.arange(0, NB)
++    active = (buckets > 0) & (buckets <= E) & (counts > 0)
++    use_small = tl.max(tl.where(active, counts, 0), 0) <= SMALL
++    big_blocks = (counts + BIG - 1) // BIG
++    big_starts = tl.cumsum(big_blocks, 0) - big_blocks
++    small_starts = tl.cumsum(active.to(tl.int32), 0) - active.to(tl.int32)
++    rows = tl.arange(0, SMALL)
++    tokens = tl.load(
++        BIG_TOKENS + big_starts[:, None] * BIG + rows[None, :],
++        use_small & active[:, None],
++        other=N,
++    )
++    tl.store(
++        SMALL_TOKENS + small_starts[:, None] * SMALL + rows[None, :],
++        tokens,
++        use_small & active[:, None],
++    )
++    tl.store(SMALL_EXPERTS + small_starts, buckets - 1, use_small & active)
++    total = tl.load(BIG_COUNT)
++    tl.store(BIG_COUNT, tl.where(use_small, 0, total))
++    tl.store(
++        SMALL_COUNT, tl.where(use_small, tl.sum(active.to(tl.int32), 0) * SMALL, 0)
++    )
++
++
++def prepare_adaptive_alignment(
++    local_ids, big_block, local_experts, big_count, is_ep, big_sorted, small_block=16
++):
++    if (
++        not is_ep
++        or big_block <= small_block
++        or local_ids.numel() > 8192
++        or local_experts > 128
++    ):
++        return None
++    import torch
++
++    small = (
++        torch.empty(
++            local_experts * small_block, dtype=torch.int32, device=local_ids.device
++        ),
++        torch.empty(local_experts, dtype=torch.int32, device=local_ids.device),
++        torch.empty(1, dtype=torch.int32, device=local_ids.device),
++    )
++    _select_and_compact[(1,)](
++        local_ids,
++        big_sorted,
++        big_count,
++        *small,
++        local_ids.numel(),
++        local_experts,
++        big_block,
++        small_block,
++        triton.next_power_of_2(local_ids.numel()),
++        triton.next_power_of_2(local_experts + 1),
++    )
++    return small
++
++
++def adaptive_gemm(*args, adaptive_tables=None, adaptive_block=16, **kwargs):
++    from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
++
++    output = moe_wna16_marlin_gemm(*args, **kwargs)
++    if adaptive_tables is None:
++        return output
++    alternate = list(args)
++    # The public positional API: c at 1; sorted IDs, block IDs, padded count at 10:13.
++    assert alternate[1] is not None
++    alternate[10:13] = adaptive_tables
++    kwargs = dict(kwargs, moe_block_size=adaptive_block)
++    return moe_wna16_marlin_gemm(*alternate, **kwargs)
+diff --git a/python/sglang/kernels/ops/moe/moe_align_small_numel.py b/python/sglang/kernels/ops/moe/moe_align_small_numel.py
+--- a/python/sglang/kernels/ops/moe/moe_align_small_numel.py
++++ b/python/sglang/kernels/ops/moe/moe_align_small_numel.py
+@@ -28,6 +28,9 @@
+     num_experts,  # E + 1 (the "+1 offset" convention's bucket count)
+     block_size,
+     numel,
++    expert_map_ptr,
++    local_ids_ptr,
++    HAS_EXPERT_MAP: tl.constexpr,
+     NP: tl.constexpr,  # power-of-2 >= numel
+     NB: tl.constexpr,  # power-of-2 >= max blocks used
+     USE_GDC: tl.constexpr = False,
+@@ -60,6 +63,11 @@
+     offs_p = tl.arange(0, NP)
+     mask_p = offs_p < numel
+     ids = tl.load(topk_ids_ptr + offs_p, mask=mask_p, other=-2)
++    if HAS_EXPERT_MAP:
++        ids = tl.load(
++            expert_map_ptr + tl.maximum(ids, 0), mask=mask_p & (ids >= 0), other=-1
++        )
++        tl.store(local_ids_ptr + offs_p, ids.to(tl.int32), mask=mask_p)
+     # Padded lanes get an out-of-range bucket and are masked out everywhere.
+     bucket = tl.where(mask_p, (ids + 1).to(tl.int32), num_experts)
+ 
+@@ -126,6 +134,8 @@
+     num_tokens_post_pad: torch.Tensor,
+     *,
+     write_inactive_prefix_count: bool = False,
++    expert_map: torch.Tensor | None = None,
++    local_topk_ids: torch.Tensor | None = None,
+ ) -> None:
+     """Align and sort expert token ids into block-padded buffers, in one launch.
+ 
+@@ -133,11 +143,19 @@
+     (minus its ``cumsum_buffer``, which a single CTA does not need):
+     ``num_experts`` is the bucket count ``E + 1`` under the "+1 offset"
+     convention, and the three output buffers are written in place.
++    With expert_map, map global IDs and publish local_topk_ids in the same
++    launch. Negative IDs remain inactive; original route slots are preserved.
+ 
+     Callers gate on ``topk_ids.numel() <= SMALL_NUMEL_LIMIT``; the kernel stays
+     correct above it, but its pairwise tensors spill and it stops being faster
+     than the two-kernel path.
+     """
++    if expert_map is not None:
++        assert topk_ids.is_contiguous() and expert_map.is_contiguous()
++        assert local_topk_ids is not None
++        assert local_topk_ids.shape == topk_ids.shape
++        assert local_topk_ids.dtype == torch.int32 and local_topk_ids.is_contiguous()
++        assert local_topk_ids.device == topk_ids.device == expert_map.device
+     if write_inactive_prefix_count:
+         assert num_tokens_post_pad.shape == (2,)
+         assert num_tokens_post_pad.dtype == torch.int32
+@@ -154,6 +172,9 @@
+         num_experts,
+         block_size,
+         numel,
++        expert_map if expert_map is not None else topk_ids,
++        local_topk_ids if local_topk_ids is not None else topk_ids,
++        HAS_EXPERT_MAP=expert_map is not None,
+         NP=triton.next_power_of_2(max(numel, 2)),
+         NB=triton.next_power_of_2(max(expert_ids.numel(), 2)),
+         WRITE_INACTIVE_PREFIX_COUNT=write_inactive_prefix_count,
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_humming_scale.py b/python/sglang/kernels/ops/moe/muse_spark_humming_scale.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/muse_spark_humming_scale.py
+@@ -0,0 +1,42 @@
++"""Exact BF16 global scaling, skipping non-local expert routes."""
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _scale_rows_kernel(x_ptr, ids_ptr, scale_ptr, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
++    row = tl.program_id(0)
++    expert = tl.load(ids_ptr + row)
++    if expert >= 0:
++        offset = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++        value = tl.load(x_ptr + row * WIDTH + offset, mask=offset < WIDTH, other=0).to(tl.float32)
++        scale = tl.load(scale_ptr + expert).to(tl.float32)
++        # Preserve the separate BF16 multiplication after the BF16 GEMM output.
++        result = (value * scale).to(x_ptr.dtype.element_ty)
++        tl.store(x_ptr + row * WIDTH + offset, result, mask=offset < WIDTH)
++
++
++def scale_active_rows(output, local_ids, scales):
++    if output.ndim != 2 or scales.ndim != 1:
++        raise ValueError("Expected a matrix output and one scale per expert")
++    if output.dtype != torch.bfloat16 or scales.dtype != torch.bfloat16:
++        raise TypeError("Global scaling requires BF16 output and scales")
++    if local_ids.dtype not in (torch.int32, torch.int64):
++        raise TypeError("Local expert IDs must be integer tensors")
++    if not output.is_cuda or not output.device == local_ids.device == scales.device:
++        raise ValueError("Output, IDs and scales must share one CUDA device")
++    if not all(t.is_contiguous() for t in (output, local_ids, scales)):
++        raise ValueError("Output, IDs and scales must be contiguous")
++    if output.shape[0] != local_ids.numel() or scales.numel() == 0:
++        raise ValueError("Expected one local ID per output row and nonempty scales")
++    width = output.shape[1]
++    if width == 0:
++        raise ValueError("Output width must be positive")
++    if output.shape[0] == 0:
++        return
++    block = min(8192, triton.next_power_of_2(width))
++    _scale_rows_kernel[(output.shape[0], triton.cdiv(width, block))](
++        output, local_ids, scales, WIDTH=width, BLOCK=block,
++        num_warps=8 if block >= 8192 else 4,
++    )
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_humming_split.py b/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
+@@ -0,0 +1,530 @@
++"""Histogram-selected expert partitions sharing canonical outputs.
++
++Unsupported inputs retain the original helper. Both up GEMMs must finish before any down GEMM because
++cache13 aliases their outputs. This module has no host reads of route values.
++"""
++import torch
++import triton
++import triton.language as tl
++from copy import deepcopy
++
++
++def select_ep_config(intervals, actual_routes, local_experts, global_experts):
++    tune_m = (actual_routes * local_experts + global_experts - 1) // global_experts
++    config = next((deepcopy(c) for lo, hi, c in intervals if lo < tune_m <= hi), None)
++    if config is None or config.get("use_stream_k") is not False or config.get("use_f16_accum") is not False:
++        return None
++    return {"tune_m": tune_m, "valid_shape_m": actual_routes, "config": config}
++
++
++
++@triton.jit
++def _partition_kernel(ids_ptr, light_ptr, heavy_ptr, count_ptr,
++                      ROUTES: tl.constexpr, EXPERTS: tl.constexpr,
++                      CUTOFF: tl.constexpr, BLOCK: tl.constexpr, BINS: tl.constexpr):
++    offsets = tl.arange(0, BLOCK)
++    ids = tl.load(ids_ptr + offsets, mask=offsets < ROUTES, other=-1)
++    valid = (offsets < ROUTES) & (ids >= 0) & (ids < EXPERTS)
++    buckets = tl.where(valid, ids, BINS - 1).to(tl.int32)
++    counts = tl.histogram(buckets, BINS)
++    safe_ids = tl.where(valid, ids, 0).to(tl.int32)
++    route_counts = tl.gather(counts, safe_ids, 0)
++    light = valid & (route_counts <= CUTOFF)
++    heavy = valid & (route_counts > CUTOFF)
++    tl.store(light_ptr + offsets, tl.where(light, ids, -1), mask=offsets < ROUTES)
++    tl.store(heavy_ptr + offsets, tl.where(heavy, ids, -1), mask=offsets < ROUTES)
++    expert_offsets = tl.arange(0, BINS)
++    tl.store(count_ptr + expert_offsets, counts, mask=expert_offsets < EXPERTS)
++
++
++def partition_routes(local_ids, experts, cutoff):
++    routes = local_ids.numel()
++    if not (0 < routes <= 4096 and 0 < experts <= 256 and cutoff > 0):
++        raise ValueError('Partitioning supports 1..4096 routes and 1..256 experts')
++    if not local_ids.is_cuda or not local_ids.is_contiguous() or local_ids.dtype not in (torch.int32, torch.int64):
++        raise ValueError('Expected contiguous CUDA integer route IDs')
++    light = torch.empty(local_ids.shape, dtype=torch.int32, device=local_ids.device)
++    heavy = torch.empty_like(light)
++    counts = torch.empty((experts,), dtype=torch.int32, device=local_ids.device)
++    _partition_kernel[(1,)](local_ids, light, heavy, counts,
++                           ROUTES=routes, EXPERTS=experts, CUTOFF=cutoff,
++                           BLOCK=triton.next_power_of_2(routes),
++                           BINS=triton.next_power_of_2(experts + 1),
++                           num_warps=8 if routes > 1024 else 4)
++    return light, heavy, counts
++
++
++def choose_partition_configs(layer, actual_routes, global_experts):
++    experts = layer.w13_post_scale.numel()
++    default = {s:next(c for lo,hi,c in intervals if lo < actual_routes <= hi)
++               for s,intervals in layer.fp32_configs.items()}
++    selections = {s:select_ep_config(intervals,actual_routes,experts,global_experts)
++                  for s,intervals in layer.fp32_configs.items()}
++    if any(value is None for value in selections.values()):
++        return None
++    light = {stage:value['config'] for stage,value in selections.items()}
++    if not all(c.get('use_f16_accum') is False and c.get('use_stream_k') is False
++               for c in list(default.values()) + list(light.values())):
++        return None
++    # Only explore pairs where expected-local tuning uses no larger row tile.
++    distinct = any(light[s] != default[s] for s in default)
++    smaller = all(light[s]['block_shape'][0] <= default[s]['block_shape'][0] for s in default)
++    if not distinct or not smaller:
++        return None
++    cutoff = min(c['block_shape'][0] for c in light.values())
++    return {'light':light,'heavy':default,'cutoff':cutoff}
++
++
++def split_expert_outputs(original_helper, layer, x, local_ids, torch, global_experts=None,
++                         *, retain=False, defer_downscale=False):
++    from humming.layer import HummingMethod
++    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
++    from sglang.kernels.ops.activation.activation import silu_and_mul
++    from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
++    def fallback():
++        return original_helper(layer,x,local_ids,torch,retain=retain,
++                               defer_downscale=defer_downscale)
++    if (x.ndim != 2 or local_ids.ndim != 2 or x.dtype != torch.bfloat16
++            or local_ids.dtype not in (torch.int32,torch.int64)
++            or not x.is_cuda or x.device != local_ids.device
++            or not x.is_contiguous() or not local_ids.is_contiguous()
++            or local_ids.shape[0] != x.shape[0]):
++        return fallback()
++    valid = local_ids.numel()
++    experts = layer.w13_post_scale.numel()
++    if (valid == 0 or valid > 4096 or not 0 < experts <= 256
++            or not isinstance(global_experts,int) or isinstance(global_experts,bool)
++            or global_experts < experts or global_experts % experts
++            or layer.w2_post_scale.numel() != experts):
++        return fallback()
++    plan = choose_partition_configs(layer,valid,global_experts)
++    if plan is None:
++        return fallback()
++    light_ids,heavy_ids,counts = partition_routes(local_ids,experts,plan['cutoff'])
++    partitions = [('light',light_ids),('heavy',heavy_ids)]
++    aligned = {}
++    def alignment(name,ids,block):
++        key = (name,block)
++        if key not in aligned:
++            aligned[key] = moe_align_block_size(ids,block,experts,ignore_invalid_expert=True)
++        return aligned[key]
++    m,k = x.shape
++    topk = local_ids.shape[1]
++    intermediate = layer.humming_metas['w2'].shape_k
++    cache13 = torch.empty((m*topk*max(2*intermediate,k),),device=x.device,dtype=x.dtype)
++    cache1 = cache13[:m*topk*2*intermediate].view(m*topk,2*intermediate)
++    for name,ids in partitions:
++        config = plan[name]['w13']
++        sorted_ids,expert_ids,padded = alignment(name,ids,config['block_shape'][0])
++        HummingMethod.forward_layer(layer,inputs=x,outputs=cache1,top_k=topk,sublayer_name='w13',
++            tuning_config=config,sorted_ids=sorted_ids,expert_ids=expert_ids,num_tokens_padded=padded,
++            valid_shape_m=valid,compute_config={'gemm_type':'indexed','use_f16_accum':False})
++    # Both up partitions are complete before scaling/activation or down-buffer reuse.
++    scale_active_rows(cache1,local_ids,layer.w13_post_scale)
++    cache2 = torch.empty((m*topk,intermediate),device=x.device,dtype=x.dtype)
++    silu_and_mul(cache1,cache2,expert_ids=local_ids.flatten(),expert_step=1)
++    cache3 = cache13[:m*topk*k].view(m*topk,k)
++    for name,ids in partitions:
++        config = plan[name]['w2']
++        sorted_ids,expert_ids,padded = alignment(name,ids,config['block_shape'][0])
++        HummingMethod.forward_layer(layer,inputs=cache2,outputs=cache3,top_k=1,sublayer_name='w2',
++            tuning_config=config,sorted_ids=sorted_ids,expert_ids=expert_ids,num_tokens_padded=padded,
++            valid_shape_m=valid,compute_config={'gemm_type':'indexed','use_f16_accum':False})
++    if not defer_downscale:
++        scale_active_rows(cache3,local_ids,layer.w2_post_scale)
++    return cache3.view(m,topk,k),local_ids
++
++
++# Scalable large-route path; the existing small-route implementation is preserved.
++_original_split_expert_outputs = split_expert_outputs
++
++"""Isolated larger-prefill partition prototype; canonical weights/math unchanged.
++
++Only the original4096-route cap and partition implementation differ. Existing
++<=4096 routes dispatch the exact scored partition. No host reads of route data.
++"""
++from copy import deepcopy
++import torch
++import triton
++import triton.language as tl
++original_choose_partition_configs = choose_partition_configs
++
++@triton.jit
++def _partial_hist(ids,partials,ROUTES:tl.constexpr,EXPERTS:tl.constexpr,BINS:tl.constexpr,BLOCK:tl.constexpr):
++    tile=tl.program_id(0)
++    ix=tile*BLOCK+tl.arange(0,BLOCK)
++    value=tl.load(ids+ix,mask=ix<ROUTES,other=-1)
++    valid=(ix<ROUTES)&(value>=0)&(value<EXPERTS)
++    bucket=tl.where(valid,value,BINS-1).to(tl.int32)
++    histogram=tl.histogram(bucket,BINS)
++    e=tl.arange(0,BINS)
++    tl.store(partials+tile*EXPERTS+e,histogram,mask=e<EXPERTS)
++
++@triton.jit
++def _reduce_hist(partials,counts,EXPERTS:tl.constexpr,TILES:tl.constexpr,BLOCK:tl.constexpr):
++    e=tl.program_id(0)
++    ix=tl.arange(0,BLOCK)
++    values=tl.load(partials+ix*EXPERTS+e,mask=ix<TILES,other=0)
++    tl.store(counts+e,tl.sum(values,0))
++
++@triton.jit
++def _classify(ids,counts,light,heavy,ROUTES:tl.constexpr,EXPERTS:tl.constexpr,CUTOFF:tl.constexpr,BLOCK:tl.constexpr):
++    ix=tl.program_id(0)*BLOCK+tl.arange(0,BLOCK)
++    value=tl.load(ids+ix,mask=ix<ROUTES,other=-1)
++    valid=(ix<ROUTES)&(value>=0)&(value<EXPERTS)
++    count=tl.load(counts+tl.where(valid,value,0))
++    tl.store(light+ix,tl.where(valid&(count<=CUTOFF),value,-1).to(tl.int32),mask=ix<ROUTES)
++    tl.store(heavy+ix,tl.where(valid&(count>CUTOFF),value,-1).to(tl.int32),mask=ix<ROUTES)
++
++def partition_routes_scalable(local_ids,experts,cutoff):
++    routes=local_ids.numel()
++    if not (0<routes<=131072 and 0<experts<=256 and cutoff>0):
++        raise ValueError('Unsupported route histogram geometry')
++    if not local_ids.is_cuda or not local_ids.is_contiguous() or local_ids.dtype not in (torch.int32,torch.int64):
++        raise ValueError('Expected contiguous CUDA integer route IDs')
++    if routes<=4096:return partition_routes(local_ids,experts,cutoff)
++    block=2048;tiles=triton.cdiv(routes,block)
++    partials=torch.empty((tiles,experts),dtype=torch.int32,device=local_ids.device)
++    counts=torch.empty((experts,),dtype=torch.int32,device=local_ids.device)
++    light=torch.empty(local_ids.shape,dtype=torch.int32,device=local_ids.device)
++    heavy=torch.empty_like(light)
++    _partial_hist[(tiles,)](local_ids,partials,ROUTES=routes,EXPERTS=experts,BINS=triton.next_power_of_2(experts+1),BLOCK=block,num_warps=4)
++    _reduce_hist[(experts,)](partials,counts,EXPERTS=experts,TILES=tiles,BLOCK=triton.next_power_of_2(tiles),num_warps=4)
++    _classify[(triton.cdiv(routes,256),)](local_ids,counts,light,heavy,ROUTES=routes,EXPERTS=experts,CUTOFF=cutoff,BLOCK=256,num_warps=4)
++    return light,heavy,counts
++
++def _split_large_prefill_expert_outputs(original_helper, layer, x, local_ids, torch, global_experts=None,
++                         *, retain=False, defer_downscale=False):
++    from humming.layer import HummingMethod
++    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
++    from sglang.kernels.ops.activation.activation import silu_and_mul
++    from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
++    def fallback():
++        return original_helper(layer,x,local_ids,torch,retain=retain,
++                               defer_downscale=defer_downscale)
++    if (x.ndim != 2 or local_ids.ndim != 2 or x.dtype != torch.bfloat16
++            or local_ids.dtype not in (torch.int32,torch.int64)
++            or not x.is_cuda or x.device != local_ids.device
++            or not x.is_contiguous() or not local_ids.is_contiguous()
++            or local_ids.shape[0] != x.shape[0]):
++        return fallback()
++    valid = local_ids.numel()
++    experts = layer.w13_post_scale.numel()
++    if (valid == 0 or valid > 131072 or not 0 < experts <= 256
++            or not isinstance(global_experts,int) or isinstance(global_experts,bool)
++            or global_experts < experts or global_experts % experts
++            or layer.w2_post_scale.numel() != experts):
++        return fallback()
++    plan = _choose_large_prefill_configs(layer,valid,global_experts)
++    if plan is None:
++        return fallback()
++    light_ids,heavy_ids,counts = partition_routes_scalable(local_ids,experts,plan['cutoff'])
++    partitions = [('light',light_ids),('heavy',heavy_ids)]
++    aligned = {}
++    def alignment(name,ids,block):
++        key = (name,block)
++        if key not in aligned:
++            aligned[key] = moe_align_block_size(ids,block,experts,ignore_invalid_expert=True)
++        return aligned[key]
++    m,k = x.shape
++    topk = local_ids.shape[1]
++    intermediate = layer.humming_metas['w2'].shape_k
++    cache13 = torch.empty((m*topk*max(2*intermediate,k),),device=x.device,dtype=x.dtype)
++    cache1 = cache13[:m*topk*2*intermediate].view(m*topk,2*intermediate)
++    for name,ids in partitions:
++        config = plan[name]['w13']
++        sorted_ids,expert_ids,padded = alignment(name,ids,config['block_shape'][0])
++        HummingMethod.forward_layer(layer,inputs=x,outputs=cache1,top_k=topk,sublayer_name='w13',
++            tuning_config=config,sorted_ids=sorted_ids,expert_ids=expert_ids,num_tokens_padded=padded,
++            valid_shape_m=valid,compute_config={'gemm_type':'indexed','use_f16_accum':False})
++    # Both up partitions are complete before scaling/activation or down-buffer reuse.
++    scale_active_rows(cache1,local_ids,layer.w13_post_scale)
++    cache2 = torch.empty((m*topk,intermediate),device=x.device,dtype=x.dtype)
++    silu_and_mul(cache1,cache2,expert_ids=local_ids.flatten(),expert_step=1)
++    cache3 = cache13[:m*topk*k].view(m*topk,k)
++    for name,ids in partitions:
++        config = plan[name]['w2']
++        sorted_ids,expert_ids,padded = alignment(name,ids,config['block_shape'][0])
++        HummingMethod.forward_layer(layer,inputs=cache2,outputs=cache3,top_k=1,sublayer_name='w2',
++            tuning_config=config,sorted_ids=sorted_ids,expert_ids=expert_ids,num_tokens_padded=padded,
++            valid_shape_m=valid,compute_config={'gemm_type':'indexed','use_f16_accum':False})
++    if not defer_downscale:
++        scale_active_rows(cache3,local_ids,layer.w2_post_scale)
++    return cache3.view(m,topk,k),local_ids
++
++def _choose_large_prefill_configs(layer, actual_routes, global_experts):
++    # The public wrapper dispatches these routes through the original function.
++    # Retain the original selector semantics too if called directly.
++    if type(actual_routes) is not int:
++        return None
++    if actual_routes <= 4096:
++        return original_choose_partition_configs(layer, actual_routes, global_experts)
++    if (type(actual_routes) is not int or actual_routes > 131072
++            or type(global_experts) is not int or global_experts <= 0):
++        return None
++    try:
++        admitted = getattr(layer, "_humming_large_prefill_configs", None)
++        if type(admitted) is not frozenset or not admitted:
++            return None
++        intervals = layer.fp32_configs
++        if type(intervals) is not dict or set(intervals) != {"w13", "w2"}:
++            return None
++        experts = layer.w13_post_scale.numel()
++        if (type(experts) is not int or not 0 < experts <= 256
++                or layer.w2_post_scale.numel() != experts
++                or global_experts < experts or global_experts % experts):
++            return None
++        tune_m = (actual_routes * experts + global_experts - 1) // global_experts
++        # Reject incomplete/ambiguous interval tables before the scored chooser.
++        for stage in ("w13", "w2"):
++            table = intervals[stage]
++            if not isinstance(table, (list, tuple)) or not table:
++                return None
++            previous_hi = None
++            for entry in table:
++                if not isinstance(entry, (list, tuple)) or len(entry) != 3:
++                    return None
++                lo, hi, config = entry
++                if (type(lo) is not int or type(hi) is not int or lo < 0 or hi <= lo
++                        or type(config) is not dict
++                        or (previous_hi is not None and lo < previous_hi)):
++                    return None
++                previous_hi = hi
++            if any(sum(lo < value <= hi for lo, hi, _ in table) != 1
++                   for value in (actual_routes, tune_m)):
++                return None
++        plan = original_choose_partition_configs(layer, actual_routes, global_experts)
++        if plan is None:
++            return None
++        plan = deepcopy(plan)
++        for stage in ("w13", "w2"):
++            light, heavy = plan["light"][stage], plan["heavy"][stage]
++            for config in (light, heavy):
++                if (config.get("use_f16_accum") is not False
++                        or config.get("use_stream_k") is not False):
++                    return None
++                for key in ("block_shape", "warp_shape"):
++                    shape = config.get(key)
++                    if (not isinstance(shape, (list, tuple)) or len(shape) != 3
++                            or any(type(v) is not int or v <= 0 for v in shape)):
++                        return None
++                if any(b % w for b, w in zip(config["block_shape"], config["warp_shape"])):
++                    return None
++            light["block_shape"] = list(light["block_shape"])
++            light["warp_shape"] = list(light["warp_shape"])
++            light["block_shape"][2] = heavy["block_shape"][2]
++            light["warp_shape"][2] = heavy["warp_shape"][2]
++            if light["block_shape"][0] > heavy["block_shape"][0]:
++                return None
++            for config in (light, heavy):
++                block, warp = config["block_shape"], config["warp_shape"]
++                if any(b % w for b, w in zip(block, warp)):
++                    return None
++                warps = 1
++                for b, w in zip(block, warp):
++                    warps *= b // w
++                ws = config.get("use_warp_spec", False)
++                if ws is not None and type(ws) is not bool:
++                    return None
++                if warps * 32 + (128 if ws is True else 0) > 1024:
++                    return None
++                signature = _large_prefill_config_signature(config)
++                if (stage, signature) not in admitted:
++                    return None
++        # Original distinctness was checked before K repair. Recheck afterward.
++        if all(plan["light"][stage] == plan["heavy"][stage] for stage in ("w13", "w2")):
++            return None
++        plan["cutoff"] = min(plan["light"][stage]["block_shape"][0] for stage in ("w13", "w2"))
++        return plan
++    except (AttributeError, KeyError, TypeError, ValueError, IndexError, StopIteration, OverflowError):
++        # Metadata-only rejection; no GPU work has begun and no launch is retried.
++        return None
++
++
++
++def split_expert_outputs(original_helper, layer, x, local_ids, torch, global_experts=None,
++                         *, retain=False, defer_downscale=False):
++    # Large-route admission is fixed during canonical weight preparation.
++    if (getattr(layer, "_humming_large_prefill_partition_enabled", False) is not True
++            or local_ids.numel() <= 4096):
++        return _original_split_expert_outputs(
++            original_helper, layer, x, local_ids, torch, global_experts,
++            retain=retain, defer_downscale=defer_downscale)
++    return _split_large_prefill_expert_outputs(
++        original_helper, layer, x, local_ids, torch, global_experts,
++        retain=retain, defer_downscale=defer_downscale)
++
++
++def _large_prefill_config_signature(config):
++    """Immutable full tuning signature; list/tuple shapes have equal semantics."""
++    def freeze(value):
++        if isinstance(value, dict):
++            if not all(isinstance(key, str) for key in value):
++                raise TypeError("tuning keys must be strings")
++            return ("dict", tuple((key, freeze(value[key])) for key in sorted(value)))
++        if isinstance(value, (list, tuple)):
++            return ("sequence", tuple(freeze(item) for item in value))
++        if value is None:
++            return ("none",)
++        if type(value) in (bool, int, str):
++            return (type(value).__name__, value)
++        raise TypeError("unsupported tuning value")
++
++    if not isinstance(config, dict):
++        raise TypeError("tuning configuration must be a dictionary")
++    return freeze(config)
++
++
++def prepare_large_prefill_partition(layer, torch):
++    """Admit finite native configurations before any forward/capture.
++
++    This performs host configuration/device-property checks, never kernel build,
++    module load or launch. It is not a native numerical or occupancy guarantee.
++    The caller owns immutable metadata and graph invalidation after preparation.
++    """
++    layer._humming_large_prefill_partition_enabled = False
++    layer._humming_large_prefill_configs = frozenset()
++    try:
++        from copy import deepcopy
++        from dataclasses import fields
++
++        from humming.config import ComputeConfig, LayerConfig, TuningConfig
++        from humming.kernel.humming import HummingKernel
++        from humming.utils.device import fits_device_smem
++
++        metas = layer.humming_metas
++        owned = layer.fp32_configs
++        device = torch.device(layer.w13_post_scale.device)
++        if device.type != "cuda" or layer.w2_post_scale.device != layer.w13_post_scale.device:
++            return False
++        if set(metas) != {"w13", "w2"} or not {"w13", "w2"}.issubset(owned):
++            return False
++        if (metas["w13"].shape_n != 2 * metas["w2"].shape_k
++                or metas["w13"].shape_k != metas["w2"].shape_n
++                or metas["w13"].num_experts != metas["w2"].num_experts):
++            return False
++        for meta in metas.values():
++            if (str(meta.a_dtype) != "bfloat16" or str(meta.c_dtype) != "bfloat16"
++                    or str(meta.b_dtype) != "float4e2m1" or str(meta.bs_dtype) != "float8e4m3"
++                    or meta.input_scale_group_size != 0 or meta.weight_scale_group_size != 16
++                    or meta.has_zero_point or meta.has_bias or meta.use_packed_k_layout):
++                return False
++        admitted = set()
++        with torch.cuda.device(device):
++            props = torch.cuda.get_device_properties(device)
++            sm_version = props.major * 10 + props.minor
++
++            class ValidationKernel(HummingKernel):
++                # KernelRuntime normally caches by CUDA context and compiles in
++                # init_kernel. Bypass both; retain the pinned native validators.
++                def __new__(cls, *args, **kwargs):
++                    return object.__new__(cls)
++
++                def __post_init__(self):
++                    LayerConfig.__post_init__(self)
++                    ComputeConfig.__post_init__(self)
++                    TuningConfig.__post_init__(self)
++                    self.sm_version = sm_version
++                    self.sm_version_str = str(sm_version) + ("a" if sm_version >= 90 else "")
++                    self.check_shape()
++                    self.check_dtype()
++                    self.check_scale()
++                    self.check_config()
++                    self.mma_op_class = self.select_mma_op_class()
++
++                def prepare(self):
++                    raise RuntimeError("configuration admission cannot compile")
++
++                def load_cubin(self):
++                    raise RuntimeError("configuration admission cannot load a module")
++
++            for stage in ("w13", "w2"):
++                intervals = owned[stage]
++                if not isinstance(intervals, (list, tuple)) or not 0 < len(intervals) <= 256:
++                    return False
++                metadata = {
++                    field.name: getattr(metas[stage], field.name)
++                    for field in fields(LayerConfig) if field.init
++                }
++                configs = {}
++                for interval in intervals:
++                    if not isinstance(interval, (list, tuple)) or len(interval) != 3:
++                        return False
++                    config = interval[2]
++                    configs[_large_prefill_config_signature(config)] = deepcopy(config)
++                checked = {}
++
++                def legal(config):
++                    signature = _large_prefill_config_signature(config)
++                    if signature in checked:
++                        return checked[signature]
++                    checked[signature] = False
++                    if len(checked) > 1024:
++                        return False
++                    if config.get("use_f16_accum") is not False or config.get("use_stream_k") is not False:
++                        return False
++                    for name in ("num_ctas_per_sm", "num_write_splits"):
++                        count = config.get(name, 1)
++                        if type(count) is not int or count < 1:
++                            return False
++                    for name in ("block_shape", "warp_shape"):
++                        shape = config.get(name)
++                        if not isinstance(shape, (list, tuple)) or len(shape) != 3:
++                            return False
++                        if any(type(value) is not int or value <= 0 for value in shape):
++                            return False
++                    # Keep layer format and compute contract owned by metadata.
++                    tuning_names = {field.name for field in fields(TuningConfig) if field.init}
++                    if set(config) - tuning_names - {"num_sms", "use_f16_accum"}:
++                        return False
++                    launch_sms = config.get("num_sms", 0)
++                    if type(launch_sms) is not int or launch_sms < 0:
++                        return False
++                    values = dict(metadata)
++                    values.update(gemm_type="indexed", use_f16_accum=False)
++                    values.update(deepcopy(config))
++                    values.pop("num_sms", None)
++                    try:
++                        validator = ValidationKernel(**values)
++                        max_threads = getattr(props, "max_threads_per_block", 1024)
++                        valid = (
++                            0 < validator.num_threads <= max_threads
++                            and validator.use_f16_accum is False
++                            and validator.use_stream_k is False
++                            and fits_device_smem(validator, validator, validator, device)
++                        )
++                    except Exception:
++                        return False
++                    checked[signature] = bool(valid)
++                    return bool(valid)
++
++                # Validate all unchanged heavy configurations first. Only their
++                # K topologies may produce repaired light candidates.
++                heavy_k = set()
++                stage_admitted = set()
++                for signature, config in configs.items():
++                    if legal(config):
++                        stage_admitted.add((stage, signature))
++                        heavy_k.add((config["block_shape"][2], config["warp_shape"][2]))
++                if not heavy_k or len(heavy_k) > 16:
++                    return False
++                eligible_pair = False
++                for config in configs.values():
++                    for block_k, warp_k in heavy_k:
++                        repaired = deepcopy(config)
++                        repaired["block_shape"] = list(repaired["block_shape"])
++                        repaired["warp_shape"] = list(repaired["warp_shape"])
++                        repaired["block_shape"][2] = block_k
++                        repaired["warp_shape"][2] = warp_k
++                        if legal(repaired):
++                            stage_admitted.add((stage, _large_prefill_config_signature(repaired)))
++                            eligible_pair = True
++                if not eligible_pair:
++                    return False
++                admitted.update(stage_admitted)
++        layer._humming_large_prefill_configs = frozenset(admitted)
++        layer._humming_large_prefill_partition_enabled = True
++        return True
++    except Exception:
++        # Missing or changed installed Humming APIs retain the scored helper.
++        return False
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py b/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py
+--- a/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py
++++ b/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py
+@@ -14,6 +14,8 @@
+     s_ptr,
+     out_ptr,
+     ids_ptr,
++    scale_ptr,
++    HAS_SCALE: tl.constexpr,
+     TOPK: tl.constexpr,
+     H: tl.constexpr,
+     eps,
+@@ -36,10 +38,16 @@
+     for k in tl.static_range(TOPK):
+         base = (tok * TOPK + k) * H
+         live = True
++        expert_id = -1
+         if HAS_IDS:
+-            live = tl.load(ids_ptr + tok * TOPK + k) >= 0
++            expert_id = tl.load(ids_ptr + tok * TOPK + k)
++            live = expert_id >= 0
+         if live:
+             x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
++            if HAS_SCALE:
++                scale = tl.load(scale_ptr + expert_id).to(tl.float32)
++                # Preserve BF16 multiplication before FP32 norm/reduction.
++                x = (x * scale).to(tl.bfloat16).to(tl.float32)
+ 
+             if APPLY_NORM:
+                 if HAS_WEIGHT and WEIGHT_FIRST:
+@@ -64,6 +72,90 @@
+     tl.store(out_ptr + tok * H + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+ 
+ 
++# Two-phase work decomposition inspired by muse-okc-submissions' MoE bs1
++# redesign (github.com/gauravjain14/muse-okc-submissions) and our standalone
++# decode work: parallelize independent expert
++# reductions, then distribute the combine over output tiles. No weight repack
++# or change to the precision / ordering of the per-slot weighted sum is needed.
++@triton.jit
++def _post_expert_inv_rms_kernel(
++    x_ptr,
++    w_ptr,
++    ids_ptr,
++    inv_ptr,
++    scale_ptr,
++    HAS_SCALE: tl.constexpr,
++    TOPK: tl.constexpr,
++    H: tl.constexpr,
++    eps,
++    HAS_WEIGHT: tl.constexpr,
++    WEIGHT_FIRST: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++):
++    slot = tl.program_id(0)
++    expert_id = tl.load(ids_ptr + slot)
++    live = expert_id >= 0
++    inv = 0.0
++    if live:
++        offs = tl.arange(0, BLOCK_H)
++        x = tl.load(x_ptr + slot * H + offs, mask=offs < H, other=0.0).to(tl.float32)
++        if HAS_SCALE:
++            scale = tl.load(scale_ptr + expert_id).to(tl.float32)
++            # Preserve BF16 multiplication before FP32 norm/reduction.
++            x = (x * scale).to(tl.bfloat16).to(tl.float32)
++        if HAS_WEIGHT and WEIGHT_FIRST:
++            w = tl.load(w_ptr + offs, mask=offs < H, other=0.0).to(tl.float32)
++            x = x * w
++        var = tl.sum(x * x, axis=0) / H
++        inv = tl.rsqrt(var + eps)
++    tl.store(inv_ptr + slot, inv)
++
++
++@triton.jit
++def _post_expert_tiled_combine_kernel(
++    x_ptr,
++    w_ptr,
++    s_ptr,
++    ids_ptr,
++    inv_ptr,
++    out_ptr,
++    scale_ptr,
++    HAS_SCALE: tl.constexpr,
++    TOPK: tl.constexpr,
++    H: tl.constexpr,
++    HAS_WEIGHT: tl.constexpr,
++    WEIGHT_FIRST: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    tok = tl.program_id(0)
++    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    if HAS_WEIGHT:
++        w = tl.load(w_ptr + offs, mask=offs < H, other=0.0).to(tl.float32)
++    acc = tl.zeros([BLOCK], tl.float32)
++    for k in tl.static_range(TOPK):
++        slot = tok * TOPK + k
++        expert_id = tl.load(ids_ptr + slot)
++        live = expert_id >= 0
++        if live:
++            x = tl.load(x_ptr + slot * H + offs, mask=offs < H, other=0.0).to(
++                tl.float32
++            )
++            if HAS_SCALE:
++                scale = tl.load(scale_ptr + expert_id).to(tl.float32)
++                # Preserve BF16 multiplication before FP32 norm/reduction.
++                x = (x * scale).to(tl.bfloat16).to(tl.float32)
++            inv = tl.load(inv_ptr + slot)
++            if HAS_WEIGHT and WEIGHT_FIRST:
++                y = (x * w) * inv
++            elif HAS_WEIGHT:
++                y = (x * inv) * w
++            else:
++                y = x * inv
++            score = tl.load(s_ptr + slot).to(tl.float32)
++            acc += y * score
++    tl.store(out_ptr + tok * H + offs, acc.to(out_ptr.dtype.element_ty), mask=offs < H)
++
++
+ def fused_post_expert_norm_weighted_sum(
+     expert_output: torch.Tensor,
+     topk_scores: torch.Tensor,
+@@ -73,6 +165,7 @@
+     apply_norm: bool = True,
+     slot_expert_ids: Optional[torch.Tensor] = None,
+     round_product: bool = False,
++    expert_output_scale: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """Normalize and combine experts without reading inactive slots.
+ 
+@@ -81,6 +174,21 @@
+     """
+     x = expert_output.contiguous()
+     tokens, topk, hidden = x.shape
++    if expert_output_scale is not None:
++        if slot_expert_ids is None:
++            raise ValueError("Expert output scales require local slot IDs")
++        if x.dtype != torch.bfloat16 or expert_output_scale.dtype != torch.bfloat16:
++            raise TypeError("Fused expert output scaling requires BF16 tensors")
++        if expert_output_scale.ndim != 1 or expert_output_scale.numel() == 0:
++            raise ValueError("Expected a nonempty scale vector")
++        if not expert_output_scale.is_contiguous():
++            raise ValueError("Expert output scales must be contiguous")
++        if slot_expert_ids.dtype not in (torch.int32, torch.int64):
++            raise TypeError("Local expert IDs must be integer tensors")
++        if slot_expert_ids.numel() != tokens * topk:
++            raise ValueError("Expected one local expert ID per output slot")
++        if not x.is_cuda or not x.device == slot_expert_ids.device == expert_output_scale.device:
++            raise ValueError("Outputs, local IDs and scales must share one CUDA device")
+     out = torch.empty((tokens, hidden), dtype=x.dtype, device=x.device)
+     if tokens == 0:
+         return out
+@@ -103,12 +211,62 @@
+         return y.sum(dim=1).to(x.dtype)
+ 
+     block_h = triton.next_power_of_2(hidden)
++    # The one-CTA-per-token kernel serializes TOPK full-width reductions and
++    # leaves most SMs idle for small routed batches. Keep its path for larger
++    # batches and uncommon arithmetic modes, where an extra launch may lose.
++    if (
++        x.is_cuda
++        and 2 <= tokens <= 8
++        and 2 <= topk <= 32
++        and 1024 <= hidden <= 16384
++        and slot_expert_ids is not None
++        and apply_norm
++        and not round_product
++    ):
++        ids = slot_expert_ids.contiguous()
++        weight = norm_weight.contiguous() if norm_weight is not None else x
++        inv = torch.empty((tokens * topk,), device=x.device, dtype=torch.float32)
++        _post_expert_inv_rms_kernel[(tokens * topk,)](
++            x,
++            weight,
++            ids,
++            inv,
++            expert_output_scale if expert_output_scale is not None else x,
++            HAS_SCALE=expert_output_scale is not None,
++            TOPK=topk,
++            H=hidden,
++            eps=eps,
++            HAS_WEIGHT=norm_weight is not None,
++            WEIGHT_FIRST=weight_first,
++            BLOCK_H=block_h,
++            num_warps=8 if block_h >= 4096 else 4,
++            num_stages=2,
++        )
++        _post_expert_tiled_combine_kernel[(tokens, triton.cdiv(hidden, 256))](
++            x,
++            weight,
++            topk_scores.contiguous(),
++            ids,
++            inv,
++            out,
++            expert_output_scale if expert_output_scale is not None else x,
++            HAS_SCALE=expert_output_scale is not None,
++            TOPK=topk,
++            H=hidden,
++            HAS_WEIGHT=norm_weight is not None,
++            WEIGHT_FIRST=weight_first,
++            BLOCK=256,
++            num_warps=4,
++        )
++        return out
+     _post_expert_norm_weighted_sum_kernel[(tokens,)](
+         x,
+         norm_weight.contiguous() if norm_weight is not None else x,
+         topk_scores.contiguous(),
+         out,
+         slot_expert_ids.contiguous() if slot_expert_ids is not None else x,
++        expert_output_scale if expert_output_scale is not None else x,
++        HAS_SCALE=expert_output_scale is not None,
+         TOPK=topk,
+         H=hidden,
+         eps=eps,
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -407,9 +407,10 @@
+         )
+ 
+     def _compute_scheduler_metadata(
+-        self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
++        self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q,
++        max_seq_len_q=1,
+     ):
+-        """Compute FA3 scheduler metadata for decode.
++        """Compute FA3 scheduler metadata for causal full attention.
+ 
+         Returns the scheduler_metadata tensor, or None if not applicable.
+         """
+@@ -421,7 +422,7 @@
+         # consumed by non-SWA layers (SWA layers skip it in forward_decode).
+         return self._get_scheduler_metadata(
+             batch_size=batch_size,
+-            max_seqlen_q=1,
++            max_seqlen_q=max_seq_len_q,
+             max_seqlen_k=max_seq_len_k,
+             num_heads=self.num_attention_heads,
+             num_heads_k=self.num_kv_heads,
+@@ -433,6 +434,25 @@
+             causal=True,
+             has_softcap=self.has_softcap,
+             num_splits=self.num_splits,
++        )
++
++    def _compute_verify_scheduler_metadata(self, metadata, batch_size):
++        # Local and distributed attention can change the effective geometry.
++        # Retain their per-layer scheduler path.
++        if (
++            self.local_attn_builder is not None
++            or self._kv_shard_pool is not None
++            or self.topk > 1
++        ):
++            return None
++        return self._compute_scheduler_metadata(
++            batch_size,
++            # FA3 derives its maximum K extent from this same paged-table
++            # capacity. A shorter live host bound can change metadata shape.
++            metadata.page_table.shape[1] * self.page_size,
++            metadata.cache_seqlens_int32,
++            metadata.cu_seqlens_q,
++            max_seq_len_q=metadata.max_seq_len_q,
+         )
+ 
+     def validate_elastic_cuda_graph_recapture(self) -> None:
+@@ -720,6 +740,17 @@
+                         self._sched_meta_buf[n:] = 0
+                         metadata.scheduler_metadata = self._sched_meta_buf[:n]
+ 
++            if forward_mode.is_target_verify() and self.topk <= 1:
++                metadata = self.target_verify_metadata[bs]
++                if self._verify_sched_meta_buf is not None:
++                    sched = self._compute_verify_scheduler_metadata(metadata, bs)
++                    if sched is not None:
++                        n = sched.numel()
++                        assert n <= self._verify_sched_meta_buf.numel()
++                        self._verify_sched_meta_buf[:n].copy_(sched)
++                        self._verify_sched_meta_buf[n:].zero_()
++                        metadata.scheduler_metadata = self._verify_sched_meta_buf[:n]
++
+             if forward_mode.is_draft_extend_v2():
+                 # CUDA graph bakes max_seq_len_q as a constant. replay() sets it to
+                 # max(num_accept_tokens_cpu) which is None/empty at capture time,
+@@ -1368,6 +1399,12 @@
+                 )
+                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
+ 
++        # The page table must already have been converted to pages, so
++        # scheduler capacity matches the table passed to FA3 exactly.
++        if forward_batch.forward_mode.is_target_verify() and self.topk <= 1:
++            metadata.scheduler_metadata = self._compute_verify_scheduler_metadata(
++                metadata, batch_size
++            )
+         self.forward_metadata = metadata
+ 
+     def get_paged_mha_kv_cache(
+@@ -1786,6 +1823,29 @@
+                     **kwargs,
+                 )
+             else:
++                # Only reuse a scheduler for exactly the geometry it describes.
++                # SWA, cross/local attention and custom masks retain stock paths.
++                sched_meta = None
++                if (
++                    forward_batch.forward_mode.is_target_verify()
++                    and self.topk <= 1
++                    and metadata.scheduler_metadata is not None
++                    and causal
++                    and not is_swa_layer
++                    and not use_local_attn
++                    and not layer.is_cross_attention
++                    and sinks is None
++                    and score_mod is None
++                    and rel_bias is None
++                    and metadata.image_token_ranges is None
++                    and q.dtype == self.kv_cache_dtype
++                    and layer.tp_q_head_num == self.num_attention_heads
++                    and layer.tp_k_head_num == self.num_kv_heads
++                    and layer.head_dim == self.head_dim
++                    and layer.v_head_dim == self.head_dim
++                    and bool(layer.logit_cap > 0) == self.has_softcap
++                ):
++                    sched_meta = metadata.scheduler_metadata
+                 result = flash_attn_with_kvcache(
+                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                     k_cache=key_cache,
+@@ -1794,6 +1854,7 @@
+                     cache_seqlens=cache_seqlens,
+                     cu_seqlens_q=cu_seqlens_q,
+                     cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
++                    scheduler_metadata=sched_meta,
+                     max_seqlen_q=max_seqlen_q,
+                     softmax_scale=layer.scaling,
+                     causal=False if use_cascade_attn else causal,
+@@ -2457,8 +2518,14 @@
+             self._sched_meta_buf = torch.zeros(
+                 1 + b_rounded * 4, dtype=torch.int32, device=self.device
+             )
++            # Verify has max_seqlen_q > 1 and needs four rounded vectors.
++            # Keep its storage separate from decode's captured views.
++            self._verify_sched_meta_buf = torch.zeros(
++                1 + b_rounded * 4, dtype=torch.int32, device=self.device
++            )
+         else:
+             self._sched_meta_buf = None
++            self._verify_sched_meta_buf = None
+ 
+         if self.local_attn_builder is not None:
+             self.decode_cuda_graph_local_attn_metadata = (
+@@ -3185,12 +3252,18 @@
+                     verify_lens = seq_lens
+                     verify_delta = self.speculative_num_draft_tokens
+ 
+-                # Page table built on-device (self-guards on cache_seqlens);
+-                # max_seq_len_k left unset -- unread here (scheduler_metadata is
+-                # normal-decode-only).
++                # Both attention and its scheduler use the page-table capacity;
++                # live lengths remain device data and need no host maximum.
+                 self._set_decode_page_metadata(
+                     plan, metadata, req_pool_indices, verify_lens, verify_delta
+                 )
++                if metadata.scheduler_metadata is not None:
++                    sched = self._compute_verify_scheduler_metadata(metadata, bs)
++                    if sched is not None:
++                        n = sched.numel()
++                        assert n == metadata.scheduler_metadata.numel()
++                        self._verify_sched_meta_buf[:n].copy_(sched)
++                        self._verify_sched_meta_buf[n:].zero_()
+             else:
+                 # When topk > 1, we need two specific target verify metadata, and then merge states
+                 # 1. The first half of metadata for prefix tokens
+diff --git a/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py b/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
+--- a/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
++++ b/python/sglang/srt/layers/communication/muse_spark_gemm_ag.py
+@@ -69,3 +69,99 @@
+     if out is None:
+         out = torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
+     return all_gather(comm, local, out, b, c)
++
++
++def prefill_row_projection_supported(group, x, weight) -> bool:
++    """A large replicated projection with equal contiguous token-row shards."""
++    if group is None or group.world_size not in (2, 4, 8):
++        return False
++    if not x.is_cuda or x.ndim != 2 or weight.ndim != 2:
++        return False
++    if x.dtype != torch.bfloat16 or weight.dtype != x.dtype:
++        return False
++    if weight.device != x.device or not weight.is_contiguous():
++        return False
++    m, k = x.shape
++    n = weight.shape[0]
++    return (
++        torch.cuda.get_device_capability(x.device) == (9, 0)
++        and m >= 512
++        and m % group.world_size == 0
++        and min(k, n) >= 1024
++        and k == weight.shape[1]
++        and k % 128 == 0
++        and n % 128 == 0
++    )
++
++
++def prefill_row_projection(group, x, weight):
++    """Compute full output rows once, then gather in original token order.
++
++    Input and weights must be replicated on the TP group. The complete K
++    reduction and full output dimension remain local, with FP32 output before
++    the single BF16 rounding. No persistent repacked weight or padding exists.
++    """
++    m_local = x.shape[0] // group.world_size
++    start = group.rank_in_group * m_local
++    local_fp32 = torch.mm(
++        x[start : start + m_local], weight.t(), out_dtype=torch.float32
++    )
++    local = local_fp32.to(x.dtype)
++    del local_fp32
++    return group.all_gather(local, dim=0)
++
++
++def small_projection_supported(group, x, weight) -> bool:
++    """Hopper column shards through an already-reserved multicast workspace."""
++    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
++        CustomAllReduceV2,
++    )
++
++    if group is None or group.world_size not in (2, 4, 8):
++        return False
++    comm = group.ca_comm
++    if (
++        not isinstance(comm, CustomAllReduceV2)
++        or comm.disabled
++        or not comm.has_multicast
++        or comm.world_size != group.world_size
++    ):
++        return False
++    if not x.is_cuda or x.ndim != 2 or weight.ndim != 2:
++        return False
++    if x.dtype != torch.bfloat16 or weight.dtype != x.dtype:
++        return False
++    if weight.device != x.device or not weight.is_contiguous():
++        return False
++    m, k = x.shape
++    n = weight.shape[0]
++    return (
++        torch.cuda.get_device_capability(x.device) == (9, 0)
++        and 1 <= m < 512
++        and min(k, n) >= 1024
++        and k == weight.shape[1]
++        and k % 128 == 0
++        and n % (128 * group.world_size) == 0
++        and m * n * 2 <= comm.max_push_size
++        and comm.config.num_push_blocks >= 2
++    )
++
++
++def small_projection_local(comm, x, weight):
++    """Complete K reductions for this rank's contiguous output columns."""
++    n_local = weight.shape[0] // comm.world_size
++    start = comm.rank * n_local
++    local_fp32 = torch.mm(
++        x, weight[start : start + n_local].t(), out_dtype=torch.float32
++    )
++    return local_fp32.to(x.dtype)
++
++
++def small_projection(group, x, weight):
++    """Gather complete BF16 columns without an intermediate layout copy."""
++    comm = group.ca_comm
++    local = small_projection_local(comm, x, weight)
++    output = torch.empty(
++        x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device
++    )
++    return all_gather(comm, local, output)
+diff --git a/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py b/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
+--- a/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
++++ b/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
+@@ -130,7 +130,12 @@
+         self.dispatcher = _DirectDispatcher()
+ 
+         capability = get_device_capability() if is_cuda() else None
+-        self.use_marlin = self.moe_runner_backend.is_marlin()
++        self.use_humming = self.moe_runner_backend.is_humming()
++        if self.use_humming and self.params_dtype != torch.bfloat16:
++            raise ValueError("Muse NVFP4 Humming requires BF16 activations")
++        # Shared BF16 activation/finalization semantics also disable early FP4
++        # activation quantization and preserve the existing projection guards.
++        self.use_marlin = self.moe_runner_backend.is_marlin() or self.use_humming
+         self._sm_major = capability[0] if capability is not None else 0
+         if not self.use_marlin and capability is not None and capability < (10, 0):
+             raise ValueError(
+@@ -175,6 +180,13 @@
+                 num_local_experts, dtype=torch.int32
+             )
+         self.register_buffer("_expert_map", expert_map, persistent=False)
++        # Derived from the fixed expert map; not part of model checkpoints.
++        expert_lookup = (
++            None
++            if expert_map is None
++            else torch.cat((expert_map.new_full((1,), -1), expert_map))
++        )
++        self.register_buffer("_expert_lookup", expert_lookup, persistent=False)
+ 
+         self.quant_method = MuseSparkNvFp4FusedMoEMethod(quant_config)
+         if not self.use_marlin and not self.quant_method.enable_flashinfer_trtllm_moe:
+@@ -209,7 +221,7 @@
+         behaviour change for it; a ``False`` export would previously have been
+         mis-scaled by the hardcoded weight-first form.
+ 
+-        ``post_expert_norm`` is *not* registered as a submodule — it already
++        ``post_expert_norm`` is *not* registered as a submodule â€” it already
+         belongs to the parent block, so registering it here would duplicate its
+         weight in ``state_dict`` and create a reference cycle.
+         """
+@@ -229,7 +241,7 @@
+             weight = torch.ones(
+                 self.hidden_size,
+                 dtype=torch.bfloat16,
+-                device=self.gate_up_proj.device,
++                device=next(self.parameters()).device,
+             )
+         object.__setattr__(self, "_post_expert_norm", post_expert_norm)
+         self._post_expert_norm_weight = weight.detach().to(torch.bfloat16)
+@@ -377,21 +389,63 @@
+         )
+         return output.to(out_dtype)
+ 
++    @torch.no_grad()
++    def refresh_expert_lookup_(self) -> None:
++        """Refresh after map edits, before consumers on the ordered CUDA stream.
++
++        Preserves captured storage. Replacing/moving buffers requires graph
++        recapture; direct map mutations are not automatically detected.
++        """
++        if self._expert_map is not None:
++            self._expert_lookup[0].fill_(-1)
++            self._expert_lookup[1:].copy_(self._expert_map)
++
++    @torch.no_grad()
++    def update_expert_map_(self, mapping: torch.Tensor) -> None:
++        """Update fixed-shape routing metadata without replacing graph inputs."""
++        if self._expert_map is None:
++            raise ValueError("Mapping cannot be enabled without reconstructing the module")
++        if (
++            mapping.shape != self._expert_map.shape
++            or mapping.dtype != torch.int32
++            or mapping.device != self._expert_map.device
++        ):
++            raise ValueError("Expert map update must preserve shape, int32 dtype and device")
++        self._expert_map.copy_(mapping)
++        self.refresh_expert_lookup_()
++
+     def _marlin_expert_outputs(
+         self,
+         hidden_states: torch.Tensor,
+         topk_scores: torch.Tensor,
+         topk_ids: torch.Tensor,
++        *,
++        defer_downscale: bool = False,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         """Project local routes; finalization skips undefined inactive slots."""
++        if self.use_humming:
++            from sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe import (
++                _humming_expert_outputs,
++            )
++
++            local_ids = topk_ids.to(torch.int32)
++            if self._expert_map is not None:
++                local_ids = self._expert_lookup[local_ids.clamp_min(-1) + 1]
++            return _humming_expert_outputs(
++                self._humming_layer, hidden_states.contiguous(),
++                local_ids.contiguous(), torch,
++                defer_downscale=defer_downscale,
++                global_experts=self.global_num_experts,
++            )
++
+         from sgl_kernel.scalar_type import scalar_types
+ 
+         from sglang.kernels.ops.activation.activation import silu_and_mul
+-        from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
++        from sglang.kernels.ops.moe.adaptive_marlin_tiles import (
++            adaptive_gemm as moe_wna16_marlin_gemm,
++            prepare_adaptive_alignment,
++        )
+         from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+-        from sglang.srt.layers.moe.token_dispatcher.standard import (
+-            _map_topk_ids_to_local_experts,
+-        )
+         from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+ 
+         hidden_states = hidden_states.contiguous()
+@@ -401,41 +455,83 @@
+         gemm1_n = 2 * size_n
+         expert_map = self._expert_map
+ 
+-        local_topk_ids = topk_ids.to(torch.int32)
+-        if expert_map is not None:
+-            local_topk_ids = _map_topk_ids_to_local_experts(local_topk_ids, expert_map)
+-        local_topk_ids = local_topk_ids.contiguous()
++        from sglang.kernels.ops.moe.moe_align_small_numel import (
++            SMALL_NUMEL_LIMIT,
++            moe_align_small_numel,
++        )
++
++        fuse_mapping = (
++            expert_map is not None
++            and hidden_states.is_cuda
++            and topk_ids.is_contiguous()
++            and expert_map.is_contiguous()
++            and 0 < topk_ids.numel() <= SMALL_NUMEL_LIMIT
++        )
++        if fuse_mapping:
++            local_topk_ids = torch.empty_like(topk_ids, dtype=torch.int32)
++        else:
++            local_topk_ids = topk_ids.to(torch.int32)
++            if expert_map is not None:
++                local_topk_ids = self._expert_lookup[
++                    local_topk_ids.clamp_min(-1) + 1
++                ]
++            local_topk_ids = local_topk_ids.contiguous()
+         topk_weights = topk_scores.to(torch.float32).contiguous()
+ 
+         for block_size_m in _MARLIN_BLOCK_SIZE_M_CANDIDATES:
+             if num_tokens * topk / self.num_local_experts / block_size_m < 0.9:
+                 break
+ 
+-        if num_tokens == 1 and topk <= 32 and expert_map is None:
++        if fuse_mapping:
++            # Every route can occupy its own padded block, including sentinels.
++            # Fuse conversion, sentinel-preserving EP mapping and alignment.
++            num_routes = topk_ids.numel()
++            sorted_token_ids = torch.empty(
++                num_routes * block_size_m, device=topk_ids.device, dtype=torch.int32
++            )
++            expert_ids = torch.empty(
++                num_routes, device=topk_ids.device, dtype=torch.int32
++            )
++            num_tokens_post_padded = torch.empty(
++                1, device=topk_ids.device, dtype=torch.int32
++            )
++            moe_align_small_numel(
++                topk_ids.contiguous(),
++                self.num_local_experts + 1,
++                block_size_m,
++                sorted_token_ids,
++                expert_ids,
++                num_tokens_post_padded,
++                expert_map=expert_map,
++                local_topk_ids=local_topk_ids,
++            )
++        elif num_tokens == 1 and topk <= 32:
+             from sglang.kernels.ops.moe.moe_align_single_token import (
+                 moe_align_single_token,
+             )
+ 
+             sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                 moe_align_single_token(
+-                    local_topk_ids, block_size_m, return_inactive_prefix_count=True
++                    local_topk_ids,
++                    block_size_m,
++                    return_inactive_prefix_count=expert_map is None,
+                 )
+             )
+         else:
+-            align_num_experts = (
+-                self.global_num_experts
+-                if expert_map is not None
+-                else self.num_local_experts
+-            )
+             sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                 local_topk_ids,
+                 block_size_m,
+-                align_num_experts,
++                self.num_local_experts,
+                 return_inactive_prefix_count=expert_map is None,
+             )
+ 
+         # Both aligners emit ascending block IDs with inactive blocks first;
+         # no expert remapping occurs after this ordering is established.
++        adaptive_tables = prepare_adaptive_alignment(
++            local_topk_ids, block_size_m, self.num_local_experts,
++            num_tokens_post_padded, expert_map is not None, sorted_token_ids,
++            small_block=32,
++        )
+         workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
+         cache2 = torch.empty(
+             (num_tokens * topk, size_n),
+@@ -479,6 +575,8 @@
+             is_zp_float=False,
+             expert_ids_are_sorted=True,
+             has_inactive_prefix_count=expert_map is None,
++            adaptive_tables=adaptive_tables,
++            adaptive_block=32,
+         )
+         silu_and_mul(
+             cache1.view(-1, gemm1_n),
+@@ -515,6 +613,8 @@
+             is_zp_float=False,
+             expert_ids_are_sorted=True,
+             has_inactive_prefix_count=expert_map is None,
++            adaptive_tables=adaptive_tables,
++            adaptive_block=32,
+         ).view(num_tokens, topk, size_k), local_topk_ids
+ 
+     def _forward_marlin(
+@@ -538,8 +638,14 @@
+             )
+         if pre_expert_norm is not None:
+             hidden_states = pre_expert_norm(hidden_states)
++        # Recognize the current norm before deciding whether scaling can be
++        # deferred. Generic norm fallback and direct helper calls remain scaled.
++        if self.use_humming and self._post_expert_norm is not post_expert_norm:
++            self.set_post_expert_norm(post_expert_norm)
++        defer_downscale = self.use_humming and self._post_expert_norm_weight is not None
+         expert_outputs, local_topk_ids = self._marlin_expert_outputs(
+-            hidden_states, topk_scores, topk_ids
++            hidden_states, topk_scores, topk_ids,
++            defer_downscale=defer_downscale,
+         )
+         if self._post_expert_norm is not post_expert_norm:
+             self.set_post_expert_norm(post_expert_norm)
+@@ -551,6 +657,9 @@
+                 eps=self._post_expert_norm_eps,
+                 weight_first=self._post_expert_norm_weight_first,
+                 slot_expert_ids=local_topk_ids,
++                expert_output_scale=(
++                    self._humming_layer.w2_post_scale if defer_downscale else None
++                ),
+             )
+         return finalize_identity_with_post_expert_norm(
+             expert_outputs=expert_outputs,
+diff --git a/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py b/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
+--- a/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
++++ b/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
+@@ -84,6 +84,21 @@
+ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
+     """Prepare Muse FP4 experts without process-global mutation or duplication."""
+ 
++    def __init__(self, quant_config):
++        from sglang.srt.layers.moe import get_moe_runner_backend
++        from sglang.srt.utils.common import get_device_capability, is_cuda
++
++        backend = get_moe_runner_backend()
++        if not backend.is_humming():
++            super().__init__(quant_config)
++            return
++        if not is_cuda() or not (8, 0) <= get_device_capability() < (10, 0):
++            raise ValueError("Muse NVFP4 Humming W4A16 requires SM80-SM90")
++        self.quant_config = quant_config
++        self._lora_marlin = False
++        self.enable_flashinfer_trtllm_moe = False
++        self.use_flashinfer_trtllm_weight_layout = False
++        self._cache_permute_indices = {}
+     def create_weights(
+         self,
+         layer,
+@@ -138,9 +153,25 @@
+                 delattr(layer, native)
+         return result
+ 
++    def _process_weights_for_humming(self, layer):
++        from types import SimpleNamespace
++
++        raw = SimpleNamespace()
++        for alias, native in self._MARLIN_PARAM_ALIASES:
++            setattr(raw, alias, getattr(layer, native))
++        # Match stock Marlin's gate/up global-scale collapse exactly.
++        if raw.w13_weight_scale_2.dim() > 1:
++            raw.w13_weight_scale_2 = raw.w13_weight_scale_2[:, 0].contiguous()
++        layer._humming_layer = _prepare_humming_experts(raw, torch)
++        # Only the canonical Humming packed tensors remain resident.
++        for _, native in self._MARLIN_PARAM_ALIASES:
++            delattr(layer, native)
++
+     def process_weights_after_loading(self, layer):
+         """Prepare the TRT-LLM layout from native HF parameters in place."""
+         backend = getattr(self, "_moe_runner_backend", None)
++        if backend is not None and backend.is_humming():
++            return self._process_weights_for_humming(layer)
+         if backend is not None and backend.is_marlin():
+             return self._process_weights_for_marlin(layer)
+         input_scale = layer.gate_up_proj_input_scale.max().float()
+@@ -192,3 +223,113 @@
+     "MuseSparkNvFp4FusedMoEMethod",
+     "_align_fp4_moe_weights_for_flashinfer_trtllm",
+ ]
++
++
++def _prepare_humming_experts(raw, torch):
++    """Pack one canonical NVFP4 layout with FP8 block scales.
++
++The caller validates aligned shapes, allowing repacking without redundant
++zero-padding copies. Global scales are applied after each BF16 GEMM output
++to preserve the stock Marlin rounding boundary. Tuning overrides are owned
++by this layer; Humming's cached defaults remain unchanged."""
++    from humming import dtypes
++    from humming.config import WeightScale2Type, WeightScaleType
++    from humming.layer import HummingMethod
++    from humming.schema import HummingInputSchema, HummingWeightSchema
++    layer = torch.nn.Module()
++    for prefix in ('w13', 'w2'):
++        w = getattr(raw, prefix + '_weight')
++        sf = getattr(raw, prefix + '_weight_scale')
++        gs = getattr(raw, prefix + '_weight_scale_2')
++        e, n, k2 = w.shape
++        if w.dtype != torch.uint8 or sf.dtype != torch.float8_e4m3fn:
++            raise ValueError('Humming NVFP4 requires uint8 codes and FP8 scales')
++        if n % 64 or k2 * 2 % 64 or sf.shape != (e, n, k2 * 2 // 16):
++            raise ValueError('Humming NVFP4 requires aligned shapes and group size 16')
++        if gs.ndim != 1 or gs.shape[0] != e:
++            raise ValueError('Humming NVFP4 requires one global scale per expert')
++        layer.register_parameter(prefix + '_weight', torch.nn.Parameter(w.contiguous().view(torch.int32), requires_grad=False))
++        layer.register_parameter(prefix + '_weight_scale', torch.nn.Parameter(sf.contiguous(), requires_grad=False))
++        layer.register_buffer(prefix + '_post_scale', gs.to(torch.bfloat16).contiguous())
++        schema = HummingWeightSchema(b_dtype=dtypes.float4e2m1, bs_dtype=dtypes.float8e4m3, weight_scale_group_size=16, weight_scale_type=WeightScaleType.GROUP, weight_scale_2_type=WeightScale2Type.NONE)
++        meta = HummingMethod.prepare_layer_meta(layer, shape_n=n, shape_k=k2 * 2, weight_schema=schema, input_schema=HummingInputSchema(a_dtype=dtypes.bfloat16), num_experts=e, torch_dtype=torch.bfloat16, sublayer_name=prefix)
++        assert meta.a_dtype == dtypes.bfloat16 and meta.c_dtype == dtypes.bfloat16
++        assert not meta.use_int_weight_scale and (not meta.has_input_scale)
++        HummingMethod.transform_humming_layer(layer, sublayer_name=prefix, already_padded=True)
++    layer.register_buffer('locks', torch.zeros(max(2048, torch.cuda.get_device_properties(0).multi_processor_count * 8), device='cuda', dtype=torch.int32))
++    import copy
++    layer.fp32_configs = {}
++    for stage in ('w13', 'w2'):
++        default = HummingMethod.get_default_tuning_configs(layer, use_f16_accum=False, gemm_type='indexed', sublayer_name=stage)
++        snapshot = copy.deepcopy(default)
++        owned = copy.deepcopy(default)
++        for lo, hi, c in owned:
++            # Stream-K reduces partial outputs in BF16 even with FP32 MMA.
++            # Disable it to preserve the stock FP32 reduction contract.
++            c['use_stream_k'] = False
++            c['use_f16_accum'] = False
++        assert default == snapshot, 'Default tuning cache must stay unchanged'
++        layer.fp32_configs[stage] = owned
++    from sglang.kernels.ops.moe.muse_spark_humming_split import prepare_large_prefill_partition
++    prepare_large_prefill_partition(layer, torch)
++    from sglang.kernels.ops.moe.muse_spark_grouped_gate import prepare_build
++    prepare_build(layer)
++    return layer
++
++
++def _humming_expert_outputs_default(layer, x, local_ids, torch, retain=False, *, defer_downscale=False):
++    """Compute local routes with FP32 accumulation and no Stream-K reduction.
++
++First and final outputs alias one buffer as in the stock Marlin path.
++The caller applies the original per-expert norm and weighted finalization."""
++    from humming.layer import HummingMethod
++    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
++    from sglang.kernels.ops.activation.activation import silu_and_mul
++    from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
++    configs = layer.fp32_configs
++    valid = local_ids.numel()
++    selected = {s: next((c for lo, hi, c in cfg if lo < valid <= hi)) for s, cfg in configs.items()}
++    assert all((c['use_stream_k'] is False and c['use_f16_accum'] is False for c in selected.values()))
++    block = selected['w13']['block_shape'][0]
++    sorted_ids, expert_ids, padded = moe_align_block_size(local_ids, block, layer.w13_post_scale.numel(), ignore_invalid_expert=True)
++    m, k = x.shape
++    topk = local_ids.shape[1]
++    i = layer.humming_metas['w2'].shape_k
++    cache13 = torch.empty((m * topk * max(2 * i, k),), device=x.device, dtype=x.dtype)
++    cache1 = cache13[:m * topk * 2 * i].view(m * topk, 2 * i)
++    common = dict(sorted_ids=sorted_ids, expert_ids=expert_ids, num_tokens_padded=padded, valid_shape_m=valid, compute_config={'gemm_type': 'indexed', 'use_f16_accum': False})
++    HummingMethod.forward_layer(layer, inputs=x, outputs=cache1, top_k=topk, sublayer_name='w13', tuning_config=selected['w13'], **common)
++    # GEMM output has already rounded to BF16. Apply the BF16 global scale
++    # in a separate BF16 operation, preserving Marlin's second rounding.
++    scale_active_rows(cache1, local_ids, layer.w13_post_scale)
++    cache2 = torch.empty((m * topk, i), device=x.device, dtype=x.dtype)
++    silu_and_mul(cache1, cache2, expert_ids=local_ids.flatten(), expert_step=1)
++    cache3 = cache13[:m * topk * k].view(m * topk, k)
++    if selected['w2']['block_shape'][0] != block:
++        second = moe_align_block_size(local_ids, selected['w2']['block_shape'][0], layer.w2_post_scale.numel(), ignore_invalid_expert=True)
++        common.update(sorted_ids=second[0], expert_ids=second[1], num_tokens_padded=second[2])
++    HummingMethod.forward_layer(layer, inputs=cache2, outputs=cache3, top_k=1, sublayer_name='w2', tuning_config=selected['w2'], **common)
++    # Preserve the same BF16-output -> BF16-scale boundary for GEMM2.
++    if not defer_downscale:
++        scale_active_rows(cache3, local_ids, layer.w2_post_scale)
++    return (cache3.view(m, topk, k), local_ids)
++
++
++def _humming_expert_outputs_reference(layer, x, local_ids, torch, retain=False, *,
++                            defer_downscale=False, global_experts=None):
++    from sglang.kernels.ops.moe.muse_spark_humming_split import split_expert_outputs
++    return split_expert_outputs(
++        _humming_expert_outputs_default,layer,x,local_ids,torch,global_experts,
++        retain=retain,defer_downscale=defer_downscale,
++    )
++
++
++def _humming_expert_outputs(layer, x, local_ids, torch, retain=False, *,
++                            defer_downscale=False, global_experts=None):
++    from sglang.kernels.ops.moe.muse_spark_grouped_gate import try_grouped
++    result = try_grouped(_humming_expert_outputs_reference, layer, x, local_ids, torch,
++        retain=retain, defer_downscale=defer_downscale, global_experts=global_experts)
++    if result is not None:
++        return result
++    return _humming_expert_outputs_reference(layer, x, local_ids, torch, retain=retain,
++        defer_downscale=defer_downscale, global_experts=global_experts)
+diff --git a/python/sglang/srt/models/muse_spark.py b/python/sglang/srt/models/muse_spark.py
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -53,7 +53,11 @@
+ from sglang.srt.layers.communication.muse_spark_gemm_ag import (
+     gemm_ag,
+     gemm_local,
++    prefill_row_projection,
++    prefill_row_projection_supported,
+     reserve_projection_workspace,
++    small_projection,
++    small_projection_supported,
+ )
+ from sglang.srt.layers.cp.utils import is_cp_active
+ from sglang.srt.layers.dp_attention import (
+@@ -221,28 +225,30 @@
+         self.register_buffer(
+             "e_score_correction_bias", torch.zeros(num_experts, dtype=torch.float32)
+         )
+-        self._split2_hi = None
+-        self._split2_lo = None
++        self._split2_weight = None
+         self._split2_key = None
+ 
+     @torch.no_grad()
+     def _build_split2(self) -> None:
+-        w = self.weight.data
+-        key = (w.data_ptr(), w.shape, w._version)
++        w = self.weight
++        # Keep the parameter's version counter: .data hides in-place weight
++        # updates and could leave the packed router stale after a reload.
++        key = (w.data_ptr(), w.shape, w.dtype, w.device, w._version)
+         if self._split2_key == key:
+             return
+         hi = w.to(torch.bfloat16)
+         lo = (w - hi.to(torch.float32)).to(torch.bfloat16)
+-        self._split2_hi = hi.t().contiguous()
+-        self._split2_lo = lo.t().contiguous()
++        # Share the input read and GEMM launch while retaining separate FP32
++        # accumulators for the high and low BF16 components.
++        self._split2_weight = torch.cat((hi, lo)).t().contiguous()
+         self._split2_key = key
+ 
+     def forward_split2(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         self._build_split2()
+         x = hidden_states.to(torch.bfloat16)
+-        acc = torch.mm(x, self._split2_hi, out_dtype=torch.float32)
+-        acc += torch.mm(x, self._split2_lo, out_dtype=torch.float32)
+-        return acc
++        acc = torch.mm(x, self._split2_weight, out_dtype=torch.float32)
++        hi, lo = acc.chunk(2, dim=-1)
++        return hi + lo
+ 
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         # Decode-sized FP32 logits: one CuTe GEMV instead of cuBLAS split-K + reduce.
+@@ -609,6 +615,22 @@
+             )
+         self.experts.post_expert_norm = post_expert_norm
+         self.experts.use_megamoe = self.use_megamoe
++        if (
++            self.pre_expert_proj is not None
++            and self.tp_size in (4, 8)
++            and getattr(self.experts, "use_marlin", False)
++            and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
++            and parallel.attn_dp_size == 1
++            and parallel.attn_cp_size == 1
++            and torch.cuda.is_available()
++            and torch.cuda.get_device_capability() == (9, 0)
++        ):
++            # This shared group workspace grows only on the first layer.
++            # Reserve before any forward, workspace binding or graph capture.
++            reserve_projection_workspace(
++                parallel.tp_group.ca_comm,
++                max(self.expert_hidden_size, self.hidden_size),
++            )
+         self.sp_dispatcher = None
+         self.finalize_ar_workspace = None
+         self.unpool_gather_boundary: Optional[FusedPostNormResidualPreNorm] = None
+@@ -735,8 +757,38 @@
+                 if self._defers_unpool_gather(comm, output.shape[0]):
+                     return gemm_local(comm, output, self.post_expert_proj.weight)
+                 return gemm_ag(comm, output, self.post_expert_proj.weight)
++            if self._can_shard_prefill_row_projection(output, self.post_expert_proj.weight):
++                return prefill_row_projection(
++                    get_parallel().tp_group, output, self.post_expert_proj.weight
++                )
++            if self._can_shard_small_projection(output, self.post_expert_proj.weight):
++                return small_projection(
++                    get_parallel().tp_group, output, self.post_expert_proj.weight
++                )
+             output = bf16_gemm_dispatch(output, self.post_expert_proj.weight, None)
+         return output
++
++    def _can_shard_prefill_row_projection(self, x, weight) -> bool:
++        parallel = get_parallel()
++        return (
++            getattr(self.experts, "use_marlin", False)
++            and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
++            and not getattr(get_forward(), "sp_active", False)
++            and parallel.attn_dp_size == 1
++            and parallel.attn_cp_size == 1
++            and prefill_row_projection_supported(parallel.tp_group, x, weight)
++        )
++
++    def _can_shard_small_projection(self, x, weight) -> bool:
++        parallel = get_parallel()
++        return (
++            getattr(self.experts, "use_marlin", False)
++            and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
++            and not getattr(get_forward(), "sp_active", False)
++            and parallel.attn_dp_size == 1
++            and parallel.attn_cp_size == 1
++            and small_projection_supported(parallel.tp_group, x, weight)
++        )
+ 
+     def _defers_unpool_gather(self, comm, num_tokens: int) -> bool:
+         boundary = self.unpool_gather_boundary
+@@ -815,6 +867,18 @@
+                 and gemm_ag_supported(comm, hidden_states, self.pre_expert_proj.weight)
+             ):
+                 expert_input = gemm_ag(comm, hidden_states, self.pre_expert_proj.weight)
++            elif self._can_shard_prefill_row_projection(
++                hidden_states, self.pre_expert_proj.weight
++            ):
++                expert_input = prefill_row_projection(
++                    get_parallel().tp_group, hidden_states, self.pre_expert_proj.weight
++                )
++            elif self._can_shard_small_projection(
++                hidden_states, self.pre_expert_proj.weight
++            ):
++                expert_input = small_projection(
++                    get_parallel().tp_group, hidden_states, self.pre_expert_proj.weight
++                )
+             else:
+                 expert_input = bf16_gemm_dispatch(
+                     hidden_states, self.pre_expert_proj.weight, None
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_grouped_build.py b/python/sglang/kernels/ops/moe/muse_spark_grouped_build.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/muse_spark_grouped_build.py
+@@ -0,0 +1,313 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Local build of one pinned CUTLASS SM90a grouped NVFP4 kernel; no downloads."""
++import ctypes as ct
++import fcntl
++import hashlib
++import importlib.util
++import json
++import logging
++import os
++from pathlib import Path
++import resource
++import signal
++import subprocess
++import tempfile
++from functools import lru_cache
++
++LOG = logging.getLogger(__name__)
++HEADER_SHA = '6bc2a648b879b8555c4c3337021ac39906befa4aaa0865c47866058f698ae562'
++GROUP_SHA = 'ae3a9a82c245c068e30d71dae6f6877bb02080e1914d168a10589107b0f059b3'
++REL = 'cutlass/detail/collective/mixed_input_utils.hpp'
++GROUP = 'cutlass/gemm/collective/sm90_mma_array_tma_gmma_rs_warpspecialized_mixed_input.hpp'
++
++
++def _headers():
++    for package, suffix in [('deep_gemm', 'include'), ('flashinfer', 'data/cutlass/include')]:
++        try:
++            spec = importlib.util.find_spec(package)
++            if spec is None or spec.origin is None:
++                continue
++            path = Path(spec.origin).parent / suffix
++            if (hashlib.sha256((path/REL).read_bytes()).hexdigest() == HEADER_SHA and
++                    hashlib.sha256((path/GROUP).read_bytes()).hexdigest() == GROUP_SHA):
++                return path
++        except (ImportError, OSError):
++            continue
++    raise RuntimeError('exact pinned CUTLASS headers unavailable; keep original Humming')
++
++
++def _no_core():
++    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
++    try:
++        Path('/proc/self/coredump_filter').write_text('0')
++    except OSError:
++        pass
++
++
++@lru_cache(maxsize=1)
++def library_path():
++    from torch.utils.cpp_extension import CUDA_HOME
++    if not CUDA_HOME:
++        raise RuntimeError('CUDA_HOME unavailable')
++    home = Path(CUDA_HOME)
++    include = _headers()
++    raw = (include/REL).read_text()
++    if raw.count(NEEDLE) != 2:
++        raise RuntimeError('unexpected pinned scale conversion anchors')
++    fixed = raw.replace(NEEDLE, CUSTOM, 1)
++    digest = hashlib.sha256(('normal-g16-t64-s3-v1'+SOURCE+fixed+str(home)).encode()).hexdigest()[:20]
++    cache = Path(tempfile.gettempdir()) / ('sglang_muse_grouped_' + digest)
++    cache.mkdir(exist_ok=True)
++    target = cache/'kernel.so'
++    with (cache/'build.lock').open('w') as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX)
++        failed = cache/'build.failed'
++        if failed.exists():
++            raise RuntimeError('cached grouped build failure: '+failed.read_text()[-1500:])
++        if not target.exists():
++            overlay = cache/'overlay'/REL
++            overlay.parent.mkdir(parents=True, exist_ok=True)
++            overlay.write_text(fixed)
++            source = cache/'kernel.cu'
++            source.write_text(SOURCE)
++            libdirs = [home/'lib64', home/'lib', home/'lib64/stubs',
++                       Path('/usr/lib/wsl/lib'), Path('/usr/lib/x86_64-linux-gnu')]
++            cudart = next((x for q in libdirs for x in q.glob('libcudart.so*') if x.is_file()), None)
++            driver = next((x for q in libdirs for x in q.glob('libcuda.so*') if x.is_file()), None)
++            if cudart is None or driver is None:
++                raise RuntimeError('CUDA runtime/driver link libraries unavailable')
++            args = [str(home/'bin/nvcc'), '-std=c++17', '-arch=sm_90a', '--shared',
++                    '-Xcompiler=-fPIC', '--expt-extended-lambda', '--expt-relaxed-constexpr',
++                    '-O2', '-Xptxas=-v', '-DPACKED_FP4', '-DPACKED_SCALE',
++                    '-DPROBE_CTA_K=64', '-DPROBE_TOKEN_TILE=64',
++                    '-I'+str(cache/'overlay'), '-I'+str(include), '-I'+str(home/'include/cccl'), '-cudart=none',
++                    str(source), '-L'+str(cudart.parent), '-l:'+cudart.name,
++                    '-L'+str(driver.parent), '-l:'+driver.name,
++                    '-Xlinker=-rpath='+str(cudart.parent), '-o', str(cache/'kernel.tmp.so')]
++            version = subprocess.check_output([str(home/'bin/nvcc'), '--version'], text=True)
++            process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++                                       text=True, preexec_fn=_no_core, start_new_session=True)
++            try:
++                output, _ = process.communicate(timeout=600)
++            except subprocess.TimeoutExpired:
++                os.killpg(process.pid, signal.SIGKILL)
++                output, _ = process.communicate()
++                output += '\nGrouped build exceeded 600 seconds; compiler process group stopped.'
++            (cache/'build.log').write_text(output)
++            LOG.info('Muse grouped compile: headers=%s nvcc=%s returncode=%s log=%s',
++                     include, version.strip().splitlines()[-1], process.returncode, cache/'build.log')
++            if process.returncode:
++                failed.write_text(output[-1500:])
++                raise RuntimeError('grouped CUDA build failed: '+output[-1500:])
++            os.replace(cache/'kernel.tmp.so', target)
++    LOG.info('Muse grouped binary: path=%s sha256=%s', target,
++             hashlib.sha256(target.read_bytes()).hexdigest())
++    return target
++
++
++def library():
++    return ct.CDLL(str(library_path()))
++
++SOURCE = r"""// Standalone research host adapter for the pinned CUTLASS grouped packed-FP4 kernel.
++// The caller owns every operand and stream. Create/destroy outside graph capture.
++// CUTLASS grouped Hopper R/S mixed-input compile probe based on NVIDIA example 69.
++#include "cutlass/cutlass.h"
++#include "cute/tensor.hpp"
++#include "cutlass/gemm/group_array_problem_shape.hpp"
++#include "cutlass/gemm/collective/collective_builder.hpp"
++#include "cutlass/epilogue/collective/collective_builder.hpp"
++#include "cutlass/gemm/kernel/gemm_universal.hpp"
++#include "cutlass/device_kernel.h"
++using namespace cute;
++using Bf16 = cutlass::bfloat16_t;
++#ifdef PACKED_FP4
++using Quant = cutlass::float_e2m1_t;
++#else
++using Quant = cutlass::float_e4m3_t;
++#endif
++using GroupShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>;
++#ifndef PROBE_TOKEN_TILE
++#define PROBE_TOKEN_TILE 16
++#endif
++using ProbeTile = Shape<_128,Int<PROBE_TOKEN_TILE>,Int<PROBE_CTA_K>>;
++using Cluster = Shape<_1,_1,_1>;
++using Row = cutlass::layout::RowMajor;
++using Col = cutlass::layout::ColumnMajor;
++using Epi = cutlass::epilogue::collective::CollectiveBuilder<
++    cutlass::arch::Sm90,cutlass::arch::OpClassTensorOp,ProbeTile,Cluster,cutlass::epilogue::collective::EpilogueTileAuto,
++    float,float,Bf16,Col*,8,Bf16,Col*,8,
++    cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative>::CollectiveOp;
++#ifdef PACKED_SCALE
++using Scale = uint32_t;
++#else
++using Scale = Bf16;
++#endif
++#ifdef SHARED_HUMMING_WEIGHT
++#include "humming_atom.hpp"
++using WeightLayout = HummingWeightLayout;
++#else
++using WeightLayout = Row;
++#endif
++// Judge CUTLASS builder passes StageCountType::bytes as the manual-stage template argument.
++// Preserve exactly three stages without editing installed headers.
++struct ManualStages3 : cutlass::gemm::collective::StageCount<3> { static constexpr int bytes = 3; };
++using Main = cutlass::gemm::collective::CollectiveBuilder<
++    cutlass::arch::Sm90,cutlass::arch::OpClassTensorOp,
++    cute::tuple<Quant,Scale>,WeightLayout*,(128 / cutlass::sizeof_bits<Quant>::value),Bf16,Col*,8,float,ProbeTile,Cluster,
++    ManualStages3,
++    cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative>::CollectiveOp;
++using Kernel = cutlass::gemm::kernel::GemmUniversal<GroupShape,Main,Epi>;
++template __global__ void cutlass::device_kernel<Kernel>(CUTLASS_GRID_CONSTANT Kernel::Params const params);
++
++#include "cutlass/gemm/device/gemm_universal_adapter.h"
++#include <cuda_runtime.h>
++#include <new>
++#include <cstdint>
++
++using DeviceGemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
++using Problem = Shape<int,int,int>;
++#ifdef SHARED_HUMMING_WEIGHT
++using WS = HummingWeightLayout;
++#else
++using WS = cute::remove_pointer_t<cutlass::detail::TagToStrideA_t<Row*>>;
++#endif
++using XS = cute::remove_pointer_t<cutlass::detail::TagToStrideB_t<Col*>>;
++using DS = Kernel::InternalStrideD;
++using SS = Main::StrideScale;
++constexpr int kMaxGroups = 32;
++
++struct alignas(128) Descriptors {
++  Problem problems[kMaxGroups];
++  Quant const* w[kMaxGroups];
++  Bf16 const* x[kMaxGroups];
++  Bf16 const* c[kMaxGroups];
++  Bf16* y[kMaxGroups];
++  uint32_t const* scales[kMaxGroups];
++  WS ws[kMaxGroups];
++  XS xs[kMaxGroups];
++  SS ss[kMaxGroups];
++  DS ds[kMaxGroups];
++};
++
++struct Context {
++  DeviceGemm gemm;
++  Descriptors* desc = nullptr;
++  void* workspace = nullptr;
++  cutlass::KernelHardwareInfo hw{};
++  int groups = 0, n = 0, k = 0;
++};
++
++__global__ void descriptors(Descriptors* d, int groups, int n, int k,
++                            uint8_t const* w, uint32_t const* s, Bf16 const* x, Bf16* y,
++                            int const* starts, int const* padded) {
++  int g = threadIdx.x;
++  if (g >= groups) return;
++  int64_t base = starts[g];
++  d->problems[g] = make_shape(n, padded[g], k);
++  d->w[g] = reinterpret_cast<Quant const*>(w + int64_t(g)*n*(k/2));
++  d->scales[g] = s + int64_t(g)*(k/64)*n;
++  d->x[g] = x + base*k;
++  d->y[g] = y + base*n;
++  d->c[g] = y + base*n;
++#ifdef SHARED_HUMMING_WEIGHT
++  d->ws[g] = make_humming_layout(n,k);
++#else
++  d->ws[g] = WS{k,_1{},_0{}};
++#endif
++  d->xs[g] = XS{k,_1{},_0{}};
++  d->ss[g] = SS{_1{},n,_0{}};
++  d->ds[g] = DS{_1{},n,_0{}};
++}
++
++static DeviceGemm::Arguments arguments(Context const& ctx) {
++  auto* d = ctx.desc;
++  DeviceGemm::Arguments args{};
++  decltype(args.epilogue.thread) op{};
++  op.alpha = 1.0f;
++  op.beta = 0.0f;
++  op.alpha_ptr = nullptr; op.beta_ptr = nullptr;
++  op.alpha_ptr_array = nullptr; op.beta_ptr_array = nullptr;
++  op.dAlpha = {_0{},_0{},0};
++  op.dBeta = {_0{},_0{},0};
++  return {cutlass::gemm::GemmUniversalMode::kGrouped,
++          {ctx.groups,d->problems,nullptr},
++          {d->w,d->ws,d->x,d->xs,d->scales,d->ss,64},
++          {op,d->c,d->ds,d->y,d->ds},ctx.hw};
++}
++
++// 1..999 CUDA error numbers; >=1000 indicates a CUTLASS failure.
++extern "C" int okc_destroy(void* handle) {
++  auto* ctx=static_cast<Context*>(handle);
++  if (!ctx) return 0;
++  cudaError_t a=ctx->workspace?cudaFree(ctx->workspace):cudaSuccess;
++  cudaError_t b=ctx->desc?cudaFree(ctx->desc):cudaSuccess;
++  delete ctx;
++  return int(a!=cudaSuccess?a:b);
++}
++
++extern "C" int okc_create(void** out,int groups,int n,int k,cudaStream_t stream) {
++  if (!out || groups<1 || groups>kMaxGroups || n<64 || k<64 || n%64 || k%64)
++    return int(cudaErrorInvalidValue);
++  *out=nullptr;
++  int device,major,minor,sms;
++  cudaError_t err=cudaGetDevice(&device);
++  if (err==cudaSuccess) err=cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device);
++  if (err==cudaSuccess) err=cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,device);
++  if (err==cudaSuccess) err=cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,device);
++  if (err!=cudaSuccess) return int(err);
++  if (major!=9 || minor!=0) return int(cudaErrorInvalidDeviceFunction);
++  auto* ctx=new(std::nothrow) Context;
++  if (!ctx) return int(cudaErrorMemoryAllocation);
++  ctx->hw.device_id=device;
++  ctx->hw.sm_count=sms;
++  ctx->groups=groups; ctx->n=n; ctx->k=k;
++  err=cudaMalloc(&ctx->desc,sizeof(Descriptors));
++  if (err!=cudaSuccess) { okc_destroy(ctx); return int(err); }
++  auto args=arguments(*ctx);
++  auto rc=ctx->gemm.can_implement(args);
++  if (rc!=cutlass::Status::kSuccess) { okc_destroy(ctx); return 1000+int(rc); }
++  auto bytes=DeviceGemm::get_workspace_size(args);
++  if (bytes) err=cudaMalloc(&ctx->workspace,bytes);
++  if (err!=cudaSuccess) { okc_destroy(ctx); return int(err); }
++  rc=ctx->gemm.initialize(args,ctx->workspace,stream);
++  if (rc!=cutlass::Status::kSuccess) { okc_destroy(ctx); return 1000+int(rc); }
++  *out=ctx;
++  return 0;
++}
++
++extern "C" int okc_run(void* handle,uint8_t const* w,uint32_t const* s,Bf16 const* x,Bf16* y,
++                       int const* starts,int const* padded,cudaStream_t stream) {
++  auto* c=static_cast<Context*>(handle);
++  if (!c || !w || !s || !x || !y || !starts || !padded)
++    return int(cudaErrorInvalidValue);
++  descriptors<<<1,kMaxGroups,0,stream>>>(c->desc,c->groups,c->n,c->k,w,s,x,y,starts,padded);
++  auto err=cudaGetLastError();
++  if (err!=cudaSuccess) return int(err);
++  auto rc=c->gemm.run(stream);
++  return rc==cutlass::Status::kSuccess?0:1000+int(rc);
++}
++
++extern "C" size_t okc_owned_bytes(void* handle) { auto* c=static_cast<Context*>(handle); return c ? sizeof(Descriptors)+DeviceGemm::get_workspace_size(arguments(*c)) : 0; }
++"""
++NEEDLE = r"""      if constexpr (is_same_v<DstType, ElementScale>) {
++        CUTLASS_PRAGMA_UNROLL
++        for (int i = 0; i < size<1>(dst_vm); ++i) {
++          LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));"""
++CUSTOM = r"""      if constexpr (is_same_v<ElementScale, uint32_t> && is_same_v<DstType, cutlass::bfloat16_t>) {
++        CUTLASS_PRAGMA_UNROLL
++        for (int i = 0; i < size<1>(dst_vm); ++i) {
++          LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
++          CUTLASS_PRAGMA_UNROLL
++          for (int j = 0; j < size<0>(dst_vm); ++j) {
++            const uint32_t word = scales_vm(j, i);
++            const uint8_t byte = uint8_t(word >> (8 * k_block));
++            const auto scale = cutlass::float_e4m3_t::bitcast(byte);
++            const auto normalized_scale = cutlass::bfloat16_t(float(scale) * 0.25f);
++            dst_vm(j, i) *= normalized_scale;
++          }
++        }
++      }
++      else if constexpr (is_same_v<DstType, ElementScale>) {
++        CUTLASS_PRAGMA_UNROLL
++        for (int i = 0; i < size<1>(dst_vm); ++i) {
++          LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));"""
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_grouped_gate.py b/python/sglang/kernels/ops/moe/muse_spark_grouped_gate.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/muse_spark_grouped_gate.py
+@@ -0,0 +1,254 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Conservative startup qualification; original Humming remains the fallback.
++
++The kernel uses original E2M1/E4M3 group16 coefficients, BF16 activations,
++FP32 accumulators and original post-GEMM scales. Exact bit agreement is a
++conservative activation gate, stronger than ordinary FP32-summation equivalence.
++"""
++import gc
++import json
++import logging
++import statistics
++import threading
++import torch
++from .muse_spark_grouped_build import library_path
++from .muse_spark_grouped_runtime import Arena, MAX_M
++
++LOG=logging.getLogger(__name__)
++_BUILD=None
++_STATE={}
++MIN_M=4096
++MAX_REQUEST_M=16384
++
++
++def _meta_ok(layer):
++    from humming import dtypes
++    if layer.w13_post_scale.numel()!=32 or layer.w2_post_scale.numel()!=32:
++        return False
++    for stage,n in (('w13',8192),('w2',4096)):
++        meta=layer.humming_metas[stage]
++        if (meta.a_dtype!=dtypes.bfloat16 or meta.c_dtype!=dtypes.bfloat16 or
++            meta.b_dtype!=dtypes.float4e2m1 or meta.bs_dtype!=dtypes.float8e4m3 or
++            meta.weight_scale_group_size!=16 or meta.input_scale_group_size or
++            meta.has_bias or meta.has_zero_point or meta.should_apply_bs_on_c or
++            meta.use_fused_e8m0_scale or meta.shape_n!=n or meta.shape_k!=4096 or
++            'wgmma' not in str(meta.mma_type).lower()):
++            return False
++        w=getattr(layer,meta.weight_name)
++        sf=getattr(layer,meta.weight_scale_name)
++        if (not w.is_contiguous() or not sf.is_contiguous() or
++            w.numel()*w.element_size()!=32*n*4096//2 or
++            sf.numel()*sf.element_size()!=32*n*4096//16):
++            return False
++    return True
++
++
++def prepare_build(layer):
++    global _BUILD
++    if _BUILD is not None:
++        return
++    device=layer.w13_post_scale.device
++    if device.type!='cuda' or torch.cuda.get_device_capability(device)!=(9,0):
++        return
++    if not _meta_ok(layer):
++        return
++    try:
++        library_path()
++        _BUILD=True
++    except Exception as exc:
++        _BUILD=False
++        LOG.warning('Muse grouped build unavailable; original Humming retained: %s',exc)
++
++
++def _difference(a,b):
++    a=a.reshape(-1);b=b.reshape(-1)
++    unequal=0;max_abs=0.;error2=0.;reference2=0.
++    # Bound diagnostic scratch rather than materializing whole FP32 projections.
++    for first in range(0,a.numel(),1<<20):
++        av=a[first:first+(1<<20)];bv=b[first:first+(1<<20)]
++        unequal+=int((av.view(torch.int16)!=bv.view(torch.int16)).sum())
++        af=av.float();bf=bv.float();delta=af-bf
++        max_abs=max(max_abs,float(delta.abs().max()))
++        error2+=float(delta.square().sum());reference2+=float(af.square().sum())
++    return dict(values=a.numel(),unequal_bits=unequal,max_abs=max_abs,
++                relative_l2=(error2/max(reference2,1e-40))**.5)
++
++
++def _raw_difference(a,b,ids):
++    rows=[]
++    for first in range(0,a.size(0),64):
++        live=ids[first:first+64]>=0
++        rows.append(_difference(a[first:first+64][live],b[first:first+64][live]))
++    return dict(values=sum(x['values'] for x in rows),
++                unequal_bits=sum(x['unequal_bits'] for x in rows),
++                max_abs=max((x['max_abs'] for x in rows),default=0.),
++                max_chunk_relative_l2=max((x['relative_l2'] for x in rows),default=0.))
++
++
++def _inputs(device,m,local,seed):
++    generator=torch.Generator(device=device).manual_seed(seed)
++    x=torch.empty((m,4096),device=device,dtype=torch.bfloat16).normal_(std=.017,generator=generator)
++    ids=torch.full((m,8),-1,device=device,dtype=torch.int32)
++    if local:
++        rows=torch.arange(m,device=device,dtype=torch.int32)
++        for slot in range(local):
++            ids[:,slot]=(rows*local+slot)%32
++    return x,ids
++
++
++def _checkpoint_difference(host,candidate,ids=None):
++    records=[]
++    for first in range(0,candidate.size(0),64):
++        gold=host[first:first+64].to(candidate.device)
++        actual=candidate[first:first+64]
++        if ids is not None:
++            live=ids[first:first+64]>=0
++            gold=gold[live];actual=actual[live]
++        records.append(_difference(gold,actual))
++    return dict(values=sum(x['values'] for x in records),
++                unequal_bits=sum(x['unequal_bits'] for x in records),
++                max_abs=max((x['max_abs'] for x in records),default=0.),
++                max_chunk_relative_l2=max((x['relative_l2'] for x in records),default=0.))
++
++
++def _memory(device):
++    free,total=torch.cuda.mem_get_info(device)
++    return dict(allocated=torch.cuda.memory_allocated(device),
++                reserved=torch.cuda.memory_reserved(device),
++                historical_peak_allocated=torch.cuda.max_memory_allocated(device),
++                historical_peak_reserved=torch.cuda.max_memory_reserved(device),
++                cuda_free=free,cuda_total=total)
++
++
++def _release_cache(device):
++    torch.cuda.synchronize(device)
++    gc.collect()
++    torch.cuda.empty_cache()
++
++
++def _times(fn):
++    fn();fn()
++    values=[]
++    for iteration in range(6):
++        begin=torch.cuda.Event(enable_timing=True);end=torch.cuda.Event(enable_timing=True)
++        begin.record();fn();end.record();end.synchronize()
++        values.append(begin.elapsed_time(end)*1000.)
++    return values
++
++
++def _qualify(reference,layer,device):
++    from .muse_spark_post_expert_finalize_triton import fused_post_expert_norm_weighted_sum as finish
++    memory={'before':_memory(device)}
++    norm=torch.ones(4096,device=device,dtype=torch.bfloat16)
++    checkpoints=[]
++    # Native reference temporaries never coexist with the candidate arena.
++    # Each checkpoint retains CPU BF16 only; input generation uses isolated seeds.
++    for m,local,seed in ((4096,1,917411),(4097,1,917413),(4096,4,917419),(256,0,917421)):
++        x,ids=_inputs(device,m,local,seed)
++        scores=torch.full((m,8),.125,device=device,dtype=torch.float32)
++        gold,_=reference(layer,x,ids,torch,retain=False,defer_downscale=True,global_experts=256)
++        final=finish(gold,scores,norm_weight=norm,eps=1e-8,weight_first=True,
++                     slot_expert_ids=ids,expert_output_scale=layer.w2_post_scale)
++        checkpoints.append((m,local,seed,gold.cpu(),final.cpu()))
++        del x,ids,scores,gold,final
++    x,ids=_inputs(device,4096,1,917431)
++    parent=_times(lambda:reference(layer,x,ids,torch,retain=False,defer_downscale=True,global_experts=256))
++    del x,ids
++    memory['native_before_arena']=_memory(device)
++    _release_cache(device)
++    arena=Arena(device)
++    memory['arena_allocated']=_memory(device)
++    records=[];exact=True
++    for m,local,seed,gold_cpu,final_cpu in checkpoints:
++        x,ids=_inputs(device,m,local,seed)
++        scores=torch.full((m,8),.125,device=device,dtype=torch.float32)
++        candidate,_=arena.forward(layer,x,ids,True)
++        final=finish(candidate,scores,norm_weight=norm,eps=1e-8,weight_first=True,
++                     slot_expert_ids=ids,expert_output_scale=layer.w2_post_scale)
++        raw=_checkpoint_difference(gold_cpu,candidate,ids)
++        final_diff=_checkpoint_difference(final_cpu,final)
++        exact=exact and raw['unequal_bits']==0 and final_diff['unequal_bits']==0
++        records.append(dict(m=m,local_slots=local,seed=seed,raw=raw,final=final_diff))
++        del x,ids,scores,candidate,final
++    x,ids=_inputs(device,4096,1,917431)
++    candidate_times=_times(lambda:arena.forward(layer,x,ids,True))
++    del x,ids,checkpoints,gold_cpu,final_cpu
++    memory['candidate_before_release']=_memory(device)
++    owned_bytes=arena.owned_bytes
++    packed_bytes=sum(t.numel() for t in arena.packed)
++    arena.close();del arena
++    _release_cache(device)
++    # Post-candidate native control catches gross clock/thermal drift without
++    # retaining an arena during the native reference's large temporary GEMMs.
++    x,ids=_inputs(device,4096,1,917431)
++    control=_times(lambda:reference(layer,x,ids,torch,retain=False,defer_downscale=True,global_experts=256))
++    del x,ids,norm
++    memory['native_control_after_release']=_memory(device)
++    _release_cache(device)
++    parent_median=statistics.median(parent);control_median=statistics.median(control)
++    gain=min(parent_median,control_median)/statistics.median(candidate_times)
++    drift=abs(parent_median-control_median)/min(parent_median,control_median)
++    enabled=bool(exact and gain>1.10 and drift<=.05)
++    result=Arena(device) if enabled else False
++    memory['after_qualification']=_memory(device)
++    LOG.info('Muse grouped qualification %s',json.dumps(dict(device=str(device),
++        dtype='BF16/BF16, E2M1+E4M3 group16, FP32 accumulation, original post scales',
++        token_tile=64,chunk_rows=MAX_M,minimum_request_rows=MIN_M,
++        qualification_scope='first actual layer, finite synthetic inputs; not universal parity',
++        timing_scope='separate parent/candidate/control epochs; conservative startup filter, not paired promotion',
++        original_weight_storage_retained=True,packed_bytes=packed_bytes,
++        owned_scratch_bytes=owned_bytes,memory=memory,
++        records=records,times_us=dict(parent=parent,candidate=candidate_times,control=control),
++        synthetic_gain=gain,parent_control_drift=drift,exact=exact,enabled=enabled)))
++    return result
++
++
++def _serialized_execution():
++    from sglang.srt.layers.moe.utils import is_tbo_enabled,is_sbo_enabled
++    from sglang.srt.distributed.parallel_state import get_pipeline_model_parallel_world_size
++    return not is_tbo_enabled() and not is_sbo_enabled() and get_pipeline_model_parallel_world_size()==1
++
++
++def _stream_allowed(arena):
++    from sglang.srt.runtime_context import get_resources
++    if threading.get_ident()!=arena.thread_id:
++        return False
++    current=torch.cuda.current_stream(arena.device)
++    capture=get_resources().streams.get('cuda_graph_capture')
++    if capture is not None and current==capture:
++        # GroupCoordinator.graph_capture waits for the warmup stream before entering;
++        # runner_utils/pool.py explicitly guarantees prefill/decode replay serialization.
++        return True
++    if torch.cuda.is_current_stream_capturing():
++        return False
++    if current==torch.cuda.default_stream(arena.device):
++        return arena.forward_stream is None
++    if arena.forward_stream is None:
++        # One-time transition from initialization/capture to the scheduler forward stream.
++        torch.cuda.synchronize(arena.device)
++        arena.forward_stream=current
++        LOG.info('Muse grouped bound scheduler stream %s',current.cuda_stream)
++    return current==arena.forward_stream
++
++
++def try_grouped(reference,layer,x,ids,torch_module,retain=False,*,defer_downscale=False,global_experts=None):
++    if (_BUILD is not True or retain or global_experts!=256 or x.ndim!=2 or
++        not MIN_M<=x.size(0)<=MAX_REQUEST_M or x.size(1)!=4096 or
++        x.dtype!=torch.bfloat16 or ids.dtype!=torch.int32 or ids.shape!=(x.size(0),8) or
++        not x.is_cuda or ids.device!=x.device or not x.is_contiguous() or not ids.is_contiguous() or
++        not _meta_ok(layer) or not _serialized_execution()):
++        return None
++    index=x.device.index
++    if index not in _STATE:
++        if torch.cuda.is_current_stream_capturing():
++            return None
++        # No fallback after a device execution error: a damaged CUDA context must fail loudly.
++        _STATE[index]=_qualify(reference,layer,x.device)
++        if _STATE[index] is False:
++            return None
++    arena=_STATE[index]
++    if arena is False or not _stream_allowed(arena):
++        return None
++    if torch.cuda.is_current_stream_capturing():
++        LOG.info("Muse grouped captured activation M=%s stream=%s",x.size(0),torch.cuda.current_stream(x.device).cuda_stream)
++    return arena.forward(layer,x,ids,defer_downscale)
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_grouped_prep.py b/python/sglang/kernels/ops/moe/muse_spark_grouped_prep.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/muse_spark_grouped_prep.py
+@@ -0,0 +1,158 @@
++"""Device-only packing of the scored Humming BF16/FP4 operands into Hopper grouped-GEMM arrays."""
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _pack_codes(src, dst, chosen, N: tl.constexpr, K: tl.constexpr, WG: tl.constexpr,
++                BN: tl.constexpr, PAIRS: tl.constexpr):
++    n = tl.program_id(0) * BN + tl.arange(0, BN)
++    k = (tl.program_id(1) * PAIRS + tl.arange(0, PAIRS)) * 2
++    slot = tl.program_id(2)
++    expert = tl.load(chosen + slot).to(tl.int64)
++    nn, kk = n[:, None], k[None, :]
++    lane = (nn % 8) * 4 + (kk % 8) // 2
++    word = (expert * (K // 16) + kk // 16) * (N * 2)
++    word += nn // 64 * 128 + lane * 4 + (nn % 64) // 16
++    if WG:
++        pair = ((kk // 8) % 2) * 2 + (nn // 8) % 2
++    else:
++        pair = ((nn // 8) % 2) * 2 + (kk // 8) % 2
++    bits = tl.load(src + word).to(tl.uint32) >> (pair * 4).to(tl.uint32)
++    pair_byte = (bits & 15) | ((bits >> 12) & 240)
++    tl.store(dst + (slot.to(tl.int64) * N + nn) * (K // 2) + kk // 2, pair_byte)
++
++
++@triton.jit
++def _pack_scales(src, dst, chosen, N: tl.constexpr, K: tl.constexpr, BN: tl.constexpr):
++    n = tl.program_id(0) * BN + tl.arange(0, BN)
++    col = tl.program_id(1)
++    slot = tl.program_id(2)
++    expert = tl.load(chosen + slot).to(tl.int64)
++    swizzle = n // 64 * 64 + (n % 8) * 8 + (n % 64) // 8
++    base = (expert * (K // 16) + col * 4) * N + swizzle
++    word = tl.full((BN,), 0, tl.uint32)
++    for i in tl.static_range(4):
++        word |= tl.load(src + base + i * N).to(tl.uint32) << (8 * i)
++    tl.store(dst + (slot.to(tl.int64) * (K // 64) + col) * N + n, word)
++
++
++def convert(weights, scales, chosen, scratch, n, k, wgmma):
++    groups = chosen.numel()
++    codes_bytes = groups * n * k // 2
++    total = codes_bytes + groups * n * k // 16
++    if n % 64 or k % 64 or scratch.dtype != torch.uint8 or scratch.numel() < total:
++        raise ValueError("requires aligned N,K and sufficient byte workspace")
++    if not all(a.is_contiguous() for a in (weights, scales, chosen, scratch)):
++        raise ValueError("requires contiguous tensors")
++    if chosen.dtype != torch.int32 or any(a.device != scratch.device for a in (weights, scales, chosen)):
++        raise ValueError("invalid expert list or device")
++    if weights.numel()*weights.element_size()%(n*k//2) or scales.numel()*scales.element_size()!=(weights.numel()*weights.element_size())//8:
++        raise ValueError("incompatible weight or group-16 scale storage")
++    flat = scratch.view(-1)
++    codes = flat[:codes_bytes].reshape(groups, n, k//2)
++    words = flat[codes_bytes:total].view(torch.int32).reshape(groups, k//64, n)
++    _pack_codes[(n//16,k//64,groups)](weights.view(torch.int32), codes, chosen, n, k, wgmma, 16, 32)
++    _pack_scales[(n//64,k//64,groups)](scales.view(torch.uint8), words, chosen, n, k, 64)
++    return codes, words
++
++
++@triton.jit
++def _rank(ids, excess, dest, S: tl.constexpr, E: tl.constexpr, B: tl.constexpr):
++    e, chunk = tl.program_id(0), tl.program_id(1)
++    slot = chunk*B+tl.arange(0,B)
++    match = tl.load(ids+slot, slot<S, other=-1)==e
++    n = tl.cumsum(match.to(tl.int32),0)
++    tl.store(dest+slot, n-1, match)
++    tl.store(excess+chunk*E+e, tl.sum(match.to(tl.int32),0))
++
++
++@triton.jit
++def _bases(prefix, offset, count, padded, CHUNKS: tl.constexpr, E: tl.constexpr, EB: tl.constexpr):
++    e=tl.arange(0,EB)
++    n=tl.load(prefix+(CHUNKS-1)*E+e,e<E,other=0)
++    length=tl.where(e<E,tl.maximum(16,(n+15)//16*16),0)
++    start=tl.cumsum(length,0)-length
++    tl.store(offset+e,start,e<E)
++    tl.store(count+e,n,e<E)
++    tl.store(padded+e,length,e<E)
++
++
++@triton.jit
++def _map(ids, dest, prefix, offset, S:tl.constexpr, E:tl.constexpr, B:tl.constexpr):
++    ch=tl.program_id(0)
++    i=ch*B+tl.arange(0,B)
++    e=tl.load(ids+i,i<S,other=-1)
++    live=(e>=0)&(e<E)
++    local=tl.load(dest+i,live,other=0)
++    prev=tl.load(prefix+(ch-1)*E+e,live&(ch>0),other=0)
++    first=tl.load(offset+e,live,other=0)
++    tl.store(dest+i,tl.where(live,first+prev+local,-1),i<S)
++
++
++def route_buffers(ids, experts):
++    s=ids.numel()
++    chunks=triton.cdiv(s,256)
++    kw=dict(device=ids.device,dtype=torch.int32)
++    return (torch.empty((chunks,experts),**kw),torch.empty((chunks,experts),**kw),
++            torch.empty(s,**kw),*(torch.empty(experts,**kw) for _ in range(3)))
++
++
++def route(ids, bufs):
++    partial,prefix,dest,base,counts,padded=bufs
++    s=ids.numel()
++    chunks,e=partial.shape
++    if not ids.is_contiguous() or ids.dtype!=torch.int32 or ids.ndim!=2 or ids.size(1)!=8 or not s:
++        raise ValueError("requires local contiguous int32 top-8 route IDs")
++    if chunks!=triton.cdiv(s,256) or dest.numel()!=s:
++        raise ValueError("workspace mismatches route shape")
++    _rank[(e,chunks)](ids,partial,dest,s,e,256)
++    torch.cumsum(partial,dim=0,dtype=torch.int32,out=prefix)
++    _bases[(1,)](prefix,base,counts,padded,chunks,e,triton.next_power_of_2(e))
++    _map[(chunks,)](ids,dest,prefix,base,s,e,256)
++    return dest,base,counts,padded
++
++
++@triton.jit
++def _rows(src,dst,dest,H:tl.constexpr,PACK:tl.constexpr,RESTORE:tl.constexpr,B:tl.constexpr):
++    s=tl.program_id(0)
++    cols=tl.program_id(1)*B+tl.arange(0,B)
++    row=tl.load(dest+s)
++    if PACK:
++        if row>=0:
++            tl.store(dst+row.to(tl.int64)*H+cols,tl.load(src+(s//8).to(tl.int64)*H+cols))
++    else:
++        val=tl.load(src+row.to(tl.int64)*H+cols,row>=0,other=0.)
++        if RESTORE:
++            val=(val.to(tl.float32)*4.).to(tl.bfloat16)
++        tl.store(dst+s.to(tl.int64)*H+cols,val)
++
++
++@triton.jit
++def _clear_pad(dst,base,counts,padded,H:tl.constexpr,B:tl.constexpr):
++    e=tl.program_id(0)
++    r=tl.program_id(1)
++    col=tl.program_id(2)*B+tl.arange(0,B)
++    count=tl.load(counts+e)
++    if count+r<tl.load(padded+e):
++        row=tl.load(base+e)+count+r
++        tl.store(dst+row.to(tl.int64)*H+col,0.)
++
++
++def gather(x, out, mapping):
++    dest,base,counts,padded=mapping
++    h=x.size(1)
++    b=min(256,h)
++    if h%b or x.shape[0]*8!=dest.numel() or out.shape[0]<dest.numel()+16*len(base) or out.shape[1]!=h:
++        raise ValueError("invalid source or row workspace")
++    _rows[(dest.numel(),h//b)](x,out,dest,h,True,False,b)
++    _clear_pad[(len(base),16,h//b)](out,base,counts,padded,h,b)
++
++
++def scatter(grouped, canonical, dest, restore=True):
++    h=grouped.size(1)
++    b=min(256,h)
++    if h%b or canonical.shape!=(dest.numel(),h):
++        raise ValueError("invalid canonical output")
++    _rows[(dest.numel(),h//b)](grouped,canonical,dest,h,False,restore,b)
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_grouped_runtime.py b/python/sglang/kernels/ops/moe/muse_spark_grouped_runtime.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/muse_spark_grouped_runtime.py
+@@ -0,0 +1,122 @@
++# SPDX-License-Identifier: Apache-2.0
++"""One bounded scratch arena, reused across layers and sequential chunks."""
++import ctypes as ct
++import threading
++import torch
++import triton
++import triton.language as tl
++from .muse_spark_grouped_prep import convert, gather, route, route_buffers, scatter
++from .muse_spark_grouped_build import library
++
++MAX_M = 2048
++EXTRA_LIMIT = 1_380_000_000
++
++@triton.jit
++def _restore_labels(up, ids, dest, labels, W:tl.constexpr, B:tl.constexpr):
++    s=tl.program_id(0)
++    row=tl.load(dest+s)
++    if row>=0:
++        c=tl.program_id(1)*B+tl.arange(0,B)
++        ix=row.to(tl.int64)*W+c
++        tl.store(up+ix,tl.load(up+ix).to(tl.float32)*4.)
++        if tl.program_id(1)==0:
++            tl.store(labels+row,tl.load(ids+s))
++
++def checked(rc):
++    if rc:
++        raise RuntimeError('grouped Hopper adapter status '+str(rc))
++
++class Arena:
++    def __init__(self, device):
++        self.device=torch.device(device)
++        self.stream=torch.cuda.current_stream(self.device)
++        self.thread_id=threading.get_ident()
++        self.forward_stream=None
++        self.lib=library()
++        void=ct.c_void_p
++        self.lib.okc_create.argtypes=(ct.POINTER(void),ct.c_int,ct.c_int,ct.c_int,void)
++        self.lib.okc_run.argtypes=(void,void,void,void,void,void,void,void)
++        self.lib.okc_destroy.argtypes=(void,)
++        self.lib.okc_owned_bytes.argtypes=(void,)
++        self.lib.okc_owned_bytes.restype=ct.c_size_t
++        for method in (self.lib.okc_create,self.lib.okc_run,self.lib.okc_destroy):
++            method.restype=ct.c_int
++        self.handles=[]
++        try:
++            for n in (8192,4096):
++                handle=ct.c_void_p()
++                checked(self.lib.okc_create(ct.byref(handle),32,n,4096,self.stream.cuda_stream))
++                self.handles.append(handle)
++            kw=dict(device=self.device)
++            self.chosen=torch.arange(32,**kw,dtype=torch.int32)
++            self.packed=[torch.empty(32*n*4096*9//16,**kw,dtype=torch.uint8) for n in (8192,4096)]
++            rows=MAX_M*8+16*32
++            self.main=torch.empty((rows,8192),**kw,dtype=torch.bfloat16)
++            self.mid=torch.empty((rows,4096),**kw,dtype=torch.bfloat16)
++            self.labels=torch.empty(rows,**kw,dtype=torch.int32)
++            self.rbuf=route_buffers(torch.empty((MAX_M,8),**kw,dtype=torch.int32),32)
++            tensors=[self.chosen,*self.packed,self.main,self.mid,self.labels,*self.rbuf]
++            self.owned_bytes=sum(x.numel()*x.element_size() for x in tensors)
++            self.owned_bytes+=sum(self.lib.okc_owned_bytes(h) for h in self.handles)
++            if self.owned_bytes>EXTRA_LIMIT:
++                raise RuntimeError('grouped scratch exceeds explicit memory budget')
++            self.operands={}
++        except Exception:
++            self.close()
++            raise
++
++    def close(self):
++        with torch.cuda.device(self.device):
++            while self.handles:
++                checked(self.lib.okc_destroy(self.handles.pop()))
++
++    def prepare(self,layer):
++        # All original packed coefficients/scales remain untouched and resident.
++        # Both temporary stages are overwritten once per layer call, then reused by chunks.
++        for j,stage in enumerate(('w13','w2')):
++            meta=layer.humming_metas[stage]
++            self.operands[stage]=convert(getattr(layer,meta.weight_name),
++                getattr(layer,meta.weight_scale_name),self.chosen,self.packed[j],
++                meta.shape_n,meta.shape_k,'wgmma' in str(meta.mma_type).lower())
++
++    def _gemm(self,j,stage,x,y,base,padded):
++        codes,words=self.operands[stage]
++        checked(self.lib.okc_run(self.handles[j],
++            *(t.data_ptr() for t in (codes,words,x,y,base,padded)),self.stream.cuda_stream))
++
++    def chunk(self,layer,x,ids,defer_downscale):
++        from sglang.kernels.ops.activation.activation import silu_and_mul
++        from .muse_spark_humming_scale import scale_active_rows
++        m=x.size(0)
++        slots=m*8
++        rows=slots+16*32
++        partial,prefix,dest,base,counts,padded=self.rbuf
++        chunks=triton.cdiv(slots,256)
++        mapping=route(ids,(partial[:chunks],prefix[:chunks],dest[:slots],base,counts,padded))
++        mid=self.mid[:rows]
++        main=self.main[:rows]
++        labels=self.labels[:rows]
++        dest,base,_,padded=mapping
++        gather(x,mid,mapping)
++        self._gemm(0,'w13',mid,main,base,padded)
++        labels.fill_(-1)
++        _restore_labels[(slots,8192//256)](main,ids,dest,labels,8192,256)
++        scale_active_rows(main,labels,layer.w13_post_scale)
++        silu_and_mul(main,mid,expert_ids=labels,expert_step=1)
++        down=main.view(-1)[:rows*4096].view(-1,4096)
++        self._gemm(1,'w2',mid,down,base,padded)
++        canonical=mid[:slots]
++        scatter(down,canonical,dest,restore=True)
++        if not defer_downscale:
++            scale_active_rows(canonical,ids,layer.w2_post_scale)
++        return canonical.view(m,8,4096)
++
++    def forward(self,layer,x,ids,defer_downscale):
++        self.stream=torch.cuda.current_stream(self.device)
++        self.prepare(layer)
++        # The canonical output is the same contract-sized allocation as the original helper.
++        out=torch.empty((x.size(0),8,4096),device=x.device,dtype=torch.bfloat16)
++        for first in range(0,x.size(0),MAX_M):
++            end=min(first+MAX_M,x.size(0))
++            out[first:end].copy_(self.chunk(layer,x[first:end],ids[first:end],defer_downscale))
++        return out,ids

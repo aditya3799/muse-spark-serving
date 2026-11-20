@@ -1,0 +1,75 @@
+Frozen exact DFlash draft-sampler transport candidate — 2026-11-19
+
+UNAPPLIED; defaultOFF. No scored/remote job or servinggain is established.
+Standalone incremental patch: sampler_integration/delta.diff
+Cumulative against frozenrelease: sampler_integration/candidate.diff
+Full hashes/evidence inventory: sampler_freeze_manifest.json
+Runtime flag: SGLANG_EXPERIMENTAL_DFLASH_PACKED_ARGMAX=1
+
+Problem and final behavior:
+The ordinary dense greedy DFlash draft sampler already runs inside the draft
+CUDAgraph. It computes the unchanged dense LM-head matmul and local torch.max,
+then gathers maxima and globalint64IDs in two consecutivecollectives. The new
+path packs their bits, performs one existing all_gather_into_tensor call, and
+selects the first maximum rank. It changes no logits, weights, local reduction,
+draft width, target verification, acceptance algorithm or sampling policy.
+
+The target deferred_argmax already has a packed singlecollective and is NOT
+changed. Selector/LiLiCorr/Domino/quantized/eager samplers are also unchanged.
+Native Muse LMhead is explicitly quant_config=None; actual ordinary captured
+draft-sampler activation still needs a real startup/serving trace.
+
+Payload contracts:
+- Generic mode retains complete maxbits and completeint64 IDs in16B/token.
+- Ordinary nativeproducer supplies declared[org_vocab_start,start+num_org)
+  bounds. These describe the ONLY source of IDs: torch.max index+fixedoffset.
+  If everyrank's interval is nonnegative and exclusiveend<=2^32, oneint64word
+  carries exact maxbits inupper32 and ID inlower32. Payload8B/token, versus
+  native10B forBF16/FP16 or12B forFP32, and2→1 collectiveinvocations.
+- Unknown, malformed, negative or oversized ranges choose16B mode onallranks.
+  No arbitraryID is truncated, noID passes through floatingpoint, and no
+  runtimevalue scan is mistaken for a proof about future graphreplays.
+- CPUstartup descriptoragreement excludes ranklocal deviceordinals/pointers.
+  Flag/dtype/capacity disagreements use native onallranks. A secondvote handles
+  anticipatedallocationOOM; temporaryobjects are released beforefallback.
+  Other programming/deviceerrors are not silently caught.
+- Buffers are fixed-capacity before capture and held by the sampler lifetime.
+  CurrentN uses compact rankchunks; no later local fallback skips a collective.
+  Existing sampler's serial-stream/graph-replay ownership contract is retained.
+
+Evidence, all local:
+RealGloo TP2/4:336cases each16B/8B acrossBF16/FP16/FP32, N1/7/28/56/112/224/257,
+ties/signedzero/inf/NaN/rawbits. Rawmaxbytes and allselectedIDs exact. Fullmode
+includesint64MIN/MAX; compactmode includes0/2^32−1. CPUonly, noNCCLlatencyclaim.
+RealGloo startupagreement:18fullpolicy +30compactpolicy cases, including
+one-rankOOM, mismatchedflags/dtypes/capacity, per-rankdeviceordinal variation,
+missing/negative/noninteger/oversized bounds. Coherentmode/fallback and object
+release pass. Allocationeligibility is structurallymocked; noactualOOM induced.
+GPUvirtualpeers:168patterncases permode +A-B-A sharedbuffer graphreplays,
+TP2/4/8,dtypesabove. TokenIDs/rawmaxbytes/outputguardzones exact.
+Actual frozen/patched samplerclass AST:144cases with originalTorch densehead,
+localmax and hidden-row extraction. Syntheticweights; TP2/8virtualpeers,
+B1/4/8, all3dtypes, normal/integer/tie/NaN. Bothpayloadmodes matchnative and
+concatenatedfullvocabargmax. Constructorpolicy acquisition injected because it
+is separatelyGlootested. Additional30edgecases includepositive/negative
+subnormals, signedzero and positive/negativeNaNpayloads; bits/IDs exact.
+
+Charged localcost only, compactmode seed1973519, native/control paired8rounds:
+N        nativepostops_us      compact_pack_select_us
+7        5.429                2.664
+28       7.562                2.802
+112      7.442                2.826
+224      7.949                2.829
+The timings EXCLUDE ALL collective and virtualpeer-copy costs. They compare
+nativeargmax+gather+copy with chargedpack+fusedselect. They support a localcost
+advantage, not a distributed or end-to-end speedup. No broader latency ratio
+is inferred, and these are not a2x servingresult.
+
+Resource control: one compactGloo attempt refused to launch with2.50GBavailable
+against3GBminimum. Read-only recheck foundrecoveredRAM; the sameguard then
+passed. No foreignservice was changed and no threshold was lowered.
+
+Remaining: actualSGLang startup/capture; real8GPUH200NCCL behavior; realweight
+token agreement and sampleractivation; paired wholefrontier latency. Cumulative
+patch applies cleanly via separateGitindex, with the checkout unchanged. The
+candidate is independent of all prologue, MoE, projection and KVstaging work.

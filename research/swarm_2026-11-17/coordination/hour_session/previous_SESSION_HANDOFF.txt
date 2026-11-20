@@ -1,0 +1,50 @@
+SERVING SWARM - STRUCTURAL RESEARCH CHECKPOINT 2026-11-16
+Workspace: D:\OpenKernelChallenge\serving
+
+User raised the research stretch target to3.0-3.5x after reports in official
+SGLang Slack. User declines Slack installation; thread access is not required.
+Confirmed serving score remains1.2237x, job e399c79bb1994630. No new score.
+The earlier1.25-1.35 estimate concerned smaller changes, not a proven ceiling.
+
+LATEST DURABLE EVIDENCE
+swarm_2026-11-16/coordination/stretch_research/RESEARCH_STATUS.json
+PLAN.json, GAIN_BUDGET.json and EXPERIMENT_QUEUE.json in the same directory.
+
+FIRST STRUCTURAL ROUND
+MoE canonical-layout adapter:10CPU address/tile checks and32RTX3050 integer
+CUDA eager/changed-input graph checks pass,0mismatches, intact canaries.
+Keeps Humming as sole resident weights. Donor down words map to one source
+word, gate/up to two. Direct diagnostic gather is not the intended fast kernel.
+Next: coalesced producer/bit permutation in expert GEMM with unchanged math,
+numerical gates, shared-memory occupancy and whole-model memory/performance.
+No GEMM speed or new serving score is claimed. First context-init harness
+failure retained; corrected retry exit0, header unchanged.
+Evidence: moe/phase3/canonical_tile_gpu_retry/results.json under swarm root.
+
+Communication: isolated reduction-preserving reduce-scatter/unpool prototype.
+74CPU checks andSM90 compile pass. Same reduction implementation and barriers;
+no change to selected transport/policy. Default eligibleM512..2048 atE4096;
+ordinary decode/verify and full16K chunks excluded. Illustrative tail traffic
+saving25%, not serving gain. H200 multi-rank equality/liveness/memory pending.
+Evidence: projection_communication/phase3/reduce_scatter_unpool/RESEARCH_REPORT.json.
+
+Speculation: scored DFlash8 acceptance4.0..4.1. Width4/6 experiments require
+measured accepted tokens versus cycle cost. No independent draftTP flag found;
+no adaptive/ragged DFlash verification support to enable with a simple flag.
+Offline cost model validated; no runtime policy or flags changed.
+Evidence: attention_speculation/phase3_speculative_cost/STRATEGIC_RESEARCH.json.
+
+QUOTA AND DEADLINE
+Live quota:0checks,0scored; next reset2026-11-17T00:00Z (05:30IST).
+Existing checks fa0d2a0fcf584339 and6570fbd9e1b64ce4 still queued; no duplicates.
+Live official deadline2026-11-20T08:00Z (13:30IST).
+No new remote submissions in this round. Inspect pending results/livequota
+before selecting the strongest locally gated experiment for H200 evaluation.
+
+PRESERVATION
+Active checkout untouched. Root patch and scored baseline hashes unchanged.
+Previously prepared conservative patches remain in coordination/research_resumed.
+Do not replace the scored baseline with these diagnostic prototypes.
+GPU/compiler workloads finished; reservations released. No scheduled research
+or automatic polling exists. Resume from latest evidence and next gates above.
+Earlier detailed checkpoint preserved in stretch_research/previous_SESSION_HANDOFF.txt.

@@ -1,0 +1,174 @@
+--- a/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
++++ b/python/sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py
+@@ -297,9 +297,9 @@
+     HummingMethod.forward_layer(layer, inputs=x, outputs=cache1, top_k=topk, sublayer_name='w13', tuning_config=selected['w13'], **common)
+     # GEMM output has already rounded to BF16. Apply the BF16 global scale
+     # in a separate BF16 operation, preserving Marlin's second rounding.
+-    scale_active_rows(cache1, local_ids, layer.w13_post_scale)
+     cache2 = torch.empty((m * topk, i), device=x.device, dtype=x.dtype)
+-    silu_and_mul(cache1, cache2, expert_ids=local_ids.flatten(), expert_step=1)
++    from sglang.kernels.ops.moe.muse_spark_scale_activation import scaled_silu_and_mul
++    scaled_silu_and_mul(cache1,cache2,local_ids,layer.w13_post_scale)
+     cache3 = cache13[:m * topk * k].view(m * topk, k)
+     if selected['w2']['block_shape'][0] != block:
+         second = moe_align_block_size(local_ids, selected['w2']['block_shape'][0], layer.w2_post_scale.numel(), ignore_invalid_expert=True)
+--- a/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
++++ b/python/sglang/kernels/ops/moe/muse_spark_humming_split.py
+@@ -120,9 +120,9 @@
+             tuning_config=config,sorted_ids=sorted_ids,expert_ids=expert_ids,num_tokens_padded=padded,
+             valid_shape_m=valid,compute_config={'gemm_type':'indexed','use_f16_accum':False})
+     # Both up partitions are complete before scaling/activation or down-buffer reuse.
+-    scale_active_rows(cache1,local_ids,layer.w13_post_scale)
+     cache2 = torch.empty((m*topk,intermediate),device=x.device,dtype=x.dtype)
+-    silu_and_mul(cache1,cache2,expert_ids=local_ids.flatten(),expert_step=1)
++    from sglang.kernels.ops.moe.muse_spark_scale_activation import scaled_silu_and_mul
++    scaled_silu_and_mul(cache1,cache2,local_ids,layer.w13_post_scale)
+     cache3 = cache13[:m*topk*k].view(m*topk,k)
+     for name,ids in partitions:
+         config = plan[name]['w2']
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/muse_spark_scale_activation.py
+@@ -0,0 +1,59 @@
++"""Preserve the BF16 global-scale boundary while fusing it with stock SiLU."""
++import torch
++from sglang.kernels.jit.utils import (
++    cache_once, get_activation_cuda_cflags, is_arch_support_pdl, load_jit, make_cpp_args,
++)
++from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
++
++
++@cache_once
++def _scaled_activation_module():
++    args = make_cpp_args(torch.bfloat16, is_arch_support_pdl())
++    return load_jit(
++        "muse_spark_scale_activation", *args,
++        cuda_files=["elementwise/muse_spark_scale_activation.cuh"],
++        extra_cuda_cflags=get_activation_cuda_cflags(),
++        extra_include_paths=[str(KERNEL_PATH / "csrc")],
++        cuda_wrappers=[("run", f"ScaledActivationKernel<{args}>::run")],
++    )
++
++
++def _supports_scaled_activation(input, output, local_ids, scales):
++    if torch.version.hip is not None or torch.compiler.is_compiling():
++        return False
++    if input.ndim != 2 or output.ndim != 2 or scales.ndim != 1:
++        return False
++    if any(t.dtype != torch.bfloat16 for t in (input, output, scales)):
++        return False
++    if local_ids.dtype not in (torch.int32, torch.int64):
++        return False
++    if not input.is_cuda or any(t.device != input.device for t in (output, local_ids, scales)):
++        return False
++    if not all(t.is_contiguous() for t in (input, output, local_ids, scales)):
++        return False
++    width = output.shape[1]
++    if width <= 0 or width % 8 or input.shape != (output.shape[0], 2 * width):
++        return False
++    if local_ids.numel() != input.shape[0] or scales.numel() == 0:
++        return False
++    if input.shape[0] * (width // 8) > (2**32 - 1) // 2:
++        return False
++    return torch.cuda.get_device_capability(input.device)[0] >= 8
++
++
++def scaled_silu_and_mul(input, output, local_ids, scales):
++    """Internal mapped-route helper; IDs are -1 or valid local expert indices.
++
++    The input/output buffers are disjoint. Scaled gate/up values are consumed
++    only by SiLU, so the fused path does not materialize them back into input.
++    """
++    if not _supports_scaled_activation(input, output, local_ids, scales):
++        from sglang.kernels.ops.moe.muse_spark_humming_scale import scale_active_rows
++        from sglang.kernels.ops.activation.activation import silu_and_mul
++        scale_active_rows(input, local_ids, scales)
++        return silu_and_mul(input, output, expert_ids=local_ids.flatten(), expert_step=1)
++    if input.shape[0] == 0:
++        return output
++    ids = local_ids.reshape(-1).to(torch.int32)
++    _scaled_activation_module().run(input, output, ids, scales)
++    return output
+--- /dev/null
++++ b/python/sglang/kernels/jit/csrc/elementwise/muse_spark_scale_activation.cuh
+@@ -0,0 +1,81 @@
++// Fuse global BF16 scaling with the pinned stock CUDA SiLU implementation.
++#include "elementwise/activation.cuh"
++
++namespace sglang {
++struct ScaledActivationParams {
++  const void* input;
++  void* output;
++  const void* scales;
++  const int32_t* expert_ids;
++  uint32_t hidden;
++  uint32_t rows;
++  uint32_t experts;
++};
++
++// Stock Triton scaling does not flush FP32 subnormals. Explicit PTX prevents
++// --use_fast_math (needed to match stock activation) from altering this multiply.
++SGL_DEVICE float exact_scale_product(float value, float scale) {
++  float result;
++  asm("mul.rn.f32 %0, %1, %2;" : "=f"(result) : "f"(value), "f"(scale));
++  return result;
++}
++
++template <typename T, bool kUsePDL>
++__global__ void scaled_silu_kernel(const __grid_constant__ ScaledActivationParams params) {
++  using namespace device;
++  constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
++  using vec_t = AlignedVector<T, kVecSize>;
++  const uint32_t vectors = params.hidden / kVecSize;
++  const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
++  const uint32_t row = tid / vectors;
++  if (row >= params.rows) return;
++  const int32_t expert = params.expert_ids[row];
++  if (expert < 0 || static_cast<uint32_t>(expert) >= params.experts) return;
++  PDLWaitPrimary<kUsePDL>();
++  const auto offset = row * vectors * 2 + tid % vectors;
++  const auto gate = device::load_as<vec_t>(params.input, offset);
++  const auto up = device::load_as<vec_t>(params.input, offset + vectors);
++  const float scale = device::cast<fp32_t>(static_cast<const T*>(params.scales)[expert]);
++  vec_t result;
++#pragma unroll
++  for (int i = 0; i < kVecSize; ++i) {
++    const T scaled_gate = device::cast<T>(exact_scale_product(device::cast<fp32_t>(gate[i]), scale));
++    const T scaled_up = device::cast<T>(exact_scale_product(device::cast<fp32_t>(up[i]), scale));
++    const float gate_f32 = device::cast<fp32_t>(scaled_gate);
++    const float up_f32 = device::cast<fp32_t>(scaled_up);
++    result[i] = device::cast<T>(apply_activation_f32<ActivationKind::kSiLU>(gate_f32) * up_f32);
++  }
++  device::store_as<vec_t>(params.output, result, tid);
++  PDLTriggerSecondary<kUsePDL>();
++}
++
++template <typename T, bool kUsePDL>
++struct ScaledActivationKernel {
++  static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output,
++                  tvm::ffi::TensorView ids, tvm::ffi::TensorView scales) {
++    using namespace host;
++    auto rows = SymbolicSize{"rows"};
++    auto width = SymbolicSize{"input_width"};
++    auto hidden = SymbolicSize{"hidden"};
++    auto experts = SymbolicSize{"experts"};
++    auto device_ = SymbolicDevice{};
++    device_.set_options<kDLCUDA>();
++    TensorMatcher({rows, width}).with_dtype<T>().with_device(device_).verify(input);
++    TensorMatcher({rows, hidden}).with_dtype<T>().with_device(device_).verify(output);
++    TensorMatcher({rows}).with_dtype<int32_t>().with_device(device_).verify(ids);
++    TensorMatcher({experts}).with_dtype<T>().with_device(device_).verify(scales);
++    constexpr uint32_t vector_size = device::kMaxVecBytes / sizeof(T);
++    RuntimeCheck(hidden.unwrap() > 0 && hidden.unwrap() * 2 == width.unwrap(), "invalid widths");
++    RuntimeCheck(hidden.unwrap() % vector_size == 0, "hidden width must align to vector size");
++    RuntimeCheck(experts.unwrap() > 0, "empty scales");
++    const uint64_t items = rows.unwrap() * (hidden.unwrap() / vector_size);
++    RuntimeCheck(items <= std::numeric_limits<uint32_t>::max() / 2, "32-bit indexing overflow");
++    if (rows.unwrap() == 0) return;
++    const ScaledActivationParams params{input.data_ptr(), output.data_ptr(), scales.data_ptr(),
++      static_cast<const int32_t*>(ids.data_ptr()), static_cast<uint32_t>(hidden.unwrap()),
++      static_cast<uint32_t>(rows.unwrap()), static_cast<uint32_t>(experts.unwrap())};
++    LaunchKernel(div_ceil(static_cast<uint32_t>(items), 256u), 256u, device_.unwrap())
++      .enable_pdl(kUsePDL)(scaled_silu_kernel<T, kUsePDL>, params);
++  }
++};
++}  // namespace sglang

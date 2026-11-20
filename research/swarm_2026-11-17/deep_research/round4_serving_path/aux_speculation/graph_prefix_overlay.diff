@@ -1,0 +1,864 @@
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -4,6 +4,15 @@
+ from typing import TYPE_CHECKING, List, Optional, Tuple
+ 
+ import torch
++
++from sglang.srt.speculative.target_prefix_graph_runtime import (
++    initialize_target_prefix_states, target_prefix_scope,
++)
++
++from sglang.srt.speculative.dflash_prefix_verification import (
++    next_prefix_accept_buffers,
++    resolve_prefix_verification_width,
++)
+ 
+ from sglang.kernels.ops.speculative.cache_locs import (
+     assign_extend_cache_locs_func,
+@@ -696,6 +705,8 @@
+         )
+ 
+     def init_cuda_graphs(self):
++        # Default-off; target capture exists, draft TP scope has not started.
++        initialize_target_prefix_states(self)
+         target_dp_enabled = get_parallel().attn_dp_enabled
+         with (
+             draft_pp_context(),
+@@ -2164,7 +2175,7 @@
+         self._accept_bonus_buffer_cap = new_cap
+ 
+     def _next_accept_bonus_buffers(
+-        self, bs: int
++        self, bs: int, block_size: Optional[int] = None
+     ) -> tuple[
+         torch.Tensor,
+         torch.Tensor,
+@@ -2172,6 +2183,8 @@
+         torch.Tensor,
+         torch.Tensor,
+     ]:
++        if block_size is not None and block_size != int(self.block_size):
++            return next_prefix_accept_buffers(self, bs, block_size)
+         self._ensure_accept_bonus_buffers(bs)
+         assert self._accept_len_buf is not None
+         slot = self._accept_bonus_buffer_slot
+@@ -2195,6 +2208,13 @@
+         bs: int,
+         target_predict: Optional[torch.Tensor] = None,
+     ):
++        if candidates.shape[1] != int(self.block_size):
++            expected_rows = bs * candidates.shape[1]
++            if target_predict is not None:
++                if target_predict.numel() != expected_rows:
++                    raise ValueError("DFLASH prefix predictions retain padding")
++            elif next_token_logits.shape[0] != expected_rows:
++                raise ValueError("DFLASH prefix logits retain padding")
+         new_seq_lens = None
+         if self._selector_sample is not None:
+             selector_candidate_ids, selector_q_rows = self._selector_sample
+@@ -2225,7 +2245,7 @@
+         else:
+             if target_predict is None:
+                 target_predict = torch.argmax(next_token_logits, dim=-1)
+-            target_predict = target_predict.view(bs, int(self.block_size))
++            target_predict = target_predict.view(bs, candidates.shape[1])
+             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
+             if self._use_triton_accept_bonus:
+                 try:
+@@ -2235,7 +2255,7 @@
+                         bonus,
+                         out_tokens,
+                         new_seq_lens,
+-                    ) = self._next_accept_bonus_buffers(bs)
++                    ) = self._next_accept_bonus_buffers(bs, candidates.shape[1])
+                     _compute_dflash_accept_bonus_triton_unchecked(
+                         candidates=candidates,
+                         target_top1=target_predict,
+@@ -2816,199 +2836,224 @@
+             GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
+         )
+ 
+-        # --- 2) Target verify.
+-        # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
+-        custom_mask = None
+-
+-        verify_input_ids = draft_tokens.reshape(-1)
+-        verify_input = DFlashVerifyInput(
+-            draft_token=verify_input_ids,
+-            positions=positions,
+-            draft_token_num=int(self.block_size),
+-            custom_mask=custom_mask,
+-            capture_hidden_mode=CaptureHiddenMode.FULL,
+-            kv_loc_plan=kv_loc_plan,
+-        )
+-
+-        batch.out_cache_loc = verify_out_cache_loc
+-        sampling_info = batch.sampling_info
+-
+-        seq_lens_pre_verify = (
+-            batch.seq_lens.clone() if self._need_mamba_verify_commit else None
+-        )
+-        seq_lens_cpu_backup = batch.seq_lens_cpu
+-        seq_lens_sum_backup = batch.seq_lens_sum
+-        if seq_lens_cpu_backup is not None:
+-            # Verify host bound = committed prefix + one verify block (matches draft).
+-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
+-            batch.seq_lens_cpu = verify_host_seq_lens
+-            batch.seq_lens_sum = int(verify_host_seq_lens.sum())
+-        elif draft_input.nxt_kv_lens_cpu is not None:
+-            batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+-            batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
+-
+-        verify_forward_batch, _ = verify_input.prepare_for_verify(
+-            batch,
+-            self.target_worker,
+-            defer_metadata_init=get_parallel().attn_dp_enabled,
+-        )
+-        batch.seq_lens_cpu = seq_lens_cpu_backup
+-        batch.seq_lens_sum = seq_lens_sum_backup
+-
+-        # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
+-        # counts while a graph-replaying rank assumes the padded bucket, so
+-        # their DP-gather segment offsets disagree. Fall back to eager verify
+-        # whenever any DP rank is idle this round.
+-        if (
+-            get_parallel().attn_dp_enabled
+-            and verify_forward_batch.original_global_num_tokens_cpu is not None
+-            and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
+-        ):
+-            verify_forward_batch.can_run_decode_cuda_graph = False
+-
+-        # Mixed-round guard: an extend rank's raw token counts disagree with
+-        # the verify batch's spec-scaled counts on the DP-gather layout; run
+-        # eager, symmetric with the idle guard above.
+-        if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
+-            verify_forward_batch.can_run_decode_cuda_graph = False
+-
+-        target_out = self.target_worker.forward_batch_generation(
+-            batch=None,
+-            forward_batch=verify_forward_batch,
+-            is_verify=True,
+-            skip_attn_backend_init=(
+-                None if _is_npu or get_parallel().attn_dp_enabled else True
+-            ),
+-        )
+-        logits_output = target_out.logits_output
+-        can_run_cuda_graph = target_out.can_run_cuda_graph
+-        target_predict = None
+-        target_lp = self._target_logits_processor
+-        if target_lp is not None and target_lp.is_deferred_shard(
+-            logits_output.next_token_logits
+-        ):
+-            if self._can_skip_verify_logits(batch, sampling_info):
+-                target_predict = target_lp.deferred_argmax(
+-                    logits_output.next_token_logits
+-                )
+-                logits_output.next_token_logits = None
+-            else:
+-                logits_output.next_token_logits = target_lp.finish_deferred_gather(
+-                    logits_output.next_token_logits
+-                )
+-
+-        grammar_mask = None
+-        if batch.has_grammar:
+-            grammar_mask = build_grammar_vocab_mask(
+-                reqs=batch.reqs,
+-                tree=grammar_tree,
+-                sampling_info=batch.sampling_info,
+-                device=logits_output.next_token_logits.device,
+-                barrier=grammar_barrier,
+-            )
+-
+-        if sampling_info is not None and target_predict is None:
+-            apply_dflash_verify_logits_adjustments(
++        # Draft diffusion and proposal generation retain their original width.
++        verify_block_size = resolve_prefix_verification_width(
++            self, batch, get_parallel()
++        )
++        verify_cols = None
++        if verify_block_size != block_size:
++            draft_tokens = draft_tokens[:, :verify_block_size].contiguous()
++            positions = positions_2d[:, :verify_block_size].contiguous().view(-1)
++            verify_out_cache_loc_2d = (
++                verify_out_cache_loc_2d[:, :verify_block_size].contiguous()
++            )
++            verify_out_cache_loc = verify_out_cache_loc_2d.view(-1)
++            verify_cols = slice(0, verify_block_size)
++
++        with target_prefix_scope(self, verify_block_size):
++            # --- 2) Target verify.
++            # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
++            custom_mask = None
++
++            verify_input_ids = draft_tokens.reshape(-1)
++            verify_input = DFlashVerifyInput(
++                draft_token=verify_input_ids,
++                positions=positions,
++                draft_token_num=verify_block_size,
++                custom_mask=custom_mask,
++                capture_hidden_mode=CaptureHiddenMode.FULL,
++                kv_loc_plan=kv_loc_plan,
++                kv_loc_cols=verify_cols,
++            )
++
++            batch.out_cache_loc = verify_out_cache_loc
++            sampling_info = batch.sampling_info
++
++            seq_lens_pre_verify = (
++                batch.seq_lens.clone() if self._need_mamba_verify_commit else None
++            )
++            seq_lens_cpu_backup = batch.seq_lens_cpu
++            seq_lens_sum_backup = batch.seq_lens_sum
++            if seq_lens_cpu_backup is not None:
++                # Verify host bound = committed prefix + one verify block (matches draft).
++                verify_host_seq_lens = seq_lens_cpu_backup + verify_block_size
++                batch.seq_lens_cpu = verify_host_seq_lens
++                batch.seq_lens_sum = int(verify_host_seq_lens.sum())
++            elif draft_input.nxt_kv_lens_cpu is not None:
++                batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
++                batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
++
++            verify_forward_batch, _ = verify_input.prepare_for_verify(
++                batch,
++                self.target_worker,
++                defer_metadata_init=get_parallel().attn_dp_enabled,
++            )
++            batch.seq_lens_cpu = seq_lens_cpu_backup
++            batch.seq_lens_sum = seq_lens_sum_backup
++
++            # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
++            # counts while a graph-replaying rank assumes the padded bucket, so
++            # their DP-gather segment offsets disagree. Fall back to eager verify
++            # whenever any DP rank is idle this round.
++            if (
++                get_parallel().attn_dp_enabled
++                and verify_forward_batch.original_global_num_tokens_cpu is not None
++                and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
++            ):
++                verify_forward_batch.can_run_decode_cuda_graph = False
++
++            # Mixed-round guard: an extend rank's raw token counts disagree with
++            # the verify batch's spec-scaled counts on the DP-gather layout; run
++            # eager, symmetric with the idle guard above.
++            if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
++                verify_forward_batch.can_run_decode_cuda_graph = False
++
++            target_out = self.target_worker.forward_batch_generation(
++                batch=None,
++                forward_batch=verify_forward_batch,
++                is_verify=True,
++                skip_attn_backend_init=(
++                    None if _is_npu or get_parallel().attn_dp_enabled else True
++                ),
++            )
++            logits_output = target_out.logits_output
++            can_run_cuda_graph = target_out.can_run_cuda_graph
++            target_predict = None
++            target_lp = self._target_logits_processor
++            if target_lp is not None and target_lp.is_deferred_shard(
++                logits_output.next_token_logits
++            ):
++                if self._can_skip_verify_logits(batch, sampling_info):
++                    target_predict = target_lp.deferred_argmax(
++                        logits_output.next_token_logits
++                    )
++                    logits_output.next_token_logits = None
++                else:
++                    logits_output.next_token_logits = target_lp.finish_deferred_gather(
++                        logits_output.next_token_logits
++                    )
++
++            grammar_mask = None
++            if batch.has_grammar:
++                grammar_mask = build_grammar_vocab_mask(
++                    reqs=batch.reqs,
++                    tree=grammar_tree,
++                    sampling_info=batch.sampling_info,
++                    device=logits_output.next_token_logits.device,
++                    barrier=grammar_barrier,
++                )
++
++            if sampling_info is not None and target_predict is None:
++                apply_dflash_verify_logits_adjustments(
++                    next_token_logits=logits_output.next_token_logits,
++                    sampling_info=sampling_info,
++                    draft_token_num=verify_block_size,
++                )
++
++            # Constrain every chain position before accept picks from it.
++            if grammar_mask is not None:
++                grammar_mask.apply(logits_output.next_token_logits)
++
++            candidates = draft_tokens
++            (
++                accept_len,
++                commit_lens,
++                bonus,
++                out_tokens,
++                new_seq_lens,
++            ) = self._accept_block(
++                candidates=candidates,
+                 next_token_logits=logits_output.next_token_logits,
+                 sampling_info=sampling_info,
+-                draft_token_num=int(self.block_size),
+-            )
+-
+-        # Constrain every chain position before accept picks from it.
+-        if grammar_mask is not None:
+-            grammar_mask.apply(logits_output.next_token_logits)
+-
+-        candidates = draft_tokens
+-        (
+-            accept_len,
+-            commit_lens,
+-            bonus,
+-            out_tokens,
+-            new_seq_lens,
+-        ) = self._accept_block(
+-            candidates=candidates,
+-            next_token_logits=logits_output.next_token_logits,
+-            sampling_info=sampling_info,
+-            draft_input=draft_input,
+-            prefix_lens=prefix_lens,
+-            bs=bs,
+-            target_predict=target_predict,
+-        )
+-
+-        sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
+-            sampling_info,
+-            next_token_logits=logits_output.next_token_logits,
+-            draft_input=draft_input,
+-            draft_token_num=int(self.block_size),
+-            bs=bs,
+-        )
+-        if sampling_mask_capture is not None:
+-            logits_output.sampling_mask_output = sampling_mask_capture.build_output(
+-                out_tokens=out_tokens,
+-                commit_lens=commit_lens,
+-            )
+-
+-        if batch.return_logprob:
+-            compute_spec_logprobs(
+-                batch,
+-                logits_output,
+-                out_tokens.reshape(-1),
+-                chain_stride=block_size,
+-            )
+-
+-        if self._need_mamba_verify_commit:
+-            assert seq_lens_pre_verify is not None
++                draft_input=draft_input,
++                prefix_lens=prefix_lens,
++                bs=bs,
++                target_predict=target_predict,
++            )
++
++            sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
++                sampling_info,
++                next_token_logits=logits_output.next_token_logits,
++                draft_input=draft_input,
++                draft_token_num=verify_block_size,
++                bs=bs,
++            )
++            if sampling_mask_capture is not None:
++                logits_output.sampling_mask_output = sampling_mask_capture.build_output(
++                    out_tokens=out_tokens,
++                    commit_lens=commit_lens,
++                )
++
++            if batch.return_logprob:
++                compute_spec_logprobs(
++                    batch,
++                    logits_output,
++                    out_tokens.reshape(-1),
++                    chain_stride=verify_block_size,
++                )
++
++            if self._need_mamba_verify_commit:
++                assert seq_lens_pre_verify is not None
++                if new_seq_lens is None:
++                    new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
++                self._update_target_mamba_state_after_verify(
++                    batch=batch,
++                    seq_lens_pre_verify=seq_lens_pre_verify,
++                    seq_lens_post_verify=new_seq_lens,
++                    commit_lens=commit_lens,
++                )
++
+             if new_seq_lens is None:
+                 new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+-            self._update_target_mamba_state_after_verify(
+-                batch=batch,
+-                seq_lens_pre_verify=seq_lens_pre_verify,
+-                seq_lens_post_verify=new_seq_lens,
++            if on_publish is not None:
++                on_publish(new_seq_lens)
++
++            # --- 3) Materialize committed verify-input tokens into draft KV cache.
++            hidden = logits_output.hidden_states
++            if hidden is None:
++                raise RuntimeError(
++                    "DFLASH verify requires target hidden states, but got None."
++                )
++            if verify_block_size != block_size and (
++                hidden.ndim != 2 or hidden.shape[0] != bs * verify_block_size
++            ):
++                raise ValueError("DFLASH prefix aux rows retain padding")
++            hidden = hidden.view(bs, verify_block_size, -1)
++
++            # Consume in this step: every decode graph size shares one aux output,
++            # which the next target forward overwrites (resolve_aux_hidden_states_width).
++            cache_loc = kv_loc_plan.write_ids(
++                self.draft_model_runner.kv_index_translator, cols=verify_cols
++            )
++            self._append_target_hidden_to_draft_kv_by_loc(
++                target_hidden=hidden.reshape(-1, hidden.shape[-1]),
++                cache_loc=cache_loc,
++                cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
++                positions=positions,
+                 commit_lens=commit_lens,
+             )
+ 
+-        if new_seq_lens is None:
+-            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+-        if on_publish is not None:
+-            on_publish(new_seq_lens)
+-
+-        # --- 3) Materialize committed verify-input tokens into draft KV cache.
+-        hidden = logits_output.hidden_states
+-        if hidden is None:
+-            raise RuntimeError(
+-                "DFLASH verify requires target hidden states, but got None."
+-            )
+-        hidden = hidden.view(bs, int(self.block_size), -1)
+-
+-        # Consume in this step: every decode graph size shares one aux output,
+-        # which the next target forward overwrites (resolve_aux_hidden_states_width).
+-        cache_loc = self._draft_write_ids(kv_loc_plan)
+-        self._append_target_hidden_to_draft_kv_by_loc(
+-            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+-            cache_loc=cache_loc,
+-            cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
+-            positions=positions,
+-            commit_lens=commit_lens,
+-        )
+-
+-        # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
+-        logits_output.hidden_states = None
+-
+-        next_draft_input = self._make_next_draft_input_decode(
+-            bonus_tokens=bonus,
+-            new_seq_lens=new_seq_lens,
+-        )
+-
+-        return GenerationBatchResult(
+-            logits_output=logits_output,
+-            next_token_ids=out_tokens.reshape(-1),
+-            accept_lens=commit_lens,
+-            can_run_cuda_graph=can_run_cuda_graph,
+-            next_draft_input=next_draft_input,
+-            speculative_num_draft_tokens=int(self.block_size),
+-            # The non-overlap (sync) scheduler path advances batch.seq_lens
+-            # from the result; overlap carries it via next_draft_input instead.
+-            new_seq_lens=new_seq_lens,
+-            routed_experts_output=target_out.routed_experts_output,
+-            indexer_topk_output=target_out.indexer_topk_output,
+-        )
++            # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
++            logits_output.hidden_states = None
++
++            next_draft_input = self._make_next_draft_input_decode(
++                bonus_tokens=bonus,
++                new_seq_lens=new_seq_lens,
++            )
++
++            return GenerationBatchResult(
++                logits_output=logits_output,
++                next_token_ids=out_tokens.reshape(-1),
++                accept_lens=commit_lens,
++                can_run_cuda_graph=can_run_cuda_graph,
++                next_draft_input=next_draft_input,
++                speculative_num_draft_tokens=int(self.block_size),
++                speculative_output_stride=(
++                    verify_block_size if verify_block_size != block_size else None
++                ),
++                # The non-overlap (sync) scheduler path advances batch.seq_lens
++                # from the result; overlap carries it via next_draft_input instead.
++                new_seq_lens=new_seq_lens,
++                routed_experts_output=target_out.routed_experts_output,
++                indexer_topk_output=target_out.indexer_topk_output,
++            )
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -48,7 +48,11 @@
+ )
+ from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
+ from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
+-from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
++from sglang.srt.speculative.spec_info import (
++    SpecInput,
++    SpecInputType,
++    SpeculativeAlgorithm,
++)
+ from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
+ from sglang.srt.utils import get_compiler_backend
+ from sglang.srt.utils.common import get_device_capability
+@@ -1034,6 +1038,15 @@
+             # TODO: we need to test this part for llama 4 eagle case
+             self._maybe_init_local_attn_metadata(metadata, device)
+         elif forward_batch.forward_mode.is_target_verify():
++            verify_width = self.speculative_num_draft_tokens
++            if (
++                forward_batch.spec_info is not None
++                and forward_batch.spec_info.spec_input_type
++                == SpecInputType.DFLASH_VERIFY
++            ):
++                verify_width = int(forward_batch.spec_info.draft_token_num)
++                if verify_width <= 0:
++                    raise ValueError("DFLASH verification width must be positive")
+             if self.topk <= 1:
+                 ragged_layout = getattr(
+                     forward_batch.spec_info, "ragged_verify_layout", None
+@@ -1057,16 +1070,16 @@
+                     metadata.cu_seqlens_k = geometry.cu_seqlens_k
+                 else:
+                     metadata.cache_seqlens_int32 = (
+-                        forward_batch.seq_lens + self.speculative_num_draft_tokens
++                        forward_batch.seq_lens + verify_width
+                     ).to(torch.int32)
+-                    metadata.max_seq_len_q = self.speculative_num_draft_tokens
++                    metadata.max_seq_len_q = verify_width
+                     metadata.max_seq_len_k = (
+-                        eager_max_k + self.speculative_num_draft_tokens
++                        eager_max_k + verify_width
+                     )
+                     metadata.cu_seqlens_q = torch.arange(
+                         0,
+-                        batch_size * self.speculative_num_draft_tokens + 1,
+-                        self.speculative_num_draft_tokens,
++                        batch_size * verify_width + 1,
++                        verify_width,
+                         dtype=torch.int32,
+                         device=device,
+                     )
+--- /dev/null
++++ b/python/sglang/srt/speculative/dflash_prefix_verification.py
+@@ -0,0 +1,84 @@
++"""Isolated research support for fixed draft / shorter target verification.
++
++Not wired to a server flag. A fixture must explicitly configure the worker.
++This precursor uses eager target verification for non-default widths. Target
++shape-dependent numerical behavior and end-to-end serving remain unqualified.
++"""
++from dataclasses import dataclass
++
++import torch
++
++
++@dataclass(frozen=True)
++class PrefixVerificationConfig:
++    draft_width: int
++    verify_width: int
++
++    def __post_init__(self):
++        if not 1 <= self.verify_width <= self.draft_width:
++            raise ValueError("verify width must be in [1, draft width]")
++
++
++def configure_prefix_verification(worker, verify_width):
++    # Configuration is host-side and must be identical on every TP/EP rank.
++    # No adaptive policy or rank-local measurement is installed here.
++    worker._prefix_verification_config = PrefixVerificationConfig(
++        int(worker.block_size), int(verify_width)
++    )
++
++
++def resolve_prefix_verification_width(worker, batch, parallel):
++    default = int(worker.block_size)
++    config = getattr(worker, "_prefix_verification_config", None)
++    if config is None or config.verify_width == default:
++        return default
++    if config.draft_width != default:
++        raise RuntimeError("draft width changed after prefix configuration")
++    runner = worker.target_worker.model_runner
++    backend = runner.attn_backend
++    supported = (
++        type(backend).__name__ == "FlashAttentionBackend"
++        and backend.fa_impl_ver == 3
++        and backend.topk <= 1
++        and not worker._need_mamba_verify_commit
++        and not parallel.attn_dp_enabled
++        and parallel.attn_cp_size == 1
++        and parallel.attn_dcp_size == 1
++        and parallel.pp_size == 1
++        and not runner.model_config.is_encoder_decoder
++        and runner.lora_manager is None
++        and worker.lilicorr is None
++        and not worker._is_domino
++        and worker._can_skip_verify_logits(batch, batch.sampling_info)
++    )
++    return config.verify_width if supported else default
++
++
++def next_prefix_accept_buffers(worker, batch_size, width):
++    """Same dtypes and two-slot consumer lifetime as stock accept buffers."""
++    states = getattr(worker, "_prefix_accept_buffers", None)
++    if states is None:
++        states = worker._prefix_accept_buffers = {}
++    state = states.get(width)
++    if state is None or state["capacity"] < batch_size:
++        capacity = max(batch_size, 0 if state is None else 2 * state["capacity"])
++        device = worker.device
++        state = {
++            "capacity": capacity,
++            "slot": 0,
++            "accept": torch.empty(capacity, dtype=torch.int32, device=device),
++            "commit": [torch.empty(capacity, dtype=torch.int32, device=device) for _ in range(2)],
++            "bonus": [torch.empty(capacity, dtype=torch.int64, device=device) for _ in range(2)],
++            "tokens": [torch.empty((capacity, width), dtype=torch.int64, device=device) for _ in range(2)],
++            "length": [torch.empty(capacity, dtype=torch.int64, device=device) for _ in range(2)],
++        }
++        states[width] = state
++    slot = state["slot"]
++    state["slot"] = (slot + 1) % 2
++    return (
++        state["accept"][:batch_size],
++        state["commit"][slot][:batch_size],
++        state["bonus"][slot][:batch_size],
++        state["tokens"][slot][:batch_size],
++        state["length"][slot][:batch_size],
++    )
+--- /dev/null
++++ b/python/sglang/srt/speculative/target_verify_runtime_state.py
+@@ -0,0 +1,132 @@
++"""Target-only runtime ownership prototype. No controller, no serving hook.
++Factories may use the pinned FA3 backend/DecodeCudaGraphRunner, but this module
++never changes global speculative settings or constructs a second model/KV pool.
++"""
++from contextlib import contextmanager
++from dataclasses import dataclass
++import threading
++
++
++@dataclass(frozen=True)
++class TargetVerifyState:
++    width: int
++    backend: object
++    graph: object
++
++
++class TargetVerifyStates:
++    def __init__(self, model_runner, draft_width, stream_key):
++        self.runner = model_runner
++        self.draft_width = int(draft_width)
++        self.stream_key = stream_key
++        self.thread = threading.get_ident()
++        self.active = False
++        self.startup_open = True
++        self.invalidated_reason = None
++        self.owners = self._owners()
++        self.default_backend = model_runner.attn_backend
++        self.default_graph = model_runner.decode_cuda_graph_runner
++        self.states = {self.draft_width: TargetVerifyState(
++            self.draft_width, self.default_backend, self.default_graph
++        )}
++
++    def _owners(self):
++        r = self.runner
++        return tuple(id(getattr(r, name)) for name in (
++            'model', 'req_to_token_pool', 'token_to_kv_pool',
++            'token_to_kv_pool_allocator', 'kv_index_translator',
++            'prefill_cuda_graph_runner', 'graph_shared_output',
++        ))
++
++    def invalidate(self, reason):
++        """Call before ANY weight mutation, recapture or topology replacement.
++        Retain graph/buffer references until caller synchronizes and retires us.
++        Owner identity alone cannot detect parameter.data or in-place updates.
++        """
++        if threading.get_ident() != self.thread or self.active:
++            raise RuntimeError("cannot invalidate active/foreign-thread target states")
++        self.invalidated_reason = str(reason)
++        self.startup_open = False
++
++    def bind_forward_stream(self, stream_key):
++        # Scheduler creates its serial serving stream AFTER startup capture.
++        self._guard()
++        if self.startup_open:
++            raise RuntimeError("bind serving stream only after startup capture")
++        if self.stream_key is not None and self.stream_key != stream_key:
++            raise RuntimeError("forward stream already bound")
++        self.stream_key = stream_key
++
++    def _guard(self):
++        if self.invalidated_reason is not None:
++            raise RuntimeError("target states invalidated: " + self.invalidated_reason)
++        if threading.get_ident() != self.thread:
++            raise RuntimeError('target state accessed from another host thread')
++        if self._owners() != self.owners:
++            raise RuntimeError('model/KV/input owner changed; recapture required')
++        if self.active:
++            raise RuntimeError('nested target state use is unsafe')
++        if (self.runner.attn_backend is not self.default_backend
++                or self.runner.decode_cuda_graph_runner is not self.default_graph):
++            raise RuntimeError('target runner changed outside scoped state')
++
++    def build(self, width, backend_factory, graph_factory):
++        self._guard()
++        if not self.startup_open:
++            raise RuntimeError('capture after startup/KV sizing is forbidden')
++        if not 1 <= width <= self.draft_width:
++            raise ValueError('verify width outside fixed draft block')
++        if width in self.states:
++            return self.states[width]
++        workspace = self.runner.init_new_workspace
++        try:
++            backend = backend_factory(self.runner)
++        finally:
++            self.runner.init_new_workspace = workspace
++        if type(backend).__name__ != 'FlashAttentionBackend':
++            raise RuntimeError('only an unwrapped FA3 backend is qualified')
++        if backend.fa_impl_ver != 3 or self.runner.is_draft_worker:
++            raise RuntimeError('target FA3 backend required')
++        if backend.target_verify_metadata or backend._verify_mask is not None:
++            raise RuntimeError('backend already owns width-dependent metadata')
++        # Pinned target constructor reads width but has not allocated verify
++        # tensors yet. This is a one-time binding BEFORE graph initialization.
++        backend.speculative_num_draft_tokens = width
++        self.runner.attn_backend = backend
++        self.active = True
++        try:
++            graph = graph_factory(self.runner, backend, width)
++            if graph.attn_backend is not backend or graph.captured_req_width != width:
++                raise RuntimeError('captured graph/backend width mismatch')
++            if graph.model_runner is not self.runner:
++                raise RuntimeError('graph does not share the target model runner')
++            state = TargetVerifyState(width, backend, graph)
++        finally:
++            self.runner.attn_backend = self.default_backend
++            self.runner.decode_cuda_graph_runner = self.default_graph
++            self.active = False
++        self.states[width] = state
++        return state
++
++    def seal_startup(self):
++        self._guard()
++        self.startup_open = False
++
++    @contextmanager
++    def use(self, width, current_stream_key):
++        self._guard()
++        if current_stream_key != self.stream_key:
++            raise RuntimeError('shared graph/input pool requires the forward stream')
++        state = self.states.get(width)
++        if state is None:
++            raise ValueError('unbuilt verification width')
++        self.active = True
++        self.runner.attn_backend = state.backend
++        self.runner.decode_cuda_graph_runner = state.graph
++        try:
++            # Scope must enclose preparation, forward, accept AND aux consumption.
++            yield state
++        finally:
++            self.runner.attn_backend = self.default_backend
++            self.runner.decode_cuda_graph_runner = self.default_graph
++            self.active = False
+--- /dev/null
++++ b/python/sglang/srt/speculative/target_prefix_graph_runtime.py
+@@ -0,0 +1,95 @@
++"""Default-off target-only graph factory/scoping scaffold, not production enabled.
++Requires explicit pre-mutation invalidation integration before production use.
++"""
++from contextlib import contextmanager
++from sglang.srt.speculative.target_verify_runtime_state import TargetVerifyStates
++
++RESEARCH_TARGET_VERIFY_WIDTHS = ()
++
++
++def supported_startup(worker, runtime):
++    """Reject unsupported execution before constructing a second backend."""
++    try:
++        mr=worker.target_worker.model_runner
++        p=runtime.parallel; e=runtime.execution; d=runtime.disagg
++        graph=mr.decode_cuda_graph_runner
++        return (
++            int(worker.block_size)==8 and mr.spec_algorithm.is_dflash()
++            and not mr.is_draft_worker and not mr.model_config.is_encoder_decoder
++            and type(mr.attn_backend).__name__=='FlashAttentionBackend'
++            and mr.attn_backend.fa_impl_ver==3 and mr.attn_backend.topk<=1
++            and type(graph).__name__=='DecodeCudaGraphRunner'
++            and type(graph.backend).__name__=='FullCudaGraphBackend'
++            and graph.captured_req_width==8
++            and not graph.require_gathered_buffer and not graph.require_mlp_sync
++            and not graph.attention_graph_variants and not graph.ragged_verify_mode
++            and not graph.enable_two_batch_overlap and not graph.enable_pdmux
++            and not graph.enable_prefill_cp and not graph.record_nolora_graph
++            and not graph.is_dllm and graph.capture_forward_mode.is_target_verify()
++            and not p.attn_dp_enabled and p.attn_cp_size==1 and p.attn_dcp_size==1
++            and p.pp_size==1 and not d.enable_pdmux
++            and not e.overlap.enable_two_batch_overlap
++            and mr.lora_manager is None and not worker._need_mamba_verify_commit
++            and worker.lilicorr is None and not worker._is_domino
++            and not mr.capture_tail_hooks
++        )
++    except (AttributeError,TypeError):
++        return False
++
++
++def initialize_target_prefix_states(worker, *, widths=None, runtime=None,
++                                    backend_factory=None, graph_factory=None):
++    """Call at DFlash.init_cuda_graphs entry, BEFORE entering draft TP scope.
++    Target startup graph exists; KV post-capture resize/prewarm has not run.
++    This allocates no weights or KV pools. Default-off returns immediately.
++    """
++    if widths is None: widths=RESEARCH_TARGET_VERIFY_WIDTHS
++    if not widths: return None
++    if getattr(worker,'_prefix_target_states',None) is not None:
++        raise RuntimeError('prefix states already initialized')
++    if runtime is None:
++        from types import SimpleNamespace
++        from sglang.srt.runtime_context import get_parallel,get_exec,get_disagg
++        runtime=SimpleNamespace(parallel=get_parallel(),execution=get_exec(),disagg=get_disagg())
++    if not supported_startup(worker,runtime):
++        raise RuntimeError('unsupported target-only prefix graph topology')
++    if any(type(w) is not int or w not in (1,2,4,6,8) for w in widths):
++        raise ValueError('unsupported fixed target verification width')
++    mr=worker.target_worker.model_runner
++    if backend_factory is None:
++        backend_factory=lambda r:r._get_attention_backend(init_new_workspace=True)
++    if graph_factory is None:
++        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import DecodeCudaGraphRunner
++        def graph_factory(r,b,w):
++            # Explicit width override; global/draft config remains8.
++            return DecodeCudaGraphRunner(r,attn_backend=b,speculative_num_draft_tokens=w)
++    manager=TargetVerifyStates(mr,8,None)
++    try:
++        for width in widths: manager.build(width,backend_factory,graph_factory)
++        manager.seal_startup()
++    except BaseException:
++        manager.invalidate('startup capture failure')
++        # Keep partial captures alive. Startup must abort, not continue serving.
++        worker._prefix_target_states_failed=manager
++        raise
++    worker._prefix_target_states=manager
++    return manager
++
++
++@contextmanager
++def target_prefix_scope(worker, width, *, stream_key=None):
++    manager=getattr(worker,'_prefix_target_states',None)
++    if manager is None:
++        yield None
++        return
++    if stream_key is None:
++        import torch
++        stream_key=torch.cuda.current_stream(worker.device).cuda_stream
++    manager.bind_forward_stream(stream_key)
++    with manager.use(width,stream_key) as state:
++        yield state
++
++
++def invalidate_target_prefix_states(worker, reason):
++    manager=getattr(worker,'_prefix_target_states',None)
++    if manager is not None: manager.invalidate(reason)

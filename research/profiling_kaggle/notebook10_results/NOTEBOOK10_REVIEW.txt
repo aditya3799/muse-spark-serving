@@ -1,0 +1,46 @@
+NOTEBOOK 10: VERIFIED ROUTER-CONTRACT REVIEW
+Run: 20261114T182013Z_2a6191
+
+VALIDATION
+All 10 member checksums and source provenance match. Recomputed all metrics for 144 rows from 1,584 samples; verified 252 comparisons. All 18 cases, 1,296 changed-input output checks, 80 dtype-contract output checks and inherited 576 output checks passed.
+Trace: 1,152 kernels; no copies and no unattributed operations.
+
+MATCHED REDUCTIONS (%)
+Candidate / Reference | Event median (wins/18) | Wall median | Enqueue median
+baseline_i32_s16 / baseline_i64_s16 | 13.27% (18/18) | 12.23% | 6.32%
+baseline_i32_s32 / baseline_i32_s16 | 15.88% (18/18) | 14.34% | 6.70%
+baseline_i32_s32 / baseline_i64_s16 | 26.54% (18/18) | 24.39% | 10.66%
+baseline_i32_s32 / baseline_i64_s32 | 14.94% (18/18) | 13.39% | 8.73%
+baseline_i64_s32 / baseline_i64_s16 | 14.06% (18/18) | 13.02% | 5.86%
+single_i32_s16 / baseline_i32_s16 | 20.49% (18/18) | 18.13% | 11.43%
+single_i32_s16 / single_i64_s16 | 15.99% (18/18) | 14.39% | 8.35%
+single_i32_s32 / baseline_i32_s32 | 26.06% (18/18) | 21.79% | 11.46%
+single_i32_s32 / single_i32_s16 | 21.49% (18/18) | 18.70% | 9.40%
+single_i32_s32 / single_i64_s16 | 33.70% (18/18) | 29.10% | 17.76%
+single_i32_s32 / single_i64_s32 | 20.05% (18/18) | 16.28% | 6.72%
+single_i64_s16 / baseline_i64_s16 | 17.87% (18/18) | 15.60% | 10.92%
+single_i64_s32 / baseline_i64_s32 | 21.85% (18/18) | 18.87% | 16.35%
+single_i64_s32 / single_i64_s16 | 16.45% (18/18) | 14.57% | 9.28%
+Negative reductions mean slower. Descriptive within-run ratios, not confidence intervals.
+
+NATIVE CONTRACT BY SHAPE: candidate versus baseline, int32 IDs / float32 scores
+Tokens | Stages | Event median | Range | Wins/3
+9 | 1 | 26.90% | 26.58% to 27.78% | 3/3
+9 | 8 | 30.17% | 28.15% to 30.53% | 3/3
+32 | 1 | 25.08% | 25.08% to 25.54% | 3/3
+32 | 8 | 28.71% | 28.57% to 29.53% | 3/3
+128 | 1 | 21.12% | 21.03% to 22.02% | 3/3
+128 | 8 | 23.40% | 23.32% to 23.43% | 3/3
+
+FINDINGS
+Under int32 IDs / float32 scores, single-owner versus baseline wins 18/18: 26.06% median lower CUDA-event latency, 21.79% lower synchronized wall time. Historical int64/float16 inputs yield a 17.87% event reduction in this same run.
+Trace per stage: historical baseline/candidate = 8/6 kernels; native-contract baseline/candidate = 6/4. Each unnecessary dtype conversion adds one kernel to both implementations. The mapping difference remains two kernels.
+Matching default dtypes lowers baseline harness event latency by 26.54% and candidate latency by 33.70% versus the historical inputs. These are benchmark-input effects, not new serving optimizations. The larger native-contract percentage partly reflects the smaller denominator after removing common conversion work.
+The source audit identifies default JIT/Triton output allocations. Actual router execution, preallocated buffers, runtime layout and backend selection remain unobserved. All timed inputs are contiguous.
+The local judge launch specification in RULES.md includes --ep-size 8. The serving constructor creates an expert map when local and global expert counts differ; the tested partitioned-map scenario is therefore relevant to that configuration, but is not an observation of a running model.
+
+NEXT: 11_kaggle_cache_choice.ipynb
+Compare baseline, earlier two-buffer cache and single-owner cache with int32 IDs / float32 scores, static maps, eager execution and combined graphs. Expand to 512 tokens and two routing distributions while retaining 1/8 independent stages.
+Two-buffer preserves the original registered _expert_map at offset zero, but needs explicit refresh after map edits and holds a second buffer. Single-owner prevents stale duplicated contents, but changes _expert_map to a property with a four-byte offset and requires integration review.
+If static performance is comparable, preserving the original map contract may be preferable. No equivalence or winner is assumed; report paired absolute and percentage differences. A separate gate demonstrates the two-buffer stale-copy behavior and verifies explicit refresh before graph replay.
+No actual alignment/GEMM, small fused kernel, communication, full model, scheduler/tokenizer startup or H200 validation. Neither draft has been applied; active V4 is unchanged.

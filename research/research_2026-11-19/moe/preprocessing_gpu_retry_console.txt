@@ -1,0 +1,24 @@
+{"device": "NVIDIA GeForce RTX 3050 6GB Laptop GPU", "source_sha256": "1f04c3820b2015010af6dcb023552de7ae25f53dbd70b6835fd7d59667238d69", "pack": [{"e": 3, "n": 128, "k": 192, "wgmma": false, "nibbles": 49152, "scale_bytes": 3072, "exact": true, "tail_canary": true}, {"e": 3, "n": 128, "k": 192, "wgmma": true, "nibbles": 49152, "scale_bytes": 3072, "exact": true, "tail_canary": true}, {"e": 2, "n": 192, "k": 128, "wgmma": false, "nibbles": 49152, "scale_bytes": 3072, "exact": true, "tail_canary": true}, {"e": 2, "n": 192, "k": 128, "wgmma": true, "nibbles": 49152, "scale_bytes": 3072, "exact": true, "tail_canary": true}], "routing": [{"m": 3071, "mode": "uniform", "graph": true, "exact": true, "values": 1572352}, {"m": 3071, "mode": "skew", "graph": true, "exact": true, "values": 1572352}, {"m": 3071, "mode": "none", "graph": true, "exact": true, "values": 1572352}, {"m": 3071, "mode": "uniform", "graph": true, "exact": true, "values": 1572352}, {"m": 3072, "mode": "uniform", "graph": true, "exact": true, "values": 1572864}, {"m": 3072, "mode": "skew", "graph": true, "exact": true, "values": 1572864}, {"m": 3072, "mode": "none", "graph": true, "exact": true, "values": 1572864}, {"m": 3072, "mode": "uniform", "graph": true, "exact": true, "values": 1572864}, {"m": 3073, "mode": "uniform", "graph": true, "exact": true, "values": 1573376}, {"m": 3073, "mode": "skew", "graph": true, "exact": true, "values": 1573376}, {"m": 3073, "mode": "none", "graph": true, "exact": true, "values": 1573376}, {"m": 3073, "mode": "uniform", "graph": true, "exact": true, "values": 1573376}], "complete": true, "restore_all_bf16": {"values": 65282, "unequal_bits": 0, "includes_subnormals_and_infinities": true}}
+	Command being timed: "timeout 120 /home/aditya/.venvs/okc-marlin-tiles/bin/python research_2026-11-19/moe/launch.py preprocessing_gpu"
+	User time (seconds): 5.12
+	System time (seconds): 1.42
+	Percent of CPU this job got: 58%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:11.11
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 1083356
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 6123
+	Minor (reclaiming a frame) page faults: 120992
+	Voluntary context switches: 11358
+	Involuntary context switches: 220
+	Swaps: 0
+	File system inputs: 2051888
+	File system outputs: 272
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

@@ -1,0 +1,30 @@
+--- v1/sglang/srt/speculative/dflash_target_argmax_adapter.py
++++ v2/sglang/srt/speculative/dflash_target_argmax_adapter.py
+@@ -170,6 +170,9 @@
+         key = getattr(runner, '_replay_graph_key', None)
+         if (not _plain_key(key) or key.size != runner.bs
+                 or runner.raw_num_token != raw_rows
++                or type(runner.raw_bs) is not int or runner.raw_bs <= 0
++                or runner.raw_bs > runner.bs
++                or runner.raw_bs * runner.captured_req_width != raw_rows
+                 or key not in self.confirmed_graphs
+                 or runner.backend._graphs.get(key) is not self.confirmed_graphs[key]):
+             return None
+--- v1/sglang/srt/speculative/dflash_target_argmax_capture.py
++++ v2/sglang/srt/speculative/dflash_target_argmax_capture.py
+@@ -65,10 +65,13 @@
+ 
+     def consume(self, *, runner, raw_rows, captured_rows, width,
+                 graph_used, can_skip_verify_logits, generation):
+-        # Exact-bucket admission avoids silently consuming padded/stale rows.
++        # Plain fixed-width replay preserves the leading raw token rows.
++        # Padded rows are computed, but only the live prefix is consumed.
+         if (not graph_used or not can_skip_verify_logits
+                 or self._runner_refs.get(id(runner)) is not runner
+-                or raw_rows != captured_rows or width != self.width
++                or type(raw_rows) is not int or type(captured_rows) is not int
++                or not (0 < raw_rows <= captured_rows)
++                or raw_rows % self.width or width != self.width
+                 or generation != self.generation
+                 or fingerprint(self.output) != self._fingerprint
+                 or (id(runner), captured_rows, width, generation) not in self._captures):

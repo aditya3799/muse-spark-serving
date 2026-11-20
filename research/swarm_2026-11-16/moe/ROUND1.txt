@@ -1,0 +1,40 @@
+﻿MoE round 1 - 2026-11-16
+
+Evidence and hypothesis
+The scored compact32 change achieved 1.0111x serving. It already addresses
+padded-route waste, so another fixed-small-M tile sweep is not justified.
+The direct v139 persistent kernel has a large component improvement but its
+current prepare retains eight full weight layouts across tiny/larger paths.
+That cannot fit the <=2GB/GPU whole-model allowance.
+
+Candidate experiment
+The existing Marlin JIT source is within the allowed python/sglang tree:
+python/sglang/kernels/jit/csrc/gemm/marlin_moe/moe_wna16_marlin.cuh.
+Its determine_exec_config prioritizes the greatest resident CTA count among
+two tile options. The persistent grid therefore trades occupancy against
+split-K partial accumulation and barrier overhead without a latency model.
+grid_experiment.py tests 1 and 2 CTA/SM caps against default, preserving the
+chosen tile, canonical packed weights, FP32 reductions, and activation dtype.
+It uses real existing Marlin kernels, activation and finalization. Variants
+are isolated overlays, with no edits to the active checkout. It records
+three changed-input/routing CUDA graph replays and cold-cache AB/BA samples.
+A lower grid can regress compute throughput: no winner or gain is claimed.
+
+Larger redesign feasibility
+A WGS-only donor port could keep just its WGS byte layout, eliminate all
+base/fat/unit/tiny copies, and use the same kernel for all tokens via chunks.
+This would replace the canonical weight representation rather than retaining
+another whole-model copy. The core WGS path appears to read only w[12/13]
+plus per-expert scales/norm; host assignment of other pointer slots is not
+proof that other layouts are needed. However, correctness requires adapting
+stock BF16 global-scale rounding, gate/up scale collapse, effective norm
+weight vs raw (1+w), supported epsilon/norm forms, local expert offsets,
+changed/duplicate routing, and graph-safe shared scratch. PRMT scale decode
+requires positive-normal FP8 scale checks and an actual fallback.
+This is a multi-hour implementation, not currently a ready patch. No H200
+hardware is available locally to execute its WGMMA/TMA path.
+
+Next
+Run grid experiment in the coordinator's GPU slot; reject neutral/regressing
+or inaccurate variants. Do not submit on local speedups alone. Any viable
+WGS-only port needs separate architecture-specific correctness evidence.

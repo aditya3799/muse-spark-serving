@@ -1,0 +1,33 @@
+﻿Humming memory source audit, 2026-11-16
+Status: source-derived bounds only; runtime allocated/reserved peaks and graph-pool peaks UNMEASURED because WSL is stalled. Do not promote as whole-model memory proof.
+
+Canonical persistent storage per LOCAL E32,H=I4096 layer:
+- NVFP4 codes: E*(2*I*H+H*I)/2 =805306368 bytes =0.75GiB.
+- FP8 per16 block scales: E*(2*I*H+H*I)/16 =100663296 bytes =0.09375GiB.
+- Combined:905969664 bytes =0.84375GiB, SAME as stock Marlin NVFP4 codes+FP8 processed scales.
+- Two BF16 global-scale vectors:128bytes. Locks max(2048,8*SMs)*4:8192bytes on H200132SMs. StreamK disabled so no partial-output global scratch is used.
+- Owned tuning dictionaries are CPU metadata,42intervals/stage for H200 audit; no tensor or model-weight contents. No cached activation outputs in layer state.
+
+Ownership:
+- Specialized Muse hook takes temporary aliases to native params, collapses gate global-scale column as stock, prepares child Humming module, then deletes native packed weight/scale/global-scale parameters.
+- Humming transform replaces its own weight/scale Parameters with the repacked tensors. Raw aliases only live in local prepare stack and expire upon return; no raw namespace is stored on layer. Humming metadata/kernel caches store config/code, not input or weight tensors.
+- Native input-scale tensors remain tiny checkpoint metadata (3E FP32 values), as in stock. No second full Marlin layout is created for Humming.
+
+Conversion temporary allocation:
+- Humming default check_and_pad_tensors calls F.pad even with allzero padding, potentially cloning full stage weight+scale. Export now explicitly validates uint8 weights, FP8 scales, one scale/16 elements,64alignment and per-expert global scales, then passes already_padded=True.
+- For contiguous checkpoint tensors, no full input clone. Largest inferred transient extra over resident raw weights is final-stage conversion: prior w13 canonical0.5625GiB + new w2 codes0.25GiB + transpose-and-permuted w2 scales0.0625GiB =0.875GiB, plus tiny metadata. Actual allocator reservation/fragmentation unmeasured.
+- For noncontiguous weight/scale inputs .contiguous() can add one stage copy; code handles this but current checkpoint is contiguous. Worst simple sum remains under about1.25GiB extra for these shapes, pending measured peak.
+- Stock Marlin's per-expert repack list plus stacked destination also overlap during preparation, so above is not a measured extra-versus-stock figure.
+
+Runtime and graph pools:
+- cache13 holds R*max(2I,H) BF16, cache2 holds R*I BF16, R=M*topk. First and final GEMM outputs aliascache13, matching stock.
+- At topk8,H=I4096: these buffers total196608*M bytes: M1=.1875MiB,8=1.5MiB,32=6MiB,128=24MiB,256=48MiB. Final output8192*M bytes is common to both paths.
+- If all five graph sizes have separate pools, their common activation buffers sum79.6875MiB per-layer equivalent, plus3.3203125MiB finaloutputs. This is a tensor-lifetime estimate, not actual full-model graph reservation.
+- Extra Humming routing IDs, safe int64 indices and gathered BF16 scales are O(R); current globalscale multiplication is in-place. Routing alignments are shared if stageblockM matches and independently generated otherwise. No GEMM output is silently allocated when provided outputs match shape.
+- Indexed native launcher gemm_type1 does not allocate grouped TMA descriptor storage. StreamK=False makes locks unused; no FP16 partial reduce buffer exists.
+
+Required before promotion:
+1.Measure prepare peak allocated/reserved againststock E32/H=I4096 using identical initial raw weights and release original aliases before measuring persistent state.
+2.Assert old packed-storage pointers absent from child parameters after prepare and raw weakrefs expire.
+3.Measure eager and multiple CUDA-graph-size pools in isolated fresh processes, then full serving peak on judge. Include per-stage differing alignment and all-inactive route replays.
+4.Verify actual WGMMA compilation/correctness on H200 via authorized serving check; localSM86 and architecture-mocked metadata do not establish this.

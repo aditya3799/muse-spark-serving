@@ -1,0 +1,28 @@
+diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -623,6 +623,24 @@
+         # Apply the walk's actions (e.g. a pending write-through relocation on
+         # a split) before the finalizers, which can evict or raise.
+         self._apply_cache_actions(result.cache_actions)
++        window = self._sliding_window_size
++        if (
++            window and result.swa_host_hit_length > window + self.page_size - 1
++            and self.cache_controller is not None and not self.is_mamba_enabled
++            and self.linker is None and not params.key.is_bigram
++        ):
++            # Restore complete, page-aligned nodes while keeping the original host
++            # indices for older branches. Both native tree cores split an edge when
++            # a prefix match ends inside it, including any pending transfer receipt.
++            end = result.device_prefix_len + result.host_hit_length
++            start = (end - window) // self.page_size * self.page_size
++            if 0 < start < len(params.key):
++                key = RadixKey(params.key.token_ids, extra_key=params.key.extra_key,
++                               cache_salt=params.key.cache_salt, limit=start)
++                boundary = self.tree_core.match_prefix(MatchPrefixParams(key=key))
++                self._apply_cache_actions(boundary.cache_actions)
++                result = self.tree_core.match_prefix(params)
++                self._apply_cache_actions(result.cache_actions)
+         return self._finalize_match_result(params, result)
+ 
+     def _finalize_match_result(

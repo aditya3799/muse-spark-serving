@@ -1,0 +1,76 @@
+HUMMING SERVING EXPORT CROSS-REVIEW - 2026-11-16
+
+Reviewed read-only, native Windows/source only during WSL memory recovery:
+moe/serving_humming_v1/python/sglang/srt/layers/muse_spark/
+  muse_spark_fp4_moe.py
+    SHA256 5fbb265a6c6a38c7d28b9512d122e8f0ed57b119f2a8de7e182a5f1c7719e81a
+  muse_spark_nvfp4_moe.py
+    SHA256 827ae6d881ad97dbbe637f03fb75da427e26730fe8a1f9dbb6416f45062d8977
+Also inspected pinned SGLang construction/load/capture source and vendored
+Humming0.1.12 Python/C++ source. No MoE export was edited.
+
+Verdict: no additional concrete serving blocker found after root's corrected
+Humming constructor. This is source review, not Hopper numerical/graph proof.
+
+Construction/load:
+- MuseSparkFp4MoE sets use_marlin for both Marlin and Humming. Parent
+  models/muse_spark.py:798 consequently does not quantize BF16 inputs early.
+  Quant method receives _moe_runner_backend before postprocessing.
+- Normal default loader finishes model.load_weights, then postprocesses each
+  quantized module. Humming registers its canonical packed tensors as a child
+  nn.Module and deletes original six expert weight/scale parameters. No
+  persistent second Marlin representation remains.
+- Humming transformation preserves FP4 codes and FP8 scale storage through
+  repacking/permutation; integer-scale and activation quantization are absent.
+  Generic padding can clone storage even at zero padding; original references
+  remain until helper returns. Whole-model peak memory still needs measurement.
+  There is no full-BF16 weight dequantization in this selected transform path.
+- Weight reload/overlapped sentinel capture is not validated. Standard scored
+  load path is serial; original Marlin also renames/removes native parameters.
+
+Precision/forward:
+- BF16 input schema and BF16 output explicitly selected. use_f16_accum=False
+  in both compute config and owned tuning config selects float32 MMA output
+  accumulator in HummingKernel.select_mma_op_class. StreamK is disabled.
+- FP8 per-group scales remain intact. Gate/up global scale collapse agrees
+  with stock ModelOpt Marlin branch. Each BF16 GEMM result is multiplied by
+  BF16 global scale before stock SwiGLU/finalization, preserving the intended
+  stock rounding boundary rather than Humming's different FP32 epilogue.
+  This still requires numerical testing: K reduction order is different.
+- Route weights/post-expert RMSNorm and inactive-slot masking are unchanged.
+  Stage2 uses top_k=1 with m*original_topk inputs and original slot IDs,
+  correctly preserving per-route slots. Different stage block sizes trigger
+  separate alignment. cache1/cache3 storage reuse occurs after activation
+  consumed cache1; cache2 is separate.
+- Empty M is handled by parent _forward_experts at780 before helper's
+  next(config) lookup; valid=0 is not a serving-path StopIteration.
+
+CUDA graphs:
+- FullCudaGraphBackend.capture_one runs two eager forwards for EACH captured
+  shape before capture. Humming prepare_kernels caches by layer/compute/tuning
+  strings and CUDA context. The selected config depends on static route count,
+  not actual expert IDs; warmups cover the compiled variant needed by capture.
+- In replay, alignment produces fresh sorted/expert/padded device values.
+  Humming launcher.cpp consumes pointers directly; no host .item() read of
+  dynamic route counts. It launches on getCurrentCUDAStream(input_device).
+- Internal transient torch allocations are graph-pool allocations. The
+  static locks buffer is per-layer and StreamK=false does not consume it.
+  The GPU0 SM-count query only sizes an unused/conservative buffer here.
+- Same-surface model graph recapture constructs fresh runners; weights remain
+  canonical. Device-side route changes should therefore be replay-safe.
+
+Specific remaining validation gaps:
+1. Actual SM90 WGMMA execution. sm90_tuning_audit.json embeds mma_type='mma'
+   in its meta; config/config.py:147-149 chooses WGMMA on real SM90. Tuner-only
+   emulation is not identical to an actual H200 prepare/transform/kernel run.
+2. All-routes-nonlocal case and replay transitions between all-invalid and
+   populated local routes; undefined inactive output slots must stay masked.
+3. Both stage-alignment cases (same and different selected block M), changing
+   inputs/routes while replaying the same graph, and every capture bucket.
+4. Full-shard/full-model conversion and serving peak memory; startup JIT time.
+5. Actual target output correctness and end-to-end speedup on judge hardware.
+
+Additional generic robustness observation (not a judge blocker): preparation
+hardcodes BF16. Other model dtypes would fail Humming input checks later;
+an explicit early BF16 guard would produce clearer failure. Judge dtype is
+BF16 and source does not silently downcast activations to make it pass.

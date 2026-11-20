@@ -1,0 +1,25 @@
+{"seed": 930211, "n": 8192, "experts": 2, "layout": "normal", "changed_source": false, "graph_replay": true, "exact": true, "nibbles": 67108864, "scale_bytes": 4194304, "canaries": true}
+{"seed": 930211, "n": 8192, "experts": 2, "layout": "normal", "changed_source": true, "graph_replay": true, "exact": true, "nibbles": 67108864, "scale_bytes": 4194304, "canaries": true}
+{"seed": 930211, "n": 8192, "experts": 2, "layout": "humming_mma", "changed_source": false, "graph_replay": true, "exact": true, "nibbles": 67108864, "scale_bytes": 4194304, "canaries": true}
+{"seed": 930211, "n": 8192, "experts": 2, "layout": "humming_mma", "changed_source": true, "graph_replay": true, "exact": true, "nibbles": 67108864, "scale_bytes": 4194304, "canaries": true}
+{"seed": 930211, "n": 8192, "experts": 2, "layout": "humming_wgmma", "changed_source": false, "graph_replay": true, "exact": true, "nibbles": 67108864, "scale_bytes": 4194304, "canaries": true}
+{"seed": 930211, "n": 8192, "experts": 2, "layout": "humming_wgmma", "changed_source": true, "graph_replay": true, "exact": true, "nibbles": 67108864, "scale_bytes": 4194304, "canaries": true}
+{"seed": 930211, "n": 4096, "experts": 2, "layout": "normal", "changed_source": false, "graph_replay": true, "exact": true, "nibbles": 33554432, "scale_bytes": 2097152, "canaries": true}
+{"seed": 930211, "n": 4096, "experts": 2, "layout": "normal", "changed_source": true, "graph_replay": true, "exact": true, "nibbles": 33554432, "scale_bytes": 2097152, "canaries": true}
+{"seed": 930211, "n": 4096, "experts": 2, "layout": "humming_mma", "changed_source": false, "graph_replay": true, "exact": true, "nibbles": 33554432, "scale_bytes": 2097152, "canaries": true}
+{"seed": 930211, "n": 4096, "experts": 2, "layout": "humming_mma", "changed_source": true, "graph_replay": true, "exact": true, "nibbles": 33554432, "scale_bytes": 2097152, "canaries": true}
+{"seed": 930211, "n": 4096, "experts": 2, "layout": "humming_wgmma", "changed_source": false, "graph_replay": true, "exact": true, "nibbles": 33554432, "scale_bytes": 2097152, "canaries": true}
+{"seed": 930211, "n": 4096, "experts": 2, "layout": "humming_wgmma", "changed_source": true, "graph_replay": true, "exact": true, "nibbles": 33554432, "scale_bytes": 2097152, "canaries": true}
+{"seed": 930223, "n": 8192, "experts": 2, "layout": "normal", "changed_source": false, "graph_replay": true, "exact": true, "nibbles": 67108864, "scale_bytes": 4194304, "canaries": true}
+{"seed": 930223, "n": 8192, "experts": 2, "layout": "normal", "changed_source": true, "graph_replay": true, "exact": true, "nibbles": 67108864, "scale_bytes": 4194304, "canaries": true}
+{"seed": 930223, "n": 8192, "experts": 2, "layout": "humming_mma", "changed_source": false, "graph_replay": true, "exact": true, "nibbles": 67108864, "scale_bytes": 4194304, "canaries": true}
+{"seed": 930223, "n": 8192, "experts": 2, "layout": "humming_mma", "changed_source": true, "graph_replay": true, "exact": true, "nibbles": 67108864, "scale_bytes": 4194304, "canaries": true}
+{"seed": 930223, "n": 8192, "experts": 2, "layout": "humming_wgmma", "changed_source": false, "graph_replay": true, "exact": true, "nibbles": 67108864, "scale_bytes": 4194304, "canaries": true}
+{"seed": 930223, "n": 8192, "experts": 2, "layout": "humming_wgmma", "changed_source": true, "graph_replay": true, "exact": true, "nibbles": 67108864, "scale_bytes": 4194304, "canaries": true}
+{"seed": 930223, "n": 4096, "experts": 2, "layout": "normal", "changed_source": false, "graph_replay": true, "exact": true, "nibbles": 33554432, "scale_bytes": 2097152, "canaries": true}
+{"seed": 930223, "n": 4096, "experts": 2, "layout": "normal", "changed_source": true, "graph_replay": true, "exact": true, "nibbles": 33554432, "scale_bytes": 2097152, "canaries": true}
+{"seed": 930223, "n": 4096, "experts": 2, "layout": "humming_mma", "changed_source": false, "graph_replay": true, "exact": true, "nibbles": 33554432, "scale_bytes": 2097152, "canaries": true}
+{"seed": 930223, "n": 4096, "experts": 2, "layout": "humming_mma", "changed_source": true, "graph_replay": true, "exact": true, "nibbles": 33554432, "scale_bytes": 2097152, "canaries": true}
+{"seed": 930223, "n": 4096, "experts": 2, "layout": "humming_wgmma", "changed_source": false, "graph_replay": true, "exact": true, "nibbles": 33554432, "scale_bytes": 2097152, "canaries": true}
+{"seed": 930223, "n": 4096, "experts": 2, "layout": "humming_wgmma", "changed_source": true, "graph_replay": true, "exact": true, "nibbles": 33554432, "scale_bytes": 2097152, "canaries": true}
+{"complete": true, "device": "NVIDIA GeForce RTX 3050 6GB Laptop GPU", "bridge_sha256": "e66509156716ac514a86ec7638a65efecb0a383179e336dd8d24251fe030ef46", "incumbent_pack_sha256": "f8b37e47725aa73624d475f3320e39adc7ca2e68729a5cfdf4996e952d9e5b1b", "negative_guards": 6, "elapsed_seconds": 12.776208639144897, "historical_peak_allocated": 150995968, "historical_peak_reserved": 174063616}

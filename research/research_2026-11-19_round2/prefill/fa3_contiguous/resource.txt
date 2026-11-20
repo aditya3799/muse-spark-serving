@@ -1,0 +1,24 @@
+Command exited with non-zero status 1
+	Command being timed: "prlimit --as=3221225472 --core=0 --cpu=85 --fsize=134217728 -- /home/aditya/.venvs/okc-marlin-tiles/lib/python3.12/site-packages/nvidia/cu13/bin/nvcc --cubin -arch=sm_90a -DNDEBUG -O3 -std=c++17 -DCUTE_USE_PACKED_TUPLE=1 -DCUTLASS_ENABLE_TENSOR_CORE_MMA=1 -DCUTLASS_VERSIONS_GENERATED -DCUTLASS_TEST_LEVEL=0 -DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1 -DCUTLASS_DEBUG_TRACE_LEVEL=0 -DCUTLASS_ENABLE_GDC_FOR_SM90 -DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math -Xcompiler=-fno-strict-aliasing -DFLASHATTENTION_DISABLE_BACKWARD -DFLASHATTENTION_DISABLE_DROPOUT -DFLASHATTENTION_DISABLE_UNEVEN_K -DFLASHATTENTION_VARLEN_ONLY -DFLASHATTENTION_DISABLE_SM8x -DFLASHATTENTION_DISABLE_SPARSE_MASK -Xptxas=-v -DDIAGNOSTIC_PAGED=false -I/mnt/d/OpenKernelChallenge/serving/research_2026-11-19_round2/prefill/sources/fa3/hopper -I/mnt/d/OpenKernelChallenge/serving/research_2026-11-19_round2/prefill/sources/cutlass_fa3/include -I/home/aditya/.venvs/okc-marlin-tiles/lib/python3.12/site-packages/nvidia/cu13/include -I/home/aditya/.venvs/okc-marlin-tiles/lib/python3.12/site-packages/nvidia/cu13/include/cccl /mnt/d/OpenKernelChallenge/serving/research_2026-11-19_round2/prefill/fa3_single.cu -o /mnt/d/OpenKernelChallenge/serving/research_2026-11-19_round2/prefill/fa3_contiguous/kernel.cubin"
+	User time (seconds): 25.73
+	System time (seconds): 1.97
+	Percent of CPU this job got: 83%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:33.29
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 3002208
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 688
+	Minor (reclaiming a frame) page faults: 254602
+	Voluntary context switches: 31029
+	Involuntary context switches: 69
+	Swaps: 0
+	File system inputs: 132888
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 1

@@ -1,0 +1,48 @@
+﻿Small-M projection multicast audit
+
+Evidence correcting the preliminary assumption: CustomAllReduceV2 is already
+used on H200. configs/custom_all_reduce_v2.py defines tuned SM90 TP8 behavior;
+yesterday's startup.log reports multicast=True. Existing post-unpool gemm_ag
+allows M<=8 on Hopper. Pre-pool's caller and larger-M native eligibility are
+restricted to SM103; those existing branches are preserved in this candidate.
+
+candidate_small_multicast adds a separate Hopper-only 1<=M<512 branch after
+existing supported native paths. Full-K local FP32-output matrix multiply,
+one BF16 cast, then the existing native multicast all_gather writes final
+column order. No NCCL reshape copy is needed. Unsupported communicators,
+capacity, geometry, device, SP/DP/CP or deterministic mode retain old paths.
+
+Kernel audit: all_gather.cuh uses 16-byte vectors with N/world divisible by8;
+work grid is bounded by existing num_push_blocks-1 and strides across larger
+row counts. A final block flips remaining phase counters. C++ validates full
+M*N*2 <= slot_bytes; helper preserves that conservative capacity guard. The
+native kernel already handles arbitrary positive row counts and shares the
+existing two-phase Lamport workspace protocol. No CUDA source or communicator
+algorithm changes are proposed. Source inspection cannot prove multi-GPU
+liveness or actual H200 numerical/graph correctness.
+
+Workspace: after Marlin expert construction, eligible Hopper TP4/8 reserves
+MAX_TOKENS512*max(hidden,expert_hidden)*2 bytes via the existing helper. For
+8192 output, per-slot reservation8MiB versus previous128KiB. TP8 has2*8 slots,
+so added push storage126MiB per GPU, not per layer. Existing method returns
+before synchronizing/reallocating when capacity is already sufficient. It
+rejects late growth after graph capture and preserves explicit forced size.
+All model construction reservations precede finalize workspace binding and
+forward/capture. Pull thresholds and counter/launch geometry remain intact.
+
+GPU plan: 8 distinct64MiB weight matrices per rotation,512MiB total /64MiB
+of output-column shards, avoids a single repeated weight fitting device L2.
+M1/8/16/32/64/128/256/511, both8192->4096 and4096->8192. Changed-input graph
+numerics and noncontiguous M32. All timings local compute/layout; actual
+multicast performance/correctness requires H200 check.
+
+Static validation complete
+CPU exact-source wrapper,66 shape/world combinations,communicator guards and workspace lifecycle passed.64 model-layer reservations caused one allocation; late graph growth rejected; forced size preserved.
+Attention specialist independent review found no source blocker; noted possible bounded unused reservation under runtime SP fallback.
+Canonical two-existing-file package SHA2565b727fe5b4a3bc4c017a66aaedd1054454dfc5d41c834d56dc2122e1954b2da3,10495bytes.
+Root independently proved297 gather geometry schedules and all65280 finite BF16 marker encodings; actual multiGPU ordering unproved.
+GPU numeric/coldtiming and full-output adapter checks are prepared, awaiting the single sharedGPU slot.
+
+GPU arithmetic completed:96 exact-helper changed-input graph replay cases passed, including noncontiguousM32 and both BF16reduction flags; max relativeL2 .002673475,maxabs .03125. No multicast executes locally. Coldtiming awaits exclusiveGPU. Kerneltrack adapter remote experiment was abandoned because root confirmed trackclosed; no adapter submission attempted by this agent.
+
+Cold timing postponed: WSL command execution became unavailable. The exact own queued shell and WSL launcher were cancelled before any timing started; no timing result exists and no performance claim is made. Numeric evidence and candidate source hashes reverified from Windows.

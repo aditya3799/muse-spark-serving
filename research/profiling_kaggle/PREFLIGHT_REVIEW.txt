@@ -1,0 +1,45 @@
+KAGGLE NOTEBOOK 01: REVIEW
+Run: 20261114T140211Z_143619
+
+VALIDATION
+All eight downloaded artifact checksums passed. Source manifest matches local V4 notebook.
+Two Tesla T4 GPUs detected; this notebook used GPU 0 only.
+FP32/FP16 checks, changing-input CUDA graph replay, and 30 routing correctness cases passed.
+Original V4 Triton alignment and native BF16 were skipped as intended on this T4.
+
+WARM DIAGNOSTIC TIMINGS (microseconds, CUDA event median; p10-p90)
+These intervals include exposed gaps between GPU operations. They are not pure kernel time.
+  8 tokens, uniform  : 423.9 us (406.8-436.2); synchronized wall median 426.6 us
+  8 tokens, hot_local: 414.4 us (402.0-422.9); synchronized wall median 416.9 us
+128 tokens, uniform  : 425.8 us (412.7-442.5); synchronized wall median 428.9 us
+128 tokens, hot_local: 426.8 us (415.9-442.8); synchronized wall median 429.4 us
+
+TRACE BREAKDOWN: 128 TOKENS, HOT-LOCAL ROUTING
+Median per stage over trace iterations 2-6, in microseconds.
+Stage                         Kernels Copies Kernel time Copy time
+map_global_to_local                 7      0       37.76      0.00
+sort_and_count                      7      3       83.29      7.94
+padding_counts                      3      0       11.26      0.00
+
+What each stage does:
+- Map: convert global expert IDs to IDs for this GPU; preserve -1 for inactive routes.
+- Sort/count: group routes by expert and count how many belong to each expert.
+- Padding counts: round counts to multiples of eight; this diagnostic does not build the packed buffer.
+
+INTERPRETATION
+1. The profiling setup works, including GPU kernel tracing.
+2. Increasing input from 8 to 128 tokens barely changes this diagnostic elapsed time. That supports investigating fixed dispatch/allocation/instrumentation overhead; it does not establish its exact cost.
+3. Each trace iteration contains 17 kernels and 3 device copies. The profiler reports 138 device events across six iterations: 102 kernels, 18 copies, and 18 annotation ranges. Those 138 events are NOT 138 kernels.
+4. Do not sum profile_operations.csv into percentages: it includes GPU annotation ranges and multiple representations of the same work. All 120 actual kernel/copy events were attributed via launch correlation.
+5. First trace map CPU range was 11.637 ms; later map CPU ranges were about 0.30-0.37 ms. This is a profiler-on outlier, not measured serving startup latency.
+6. The unprofiled benchmark and instrumented trace are separate runs. Do not subtract traced kernel time from benchmark time to claim an exact CPU overhead percentage.
+7. Fixed-block synthetic padding can be large: at 8 tokens, uniform routing has 3 live routes and 24 active padded rows; hot-local has 37 and 72. This alone says nothing about actual GEMM time or useful gains from a different block size.
+
+NEXT EXPERIMENT
+Notebook 02 should compare the same supported routing diagnostic with annotations disabled: warm eager versus CUDA graph replay, with matching allocation semantics and changing-input correctness checks. Profile in a separate pass. Isolate the original supported PyTorch expert-ID mapping to distinguish project code from diagnostic sorting/counting overhead.
+Keep current V4 serving code unchanged until a candidate has correctness evidence and a relevant performance comparison.
+
+SCOPE LIMITS
+This is adapted synthetic PyTorch routing, not measured stock/V4 alignment. It excludes packed-buffer construction, expert GEMMs, attention, inter-GPU communication, scheduler startup, tokenizer startup, and full-model serving.
+Therefore these results neither confirm scheduler/tokenizer initialization as the main bottleneck nor predict H200 timings, serving percentages, or contest speedup.
+The presence of nvcc/nsys/ncu does not prove usable compilation targets or hardware-counter permissions.

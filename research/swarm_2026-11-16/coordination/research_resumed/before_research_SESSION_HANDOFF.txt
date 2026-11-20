@@ -1,0 +1,53 @@
+SERVING SWARM RECOVERY CHECKPOINT - 2026-11-16
+Workspace: D:\OpenKernelChallenge\serving
+
+Best confirmed scored result: e399c79bb1994630, PASS, 1.2237x stock.
+Target remains 1.6x and has NOT been reached.
+Scored patch: swarm_2026-11-16/coordination/round5_humming_adaptive_fused/candidate.diff
+SHA256: 8b3ed81e053e4ccb2a043afd25cb94bb49017995ece517bb35aeb6e1b79e026b
+Required backend: humming.
+
+Recovered all three specialist workstreams after unexpected shutdown.
+Ubuntu/GPU functional; bounded GPU tests finished. No new remote submissions.
+Active checkout and root patch.diff preserved.
+
+REMOTE RESULTS
+9689b3114c2a45ab: done PASS; indicative 1.054x at16users, one repetition.
+fa0d2a0fcf584339 and6570fbd9e1b64ce4: queued at recovery poll; do not duplicate.
+32bcbb190b204dd6: done rejected due old patch metadata; not a numerical result.
+Quota verified: zero checks and zero scored runs left; resets17Nov00:00UTC
+(17Nov05:30IST). Re-read live quota before any future submission.
+
+LOCAL RECOVERY DECISIONS
+- Router sharding rejected: 16 expert-ID mismatches on near-tied inputs.
+- Cached persistent attention metadata passed correctness but mixed wrapper
+  timings include regression; stays experimental, not in conservative patches.
+- Tiny grouped MoE completed successfully before shutdown. Larger E32/H4096
+  recovery failed the unchanged raw-down gate atM8; completed M1 cases also
+  regress. Do not promote or relax gates. M33 was not reached.
+- Row-local normalization and attention glue remain locally validated, with
+  integrated H200/multi-GPU/FA4/serving validation pending.
+
+PREPARED PATCHES (all require --moe-runner-backend=humming)
+Combined norm+glue: coordination/phase2/round1_norm_glue/candidate.diff
+SHA256: 0c2100c03e0381c7df297cf9618c581229535937867c5a8510b90372de2f152e
+Independent recovery rebuild exactly matches original.
+Norm-only: coordination/recovery_20261116/norm_only/candidate.diff
+SHA256: c91d69157de64a37682e2ad4a290973dd625d41a9442ea62546fb5aab525030c
+Glue-only: coordination/recovery_20261116/glue_only/candidate.diff
+SHA256: 1b6a5c2ae855cbcb9d8f942e2dd4430598e3112df0494b8ebedc0b0daa6a87ad
+Above relative paths begin under swarm_2026-11-16/.
+All three pass patch round-trip, syntax, whitespace, size and file-rule gates.
+None of these phase2 candidates has a serving score or H200 validation yet.
+
+NEXT
+1. Read coordination/recovery_20261116/RECOVERY_STATUS.json and receipts.
+2. Check the two existing queued jobs once; save complete returned evidence.
+3. After quota reset, use isolated norm/glue candidates for attribution or
+   combined candidate for total-effect validation; inspect results before
+   spending remaining quota. Preserve fixed correctness and memory gates.
+4. Preserve the scored1.2237 baseline. Local RTX3050 timings cannot establish
+   H200/end-to-end speedup. No automatic background monitoring is installed.
+
+Recovery evidence: swarm_2026-11-16/coordination/recovery_20261116/
+Original checkpoint backed up there as before_SESSION_HANDOFF.txt.

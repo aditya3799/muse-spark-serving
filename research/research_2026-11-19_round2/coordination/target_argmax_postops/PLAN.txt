@@ -1,0 +1,9 @@
+Predeclared local test, before execution
+
+Replace only native deferred_argmax post-gather argmax/gather/long with one Triton kernel. Keep native softcap_row_argmax, float32 max/float32 ID payload, all-gather, rank order and native float-to-int64 semantics. First NaN rank wins; otherwise first maximum rank. No collective removal and no draft sampler changes. The helper remains isolated and unapplied.
+
+Correctness first: TP1/2/3/4/5/8/16 and N1/7/8/31/32/56/128/224/256/257/1024; changed finite logits, ties, signed zero, infinities, NaN payloads, sparse raw patterns, float ID edge/cast values, guarded output and changed-input CUDA graph replays. Stop and retain failure on any mismatch.
+
+Then local-postop timing only for TP8 N8/32/128/256. No softcap, LM head or collective in either arm. Freeze source before timing; new seed197743. Symmetric A/B/C/C/B/A, native duplicate control,128operations per graph,16graph replays per event,12rounds after20warmup cycles. Require every control in[0.97,1.03] and bootstrap lower confidence ratio>1.05 for each promoted component cell. No serving claim regardless of result. No repeat for favorable noise; a failing measurement control remains unqualified.
+
+Before the first timing execution: also measure the actual eager helper calls, since the target epilogue is ordinarily outside the target graph. Six symmetric rounds of512calls per arm, synchronize before/after each arm, retain identical source/data and duplicate controls. Report wall time separately from captured GPU time. A graph-only win cannot establish an eager host-path win.

@@ -1,0 +1,47 @@
+LOCAL SWARM RESEARCH HANDOFF - 2.5X TARGET
+
+Resumed: 2026-11-17 10:42:17 UTC. Checkpoint: 2026-11-17T11:41:41.207041+00:00.
+Elapsed this resumed round at checkpoint: 59.4 minutes. This follows the earlier completed 2.009-hour local pass; these are separate sessions.
+Four agents participated: root coordination/review, expert partition, Hopper MoE, and auxiliary/speculation.
+
+The target has NOT been demonstrated. Last confirmed whole-serving score remains 1.2237x, job e399c79bb1994630. No new check or submission was created. User confirmed no H200 access; all new execution is local RTX3050/SM86 or offline SM90 compilation. No serving-source edits were made by this swarm. Root patch and scored candidate hashes remain unchanged.
+
+What the new evidence supports
+
+1. Large-prefill routing plus fused W13 is the strongest broadly useful local prototype. The four-way, cutoff-crossing, direct-pair and mixed-skew studies passed 288 finite/bitwise comparisons. Full captured helpers include classification, alignment, both GEMMs, original-order finalizer, and changed graph inputs.
+   Cache-swept uniform full-helper median paired gains are approximately3.23x at M768 and1.89x at M1024. With simultaneous hot and cold experts, they fall to1.43x and1.22x. These are synthetic local cases, not measured workload averages. Fusion's direct incremental benefit over corrected routing alone is approximately2.7-5.5%; small drift-sensitive groups remain qualified in the raw reports but are not precision forecasts.
+
+2. Selective weight reuse is a narrow small-M opportunity. Initial hot-fixture figures were invalid as routing performance evidence because they duplicated an expert within each token; they are preserved as stress-only results. An independent actual-policy review also showed that the proposed tile is inferior to existing heavy tiles at M128/M256.
+   The corrected M32 experiment uses legal unique-global-top8 routes and the actual scored adaptive reference. The combined interleaved-weight/M2/fallback/W2/finalizer implementation passes90 strict finite/bitwise comparisons plus45 inactive-row sentinel checks. Full-helper gains are1.36-1.43x on concentrated routes and1.21-1.22x at a cutoff crossing; uniform is approximately0.998x. Empty local ranks regress4.2-6.1 microseconds.19/20 timing groups qualify. Do not substitute W13-only1.6-1.8x figures for these full-helper results.
+
+3. A single interleaved weight representation now has a numerically checked fallback: ordinary W13 GEMM, original BF16 global scaling, interleaved-aware native SiLU, unchanged W2/finalizer. The final native edge suite passes68 checks including8 CPU guards. Unsupported source/layout preparation must retain canonical weights; runtime fallback must honor the layout tag. The research renderer still uses research paths and is not a production integration.
+   All-fused scratch is structurally2R*H BF16 elements rather than3R*H for I=H; the nominal1GiB saving at M16384 is conditional. Unfused-heavy fallback needs the larger scratch unless a new aliasing proof exists. Whole-model capture, startup transients and serving memory are unmeasured.
+
+4. The original virtual-K research had an epilogue writer-ownership bug missed by compilation. The old H200 gate is held; old receipts were not rewritten. Corrected source passed actual writer/address oracles and local runtime gates. A new separately hashed H200-only gate uses corrected artifacts; it has NOT run on H200.
+  27 offline SM90 builds completed this round:12 corrected/fused,2 heavy controls,8 wait0/wait1,1 wider-MMA resource variant,4 heavy-cap variants. The large fused BM160/176 tiles spill, but matched unfused controls have exactly the same resource counts, so extra fusion spill cost is not established. BM128 removes those spills at243 registers; BM144 still spills. Smaller tiles can increase weight traversals and change the native MMA shape, so they remain research variants.
+   Wait1 retains the original MMA/arithmetic and adds safe final draining. Independent source and control-flow models pass, with negative controls detecting missing barriers/drains. Generated SASS retains distinct operand banks and actual wait1 instructions without spills. These are compiler/lifetime checks, not hardware correctness or speed measurements.
+
+What was rejected or held
+
+- Draft-cache append graphs passed50 correctness checks, but required staging erased almost all local gain. Not promoted.
+- Cache-cap sizing is incompatible with the scored radix-enabled path. Safe sliding-window eviction is already active. Recorded cachehit0.92 matches expected0.92; no cache-collapse explanation for high-load TTFT was established.
+- Reusing BM16 alignment for BM32 is conditionally valid, but the broader internal helper accepts duplicate routes that break the condition. It remains an unimplemented future lead, not a fix for the empty-rank regression.
+- Two setup failures in large composition, fallback compile/timeout attempts, and unified harness setup failures remain alongside successful immutable receipts. A timeout or compilation success is never recorded as a numerical pass.
+
+Why2.5x remains unsubstantiated
+
+2.5/1.2237 requires another2.043x uniform frontier factor. In a fixed-work planning model this means removing51.05% of current time. That model is not a simulation of the score's throughput/interactivity frontier.
+For Hopper, lower padded rows do not automatically lower weight traffic. Light experts still traverse each weight matrix once; W2 changes N-tile granularity. Small-M row reuse can underfill the132-SM H200 grid. Neither local component ratios nor the separate research mechanisms may be multiplied into a serving prediction. No scored-H200 phase profile or actual routing histogram is available here.
+
+Remaining gates before active integration or any performance claim
+
+- Source-controlled, installed-package-aware preparation and fallback; one canonical representation and bounded startup allocations.
+- Corrected native Hopper numerical/graph tests and matched timing for routing, fusion, virtual K, wait1 and any tile changes.
+- Full-model multi-rank graph replay, communications, long-turn correctness, TTFT and memory checks.
+- Whole-serving evaluation only if the user later authorizes it. Current instruction remains DO NOT SUBMIT.
+
+Evidence is indexed in coordination/RESEARCH_INDEX.json. Main summaries: expert_partition/ROUND2_CHECKPOINT.json; aux_speculation/UNIFIED_NATIVE_RESULT.json and UNIFIED_TIMING_RESULT.json; Hopper consolidated checkpoint; coordination/ROOT_COMPOSITION_REVIEW.json, HOPPER_TRANSFER_LIMIT.json, TARGET_SENSITIVITY.json and RESEARCH_FINDINGS.json.
+
+Existing remote checks were read only:6570fbd9e1b64ce4 still queued;fa0d2a0fcf584339 done/pass. These are older jobs, not this round's prototypes.
+
+Finalized: 2026-11-17T11:42:57.994713+00:00. Total resumed round: 60.7 minutes. All research workers released; temporary keeper stopped; final GPU snapshot0MiB/0%.

@@ -1,0 +1,53 @@
+﻿UPDATE: OKC 0.8.2 rules and flags supersede this initial setup snapshot. See RULES_AND_COMPONENT_REVIEW.txt and refreshed RULES.md. Launch flags may now be changed except those fixed in flags.
+
+Serving setup and initial source audit
+Date: 2026-11-12
+
+Workspace: D:\OpenKernelChallenge\serving
+Pinned source: 297e54fd105e974cdf401e5b4d20253a22c16f90
+Branch created by OKC: my-patch
+Current contract: RULES.md fetched by okc serve init. It supersedes older web snippets.
+Patch: source files under python/sglang only; 400 KB; added lines <=400 chars.
+Do not modify model_loader, parameter semantics, precision, or the released drafter.
+
+Verified workflow (invoke through wsl -d Ubuntu):
+/mnt/d/OpenKernelChallenge/bin/okc serve diff /mnt/d/OpenKernelChallenge/serving
+/mnt/d/OpenKernelChallenge/bin/okc serve check /mnt/d/OpenKernelChallenge/serving/patch.diff --no-wait
+/mnt/d/OpenKernelChallenge/bin/okc serve submit /mnt/d/OpenKernelChallenge/serving/patch.diff --no-wait
+Checks are one short load; scored runs use all loads. No runs launched during setup.
+Account queue: regular/in turn; kernel top-50 priority precedes it.
+
+Judge launch configuration is documented verbatim in RULES.md:
+816B-A42B NVFP4 target, DFlash2 released drafter, TP8/EP8, Marlin W4A16,
+8 draft tokens, draft attention FA4, hierarchical cache 160 GB,
+16K chunked prefill, 131072 context, max 32 requests, decode graph max batch 32.
+
+Source audit:
+- models/muse_spark.py already has fused norm boundaries and CuTe router GEMV.
+- MuseSpark1xRouter.forward_split2 performs two BF16-input GEMMs with FP32 output.
+  Our prior packed hi/lo projection work is a candidate to investigate, but changing
+  reduction order requires accuracy validation and a measured benefit.
+- layers/muse_spark/muse_spark_fp4_moe.py selects Marlin on Hopper.
+  _marlin_expert_outputs performs alignment, GEMM1, activation, GEMM2, then
+  _forward_marlin applies post-expert norm and weighted reduction.
+- layers/communication/muse_spark_gemm_ag.py shards replicated BF16 projection
+  rows across ranks and gathers using multicast workspaces. Keep this behavior.
+- Attention and DFlash require a separate compatibility audit before importing
+  old shape-specific kernels. The serving target has variable real request lengths.
+
+Next implementation sequence:
+1. Confirm empty patch and clean Linux Git checkout.
+2. Audit best standalone MoE source for required math, output and weight layout.
+   Existing full MoE source is ~832 KB; decoder ~993 KB, so neither fits wholesale.
+3. Choose one compact mechanism with broad shape support and stock fallback.
+4. Run static patch checks and relevant component correctness tests.
+5. Use a short serving check for a concrete candidate; review correctness,
+   throughput, latency and any profile provided before a full scored run.
+
+Hardware verified here: RTX 3050 Laptop, 6 GB. It cannot host the full model or
+validate Hopper-specific kernel performance. Use contest H200 nodes for that.
+Do not provision paid external GPUs without separate authorization.
+
+Windows Git reported symlink/line-ending artifacts on this Linux-created checkout;
+use Ubuntu Git and OKC diff as the patch authority.
+

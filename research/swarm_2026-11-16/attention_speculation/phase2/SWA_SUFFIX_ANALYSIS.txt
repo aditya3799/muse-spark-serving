@@ -1,0 +1,34 @@
+SWA suffix alternative, CPU/source analysis only; no candidate implementation.
+
+Exact mathematical indexing:
+For query length Q, key length L and query row i in [0,Q), FA bottom-right
+alignment places the query at i+L-Q. A finite left window W permits key j
+only when j >= i+L-Q-W. Causal adds j <= i+L-Q; bidirectional right window
+adds j <= i+L-Q+Wr. Therefore the union's earliest permissible key is
+max(0,L-Q-W). Cropping S keys with S <= that value and replacing L by L-S
+preserves the mask after j'=j-S, because both sides subtract S. Rotary-applied
+Q/K values must remain unchanged; absolute positional recomputation is not
+part of this transformation.
+
+That mathematical fact alone does not authorize an implementation:
+1. Source block_info.py:get_n_block_min_max floors the first key position to
+   tile_n. flash_fwd_sm90.py loads page tables for whole tiles, including
+   logically masked keys in the first tile. Leaving only unmasked page entries
+   valid can still cause invalid page reads. Any partial-fill implementation
+   must cover actual kernel tile/prefetch reads, not only the attention mask.
+2. Changing L/page-table origin can alter tiling, split heuristics and floating
+   reduction grouping. Same mathematical attention does not prove bitwise
+   output or unchanged draft acceptance. SM86 cannot execute actual paged FA4.
+3. DFlash explicitly supports both full_attention and sliding_attention in
+   _get_dflash_layer_attention_params. Shared metadata cannot be shortened
+   merely because has_swa=True. Need all active draft layers' window/type proof
+   or separate per-layer full/SWA tables; preserve encoder/cross-attention and
+   every other rejected layout. Current narrow glue is independent of this.
+4. Native sliding attention is not compact cache. The explicit draft window
+   flag defaults None; compact device lengths only exist when that separate
+   policy is enabled. No new flag or policy change is proposed.
+
+Decision: prioritize bounded persistent page-table production. It preserves
+every original live/full-tail entry and all original attention lengths, query
+alignment and FA4 launch inputs. This avoids the unresolved suffix arithmetic,
+mixed-layer and kernel-read-extent gates. Suffix idea remains unimplemented.

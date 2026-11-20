@@ -1,0 +1,28 @@
+TARGET-DEVICE NEXT STEP
+
+The selected draft is candidate_compact32_01/candidate_unsubmitted.diff.
+It is cumulative against SGLang 297e54fd and has not been submitted or applied
+to the active checkout. Keep the queued baseline check f1513498e8d84de8.
+
+1. Obtain that check's correctness, throughput, TTFT and memory result. A queued
+   job is not evidence of either success or failure.
+2. On an available H200 environment, reproduce the full-width component tests
+   with the exact candidate source. Capture real-model route-count distributions
+   and profile expert kernels, attention, communication and scheduling.
+3. Validate full-model greedy-token agreement and requested output lengths.
+   Measure TTFT and peak GPU memory against stock with the judge's default flags.
+4. Only promote after target-device evidence supports the tradeoff. Evaluate
+   the four scored loads together; a component ratio is not the serving score.
+
+The local serial max-rank proxy reached 1.5367x for balanced 256-token routing,
+while concentrated routes stayed near 1.00x. Nearby second-seed local medians
+were around 1.50x and their sample intervals span 1.50x. These observations do
+not establish a universal minimum of 1.5x.
+
+Even if 1.5367x transferred to H200, a simple Amdahl calculation would require
+about 95% of baseline end-to-end time to be in that optimized path to reach
+1.5x overall. That fraction has not been measured. The 99.5% profile figure in
+the review concerns GEMMs inside the isolated MoE component, not the full model.
+
+No paid resource was provisioned, no new judge run was launched, and no scored
+quota should be spent based solely on the RTX3050 measurements.

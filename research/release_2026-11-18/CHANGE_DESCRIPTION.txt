@@ -1,0 +1,22 @@
+Extend adaptive Humming expert partitioning to larger route sets
+
+The existing adaptive path stops at 4,096 route slots, so larger prefills use
+one global tuning choice even when expert parallelism leaves few rows per expert.
+This candidate extends the GPU histogram to 131,072 route slots and partitions
+light/heavy experts using the existing tuning policy. It preserves the baseline
+block-K and warp-K reduction geometry in the new light configuration.
+
+Canonical Humming preparation validates the finite configuration set against
+native shape, dtype, scale, MMA and shared-memory checks before capture. Unsupported
+pairs fall back before any kernel launch. No route values are read by the host.
+The original function remains unchanged for <=4,096 routes. Canonical weights,
+FP32 accumulation, BF16 boundaries, both-up-before-down buffer ordering, and the
+existing downscale/finalizer path are preserved.
+
+The cumulative patch contains the previously scored Humming build plus changes
+to only muse_spark_humming_split.py and muse_spark_nvfp4_moe.py. It introduces no
+new weight layout, expert replicas, attention backend, or speculative policy.
+
+Qualification: see BUILD_MANIFEST.json and validation receipts. The parent scored
+1.2237x; that result does not measure this candidate. Full-model/H200 correctness,
+startup, peak total-device memory, TTFT and serving speed remain to be checked.

@@ -1,0 +1,24 @@
+# V4 GPU preflight results
+
+Scope: synthetic compatibility/component diagnostics, not a full serving profile.
+
+Hardware: Tesla T4, Tesla T4
+
+| Section | Status |
+|---|---|
+| environment | passed |
+| timing_and_graphs | passed |
+| dtype_checks | passed |
+| original_kernel_probe | skipped |
+| routing_diagnostic | passed |
+| profiler | passed |
+
+Interpretation
+- Passed means the stated small test passed, not model correctness.
+- Skipped original Triton/Marlin paths on T4 are expected; do not interpret them as zero-cost operations.
+- routing_structure.csv describes CPU-calculated route/padding work.
+- routing_timings.csv and routing_trace.json describe an adapted PyTorch diagnostic, not stock/V4 alignment.
+- There are no H200 runtime percentages or serving speedup claims.
+- Keep raw samples and software versions when comparing future runs.
+
+Next: review compatibility and select original supported kernels for notebook 02.

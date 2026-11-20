@@ -1,0 +1,49 @@
+Round2 prefill research, 2026-11-19 10:32:37–13:32:37UTC.
+Frozen round1 joint530e9ccc... and parent8c754721... remain untouched.
+No remote quota, submissions, downloads or independent GPU use.
+
+Initial mechanism: output-N sharding of the existing replicated DFlash FC on
+actual ragged prefill M. FullK, unchanged BF16 operands and native full-M
+RMS/five rank-owned KV/RoPE/cache writes. No row padding or KV head substitution.
+
+Observed scope gap: round1 row adapter requires M divisible byTP and predeclared;
+the original append trims graph padding, so raw753 stays753. Frozen output-N
+factory's128MiB bound retains two new40960-wide inputs and two references,
+admitting only about544 rows at the local8519680B workspace. It excludes753.
+
+Generic alternative: the worker explicitly qualifies live shapes outside any
+capture. Reuse the already required original FC output, compare all eight
+output-column shards sequentially, then qualify another genuinely changed
+live input before publishing globally. Never allocate a second full input.
+No CPU collectives in __call__ or graph replay. Qualification is a separately
+called, all-rank state transition at the existing eager append boundary.
+Unknown/unpublished shapes keep native FC; enabled shapes always gather even
+after a local plan/stream/policy rejection. Failures and cancellation must leave
+globally identical published state. This is a design proposal, not yet a patch.
+
+Budget is additional qualification memory, excluding the already resident input
+and checkpoint but conservatively including the native reference, both full
+gather-layout buffers, local output, two workspaces and16MiB comparison margin:
+  bytes(M) = M*(6*N + 2*N/TP) + 2*workspace +16MiB.
+AtN8192/TP8/local workspace this admits M<=1960, a geometry/memory bound rather
+than a workload list. Larger M is numerical research only until another bounded
+qualification schedule exists. State/cache count must also be bounded.
+
+First-use cost matters. Time original FC plus native Lt discovery, every shard
+comparison, coherent publication and actual gather calibration. Return the
+original output while pending qualification. Report break-even repeat count
+including this cost, and reject promotion if plausible heterogeneous turns do
+not amortize it. Do not report a warmed component gain as request latency.
+
+Initial GPU screen uses real recovered public FC/KV/norm weights, fullwidthK/N,
+generic nearby ragged/aligned geometries, changed/random/integer/magnitude
+inputs and graph replay. It reconstructs all8 Nshards and compares complete
+sparse backing pools after the unchanged native tail. Timed local candidate
+includes one shard plus full layout copy; NCCL is excluded and must be modelled
+separately. Independent seed and actual runtime-control tests follow only if
+this first screen supports the mechanism.
+
+If on-demand cost, exactness or integration complexity vetoes the FC mechanism,
+move to higher-impact target-prefill attention/MoE/dense/collective stage shares
+using primary source and measured traces. No repeated tiny-FC search as a proxy
+for a whole-serving2x result.

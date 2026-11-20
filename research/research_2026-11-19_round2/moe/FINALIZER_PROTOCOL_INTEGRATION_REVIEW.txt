@@ -1,0 +1,61 @@
+﻿Independent finalizer/native-push integration review — read-only, no CUDA launch
+
+The protocol body is byte-for-byte the pinned native one-shot push body after
+replacing vec.load with fill_vec. Native SHA693fc6e5..., prototype SHAd86de30e....
+Independent comparison and abstract counterexamples: finalizer_protocol_review.json.
+No new transport ordering defect was found in that preserved body. Virtual8ranks on
+one GPU cannot establish NVLink/IPC visibility, distributed scheduling or progress.
+
+Concrete prerequisites before any future hook:
+1. Exact active group and communicator identity, TP8/rank order, current generation
+   of peer pointers/counter/slot stride, contiguous aligned BF16 output, H4096,
+   num_vecs=rows*hidden/8 and payload<=capacity. Require the actual resolved outplace
+   method to be ca, no FlashInfer override, and uses_one_shot_push(payload) under the
+   current graph/eager policy. supports_push alone checks capacity, not eligibility.
+2. Launch every allocated push counter's CTA, including idle CTAs. num_blocks<=
+   counter.numel() is insufficient. A smaller previous grid can cover all vectors
+   via its stride but leave other counters unflipped. A later larger grid then
+   reuses an old phase while a slow peer is draining it. The abstract8rank trace
+   changes the old sum36to135 and loses the next rank0arrival; full-counter flipping
+   avoids both. This is a future admission counterexample, not the fixed-grid test.
+3. Serialize GPU execution on the communicator's actual owning stream across ALL
+   native and fused callers. A host mutex around enqueue is insufficient across
+   different CUDAstreams: both kernels can read epoch0 before either flips it,
+   then overwrite the same source/destination slots. Graph replay, eager warmups,
+   native/fused alternation and TBO/SBO require the same execution-order contract
+   or separately owned communication planes. No plane sharing across independent
+   overlapping model invocations merely because pointers are equal.
+4. Keep original inverseRMS producer unchanged and establish its stream/graph
+   dependency before fill_vec reads it. PDL is false here. Every rank must enter
+   the same fused-or-native collective choice in the same order; a rank with no
+   local experts must still publish encodedzeros. Local allocation/shape/backend
+   checks are not an all-rank admission protocol. After a collective starts, do
+   not catch a rank-local error and fall back to another collective.
+5. The workspace generation must remain alive through every captured replay.
+   reserve_push_capacity replaces allocation and communicator handles; capacity
+   growth must precede borrowedviews and capture. Direct fusion capture must join
+   the communicator's actual capture lifecycle, not bypass its _capture_started
+   protection. Resize/reload/teardown retires all referencing graphs and streams.
+6. Preserve kAtom=4 exactly: only an all-positive-zero32bit BF16 pair changes to
+   0x00008000. Rewriting each scalarzero or changing marker width changes bitwise
+   behavior/protocol. All-zero and all-remote contributions are real arrivals,
+   not reasons to skip the collective. Keep native rank reduction order and
+   final BF16 conversion; eligibility cannot assume NCCL/FP32 output equivalence.
+7. already_reduced may be true only for the branch that actually enqueues this
+   agreed collective and returns its output. Workspace presence or successful
+   local arithmetic is insufficient. Root's current Humming path ignores that
+   workspace; marking it reduced would omit the real all-reduce.
+
+Actual H200 tests must include delayed peers, mixed graph/eager sizes, empty local
+routes, alternating native/fused calls, capture/replay ordering, pointer generation
+retirement and watchdog failures. Current production entry compiles with64registers
+and no spills, but virtual-fixture occupancy/block32 says nothing about production
+launch occupancy/latency. Any speed claim must include inverseRMS, transport and
+complete FFN/serving comparison against the scored Humming parent.
+
+Sources read:
+sglang/python/sglang/kernels/jit/csrc/distributed/custom_all_reduce.cuh:140,399,455
+sglang/python/sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh:124,208
+sglang/python/sglang/kernels/jit/include/sgl_kernel/distributed/ptx.cuh:64
+sglang/python/sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py:226,238,439
+root coordination/finalize_reduce/protocol.cu, PROTOCOL_READOUT.txt, FINALIZER_EVIDENCE.json
